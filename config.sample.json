@@ -1,0 +1,6 @@
+{
+  "api_key": "your-provider-api-key",
+  "base_url": "https://api.moonshot.cn/v1",
+  "model": "kimi-k2.7-code",
+  "thinking_effort": "medium"
+}
