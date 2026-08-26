@@ -1,13 +1,403 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+// --- Skills ---
+// Lightweight Agent Skills support. Skills are discovered from directories
+// containing a SKILL.md file with YAML frontmatter (name, description).
+// Only descriptions are included in the system prompt; full content is
+// loaded on demand via /skill:name or when the user message triggers it.
+
+#[derive(Clone, Debug)]
+struct Skill {
+    name: String,
+    description: String,
+    path: PathBuf,
+}
+
+fn parse_skill(path: &Path) -> Option<Skill> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let first = lines.next()?;
+    if first.trim() != "---" {
+        return None;
+    }
+    let mut frontmatter = String::new();
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        frontmatter.push_str(line);
+        frontmatter.push('\n');
+    }
+    let mut name = None;
+    let mut description = None;
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("name:") {
+            name = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("description:") {
+            description = Some(val.trim().to_string());
+        }
+    }
+    Some(Skill {
+        name: name?,
+        description: description.unwrap_or_default(),
+        path: path.to_path_buf(),
+    })
+}
+
+fn discover_skills(dirs: &[PathBuf]) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("SKILL.md").exists() {
+                if let Some(skill) = parse_skill(&path.join("SKILL.md")) {
+                    skills.push(skill);
+                }
+            }
+        }
+    }
+    skills
+}
+
+fn skill_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    // Project-level skills
+    if let Ok(cwd) = env::current_dir() {
+        dirs.push(cwd.join(".ak/skills"));
+        dirs.push(cwd.join(".agents/skills"));
+    }
+    // User-level skills
+    if let Some(cfg) = env::var_os("XDG_CONFIG_HOME") {
+        dirs.push(PathBuf::from(cfg).join("ak/skills"));
+    } else if let Some(home) = env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".config/ak/skills"));
+    }
+    dirs
+}
+
+fn format_skills_for_prompt(skills: &[Skill]) -> String {
+    let mut out = String::new();
+    out.push_str("\n\nAvailable skills:\n");
+    for skill in skills {
+        out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+    }
+    out.push_str("\nTo use a skill, type /skill:<name> or ask about it.\n");
+    out
+}
+
+// --- Session persistence ---
+// Linear JSONL session file: header + message entries.
+// Auto-saved after each message exchange so crashes and Ctrl+C
+// never lose more than one turn. Simpler than pi's tree model
+// because this agent is linear (no branching).
+
+const SESSION_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SessionHeader {
+    #[serde(rename = "type")]
+    entry_type: String,
+    version: u32,
+    id: String,
+    timestamp: String,
+    cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SessionMessageEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    id: String,
+    timestamp: String,
+    #[serde(flatten)]
+    message: ChatMessage,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SessionInfoEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    id: String,
+    timestamp: String,
+    name: String,
+}
+
+#[derive(Debug)]
+struct Session {
+    header: SessionHeader,
+    path: Option<PathBuf>,
+    counter: u64,
+}
+
+impl Session {
+    fn session_dir() -> PathBuf {
+        if let Some(dir) = env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(dir).join("ak/sessions");
+        }
+        env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".local/share/ak/sessions"))
+            .unwrap_or_else(|| PathBuf::from(".ak/sessions"))
+    }
+
+    fn cwd_slug(cwd: &str) -> String {
+        cwd.replace('/', "-").replace("\\", "-")
+    }
+
+    fn new(cwd: String, name: Option<String>) -> io::Result<Self> {
+        let id = format!("{}_{}", Self::now_ms(), uuid4());
+        let dir = Self::session_dir().join(Self::cwd_slug(&cwd));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.jsonl", id));
+        let header = SessionHeader {
+            entry_type: "session".to_string(),
+            version: SESSION_VERSION,
+            id: id.clone(),
+            timestamp: Self::now_iso(),
+            cwd,
+            name,
+        };
+        let line = serde_json::to_string(&header).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{}", line)?;
+        let session = Self {
+            header,
+            path: Some(path),
+            counter: 0,
+        };
+        Ok(session)
+    }
+
+    fn from_path(path: &Path) -> io::Result<Self> {
+        let file = fs::read_to_string(path)?;
+        let mut lines = file.lines();
+        let first = lines.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty session file"))?;
+        let header: SessionHeader = serde_json::from_str(first)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad session header: {}", e)))?;
+        let counter = lines.count() as u64;
+        Ok(Self { header, path: Some(path.to_path_buf()), counter })
+    }
+
+    fn in_memory(cwd: String) -> Self {
+        let id = format!("{}_{}", Self::now_ms(), uuid4());
+        Self {
+            header: SessionHeader {
+                entry_type: "session".to_string(),
+                version: SESSION_VERSION,
+                id,
+                timestamp: Self::now_iso(),
+                cwd,
+                name: None,
+            },
+            path: None,
+            counter: 0,
+        }
+    }
+
+    fn open_or_continue(cwd: String, session_path: Option<&Path>, no_session: bool) -> io::Result<Self> {
+        if no_session {
+            return Ok(Self::in_memory(cwd));
+        }
+        if let Some(path) = session_path {
+            if path.exists() {
+                return Self::from_path(path);
+            }
+        }
+        // Try to continue the most recent session for this cwd
+        let dir = Self::session_dir().join(Self::cwd_slug(&cwd));
+        if let Ok(mut entries) = fs::read_dir(&dir) {
+            let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
+            while let Some(Ok(entry)) = entries.next() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if latest.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
+                                latest = Some((path, modified));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((path, _)) = latest {
+                return Self::from_path(&path);
+            }
+        }
+        Self::new(cwd, None)
+    }
+
+    fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+        let dir = Self::session_dir().join(Self::cwd_slug(cwd));
+        let mut sessions = Vec::new();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Some(first) = text.lines().next() {
+                            if let Ok(header) = serde_json::from_str::<SessionHeader>(first) {
+                                sessions.push((path, header));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        Ok(sessions)
+    }
+
+    fn set_name(&mut self, name: String) -> io::Result<()> {
+        self.header.name = Some(name.clone());
+        let entry = SessionInfoEntry {
+            entry_type: "session_info".to_string(),
+            id: self.next_id(),
+            timestamp: Self::now_iso(),
+            name,
+        };
+        self.append_line(&entry)
+    }
+
+    fn append_message(&mut self, message: ChatMessage) -> io::Result<()> {
+        let entry = SessionMessageEntry {
+            entry_type: "message".to_string(),
+            id: self.next_id(),
+            timestamp: Self::now_iso(),
+            message,
+        };
+        self.append_line(&entry)
+    }
+
+    fn append_line<T: Serialize>(&mut self, entry: &T) -> io::Result<()> {
+        if let Some(path) = &self.path {
+            let line = serde_json::to_string(entry).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+            writeln!(file, "{}", line)?;
+        }
+        Ok(())
+    }
+
+    fn next_id(&mut self) -> String {
+        self.counter += 1;
+        format!("{:x}", self.counter)
+    }
+
+    fn now_iso() -> String {
+        let now = SystemTime::now();
+        let secs = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // Naive RFC3339-ish
+        let dt = chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or_default();
+        dt.to_rfc3339()
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    }
+
+    fn id(&self) -> &str {
+        &self.header.id
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.header.name.as_deref()
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn is_persisted(&self) -> bool {
+        self.path.is_some()
+    }
+
+    fn display_name(&self) -> String {
+        self.name().map(|n| n.to_string()).unwrap_or_else(|| self.id().to_string())
+    }
+}
+
+fn uuid4() -> String {
+    let mut bytes = [0u8; 16];
+    for b in bytes.iter_mut() {
+        *b = rand::random();
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+/// Load messages from a session file (excluding the header and metadata entries).
+fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
+    let text = fs::read_to_string(path)?;
+    let mut messages = Vec::new();
+    for line in text.lines().skip(1) {
+        let value: Value = serde_json::from_str(line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad session line: {}", e)))?;
+        if value.get("type").and_then(Value::as_str) == Some("message") {
+            let msg: ChatMessage = serde_json::from_value(value)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad message: {}", e)))?;
+            if msg.role != "system" {
+                messages.push(msg);
+            }
+        }
+    }
+    Ok(messages)
+}
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigint(_: i32) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+fn install_sigint_handler() {
+    // Minimal libc binding so we don't need the libc crate. We must use
+    // `sigaction` (not `signal`) WITHOUT SA_RESTART: otherwise a SIGINT
+    // arriving while blocked in read(2) on the tty restarts the syscall
+    // and the flag is never observed until another key is pressed.
+    #[repr(C)]
+    struct SigAction {
+        handler: extern "C" fn(i32),
+        mask: [u64; 16],
+        flags: i32,
+        restorer: usize,
+    }
+    unsafe extern "C" {
+        fn sigaction(signum: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+    }
+    const SA_RESTART: i32 = 0x1000_0000;
+    let action = SigAction {
+        handler: handle_sigint,
+        mask: [0; 16],
+        flags: 0 & !SA_RESTART, // no SA_RESTART => read() returns EINTR
+        restorer: 0,
+    };
+    unsafe {
+        sigaction(2, &action, std::ptr::null_mut());
+    }
+}
+
+/// Returns true once per interrupt (consumes the flag).
+fn take_interrupt() -> bool {
+    INTERRUPTED.swap(false, Ordering::SeqCst)
+}
 
 const RESET: &str = "\x1b[0m";
 const PROMPT_COLOR: &str = "\x1b[1;36m";
@@ -16,6 +406,82 @@ const TOOL_INPUT_COLOR: &str = "\x1b[1;33m";
 const TOOL_OUTPUT_COLOR: &str = "\x1b[0;34m";
 const AGENT_COLOR: &str = "\x1b[1;32m";
 const ERROR_COLOR: &str = "\x1b[1;31m";
+
+// --- Working spinner ---
+//
+// Braille frames on the current line while the agent works. Transcript
+// writers go through with_console(), which erases the frame before
+// printing, so real output never interleaves with the animation.
+
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+static CONSOLE_LOCK: Mutex<()> = Mutex::new(());
+static SPINNER_RUNNING: AtomicBool = AtomicBool::new(false);
+static SPINNER_DRAWN: AtomicBool = AtomicBool::new(false);
+
+/// Erase the drawn spinner frame, if any. Caller holds CONSOLE_LOCK.
+fn erase_spinner_frame() {
+    if SPINNER_DRAWN.swap(false, Ordering::SeqCst) {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\r\x1b[2K");
+        let _ = out.flush();
+    }
+}
+
+/// Run `f` with the spinner suspended so output never interleaves with frames.
+fn with_console<T>(f: impl FnOnce() -> T) -> T {
+    let _lock = CONSOLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    erase_spinner_frame();
+    f()
+}
+
+/// Animates `<label> ...` frames until dropped (no-op when stdout is piped).
+struct SpinnerGuard {
+    #[allow(dead_code)]
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl SpinnerGuard {
+    fn start(label: &str) -> Self {
+        if !io::stdout().is_terminal() {
+            return Self { worker: None };
+        }
+        SPINNER_RUNNING.store(true, Ordering::SeqCst);
+        let label = label.to_string();
+        let worker = thread::spawn(move || {
+            let mut out = io::stdout();
+            for frame in SPINNER_FRAMES.iter().cycle() {
+                if !SPINNER_RUNNING.load(Ordering::SeqCst) {
+                    break;
+                }
+                {
+                    let _lock = CONSOLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    if !SPINNER_RUNNING.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = write!(out, "\r\x1b[2K{}{frame}{RESET} {label} ...", AGENT_COLOR);
+                    let _ = out.flush();
+                    SPINNER_DRAWN.store(true, Ordering::SeqCst);
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+        });
+        Self { worker: Some(worker) }
+    }
+}
+
+impl Drop for SpinnerGuard {
+    fn drop(&mut self) {
+        if self.worker.take().is_some() {
+            // Final erase under the lock: after RUNNING flips false no new
+            // frame can appear, and the worker exits on its next tick
+            // without blocking turn teardown.
+            let _lock = CONSOLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            SPINNER_RUNNING.store(false, Ordering::SeqCst);
+            erase_spinner_frame();
+        }
+    }
+}
 
 #[derive(Debug)]
 enum ToolError {
@@ -222,173 +688,85 @@ fn model_tool_result(text: &str) -> String {
 
 // --- Status line ---
 //
-// A persistent one-line status bar pinned to the bottom row of the
-// terminal (like codex/claude/pi). It works by installing an ANSI scroll
-// region covering every row except the last: all normal output (including
-// streamed LLM text and tool output) scrolls inside that region and can
-// never overwrite the bar. The bar itself is drawn with absolute cursor
-// positioning, so it stays stuck to the bottom no matter how much input
-// or output accumulates. The terminal size is re-queried before each
-// redraw, so the placement self-corrects on resize.
+// The status line is rendered as part of the input "block":
+// [input box][separator][status line]. The editor places the block
+// directly below the transcript and pushes it down as output arrives;
+// once it reaches the bottom edge of the terminal it docks there and
+// stays visible (like pi/codex CLIs).
 
-struct StatusBar {
-    rows: usize,
-    cols: usize,
-}
+const CHROME_ROWS: usize = 2;
 
-impl StatusBar {
-    /// Query the terminal geometry via `stty size`. Returns None when the
-    /// size cannot be determined (not a tty, headless, etc.) so callers can
-    /// degrade gracefully to plain scrolling output.
-    fn new() -> Option<Self> {
-        let out = Command::new("stty").arg("size").stdin(Stdio::inherit()).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut parts = text.split_whitespace();
-        let rows = parts.next()?.parse::<usize>().ok()?;
-        let cols = parts.next()?.parse::<usize>().ok()?;
-        // Need room for: scroll region + input top/bottom borders + spacer
-        // row + status bar.
-        if rows < 8 || cols == 0 {
-            return None; // too small to be useful
-        }
-        Some(Self { rows, cols })
-    }
-
-    fn query_size(&mut self) {
-        if let Some(probe) = StatusBar::new() {
-            self.rows = probe.rows;
-            self.cols = probe.cols;
-        }
-    }
-
-    /// Number of rows below the scroll region: separator line + status
-    /// bar.
-    const RESERVED_ROWS: usize = 2;
-
-    /// Reserve the last two rows (separator + status bar) by limiting the
-    /// scrolling region, then draw the separator without moving the caller's
-    /// cursor.
-    fn install(&self) {
-        let region_end = self.rows - Self::RESERVED_ROWS;
-        print!("\x1b7\x1b[1;{}r", region_end);
-        self.draw_separator();
-        print!("\x1b8");
-        io::stdout().flush().ok();
-    }
-
-    /// Draw a single dim separator line directly below the scroll region.
-    /// The caller owns cursor save/restore so this helper can be nested in
-    /// `install` safely.
-    fn draw_separator(&self) {
-        const DIM: &str = "\x1b[2m";
-        let line = "─".repeat(self.cols.saturating_sub(3).max(1));
-        print!(
-            "\x1b[{};1H\x1b[K{}{}{}",
-            self.rows - 1,
-            DIM,
-            line,
-            RESET,
-        );
-    }
-
-    /// Restore the full-screen scroll region on exit.
-    fn uninstall(&self) {
-        print!("\x1b[r");
-        io::stdout().flush().ok();
-    }
-
-    /// Redraw the status bar on the bottom row with the given segment
-    /// strings, left-aligned and separated by dim dividers, truncated to
-    /// fit the terminal width. The cursor is saved/restored so this is
-    /// safe to call at any point.
-    fn draw(&mut self, segments: &[String]) {
-        self.query_size();
-        // Reinstall in case of resize; cheap and idempotent.
-        self.install();
-
-        const DIM: &str = "\x1b[2m";
-        const CYAN: &str = "\x1b[36m";
-        let divider = format!("{} │ {}", DIM, RESET);
-
-        // Build the visible string while tracking display width. ANSI
-        // escape sequences count for zero width.
-        let visible_width = |s: &str| -> usize {
-            let mut w = 0;
-            let mut chars = s.chars();
-            while let Some(c) = chars.next() {
-                if c == '\x1b' {
-                    // Skip CSI sequence up to its final byte (@ through ~).
-                    for f in chars.by_ref() {
-                        if f.is_ascii_alphabetic() || ('@'..='~').contains(&f) {
-                            break;
-                        }
-                    }
-                } else {
-                    w += 1;
-                }
-            }
-            w
-        };
-        let mut body = String::new();
-        let mut width = 0usize;
-        let mut first = true;
-        for seg in segments {
-            if !first {
-                body.push_str(&divider);
-                width += 3;
-            }
-            first = false;
-            body.push_str(seg);
-            width += visible_width(seg);
-
-            if width + 4 >= self.cols {
-                break;
-            }
-        }
-        // Hard-truncate if still too wide (count only visible chars).
-        if width >= self.cols {
-            let budget = self.cols.saturating_sub(2);
-            let mut visible = String::new();
-            let mut w = 0usize;
-            let mut in_escape = false;
-            for c in body.chars() {
-                if c == '\x1b' {
-                    in_escape = true;
-                    visible.push(c);
-                    continue;
-                }
-                if in_escape {
-                    visible.push(c);
-                    if c.is_ascii_alphabetic() || ('@'..='~').contains(&c) {
-                        in_escape = false;
-                    }
-                    continue;
-                }
-                w += 1;
-                if w > budget {
+/// Width of a string as displayed, ignoring ANSI escape sequences.
+fn visible_width(s: &str) -> usize {
+    let mut w = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip CSI sequence up to its final byte (@ through ~).
+            for f in chars.by_ref() {
+                if f.is_ascii_alphabetic() || ('@'..='~').contains(&f) {
                     break;
                 }
-                visible.push(c);
             }
-            body = visible;
-            width = budget.min(w);
+        } else {
+            w += 1;
         }
-        let pad = self.cols.saturating_sub(width);
-
-        print!(
-            "\x1b7\x1b[{};1H\x1b[K{}{} {}{}{}\x1b8",
-            self.rows,
-            DIM,
-            CYAN,
-            body,
-            RESET,
-            " ".repeat(pad),
-        );
-        io::stdout().flush().ok();
     }
+    w
+}
+
+/// Truncate a styled status body to `cols` visible columns.
+fn truncate_visible(body: &str, cols: usize) -> String {
+    let budget = cols.saturating_sub(2);
+    let mut visible = String::new();
+    let mut w = 0usize;
+    let mut in_escape = false;
+    for c in body.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+            visible.push(c);
+            continue;
+        }
+        if in_escape {
+            visible.push(c);
+            if c.is_ascii_alphabetic() || ('@'..='~').contains(&c) {
+                in_escape = false;
+            }
+            continue;
+        }
+        w += 1;
+        if w > budget {
+            break;
+        }
+        visible.push(c);
+    }
+    visible
+}
+
+/// Compose the status line body from segments, left-aligned with dim
+/// dividers, truncated to fit the terminal width.
+fn status_body(segments: &[String], cols: usize) -> String {
+    const DIM: &str = "\x1b[2m";
+    let divider = format!("{} │ {}", DIM, RESET);
+    let mut body = String::new();
+    let mut width = 0usize;
+    let mut first = true;
+    for seg in segments {
+        if !first {
+            body.push_str(&divider);
+            width += 3;
+        }
+        first = false;
+        body.push_str(seg);
+        width += visible_width(seg);
+        if width + 4 >= cols {
+            break;
+        }
+    }
+    if width >= cols {
+        body = truncate_visible(&body, cols);
+    }
+    body
 }
 
 /// Build the status segments shown while waiting for user input.
@@ -407,6 +785,30 @@ fn status_segments(config: &LlmConfig, messages: &[ChatMessage], state: &ToolSta
     );
     let tools_seg = format!("{} cached", state.cache.len());
     vec![model_seg, msgs_seg, ctx_seg, tools_seg, format!("turn {}", turns)]
+}
+
+/// Plain-text transcript lines used to repaint the screen after a width
+/// change re-wraps everything.
+fn transcript_replay(messages: &[ChatMessage]) -> Vec<String> {
+    let mut lines = vec![format!("{}ak agent{}", AGENT_COLOR, RESET)];
+    for m in messages {
+        match m.role.as_str() {
+            "user" if m.name.is_none() => {
+                let body = m.content.clone().unwrap_or_default();
+                lines.push(format!("{}> {}{}{}", PROMPT_COLOR, INPUT_COLOR, body, RESET));
+            }
+            "assistant" => match (&m.tool_calls, &m.content) {
+                (Some(calls), _) => {
+                    let names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+                    lines.push(format!("{}⋮ {}{}", TOOL_INPUT_COLOR, names.join(", "), RESET));
+                }
+                (None, Some(text)) => lines.push(text.clone()),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    lines
 }
 
 // --- OpenAI-compatible LLM integration ---
@@ -595,12 +997,29 @@ fn tools_schema() -> Vec<ToolDefinition> {
     ]
 }
 
-fn system_prompt() -> String {
-    "You are a coding agent. Use the provided tools to help the user. \
+fn project_context() -> Option<String> {
+    for name in &["AGENTS.md", "CLAUDE.md"] {
+        if let Ok(content) = fs::read_to_string(name) {
+            return Some(content);
+        }
+    }
+    None
+}
+
+fn system_prompt(skills: &[Skill]) -> String {
+    let mut prompt = "You are a coding agent. Use the provided tools to help the user. \
      Prefer reading files before editing. \
      When editing, oldText must match exactly one occurrence in the file. \
      Stop using tools once the requested work is complete. \
-     Be concise.".to_string()
+     Be concise.".to_string();
+    if let Some(ctx) = project_context() {
+        prompt.push_str("\n\n--- Project instructions ---\n");
+        prompt.push_str(&ctx);
+    }
+    if !skills.is_empty() {
+        prompt.push_str(&format_skills_for_prompt(skills));
+    }
+    prompt
 }
 
 #[derive(Default, Deserialize)]
@@ -657,8 +1076,9 @@ impl LlmConfig {
                 .or(file.api_key)
                 .ok_or("OPENAI_API_KEY not set and no api_key in config file")?,
             base_url: base_url_override
-                .or_else(|| env::var("OPENAI_BASE_URL").ok())
+                .or_else(|| env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty()))
                 .or(file.base_url)
+                .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             model: model_override
                 .or_else(|| env::var("OPENAI_MODEL").ok())
@@ -693,6 +1113,10 @@ impl StreamPrinter {
     }
 
     fn feed_line(&mut self, line: &str) {
+        with_console(|| self.feed_line_inner(line))
+    }
+
+    fn feed_line_inner(&mut self, line: &str) {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             if self.in_code {
@@ -715,7 +1139,7 @@ impl StreamPrinter {
 
     fn finish(self) {
         if self.in_code && !self.code_body.is_empty() {
-            print_code_block(&self.code_lang, &self.code_body);
+            with_console(|| print_code_block(&self.code_lang, &self.code_body));
         }
     }
 }
@@ -730,6 +1154,13 @@ fn read_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Op
     let mut usage_tokens: Option<u64> = None;
 
     loop {
+        if take_interrupt() {
+            // Ctrl+C during generation: stop consuming the stream and
+            // unwind so control returns to the prompt.
+            with_console(|| println!());
+            io::stdout().flush()?;
+            return Err("interrupted".into());
+        }
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             break;
@@ -792,7 +1223,7 @@ fn read_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Op
     io::stdout().flush()?;
 
     if !content.is_empty() {
-        println!();
+        with_console(|| println!());
         io::stdout().flush()?;
     }
     Ok((
@@ -834,7 +1265,7 @@ fn call_llm(
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-                eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay);
+                with_console(|| eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay));
                 thread::sleep(delay);
                 continue;
             }
@@ -849,7 +1280,7 @@ fn call_llm(
                 || status.is_server_error();
             if retryable && attempt < MAX_RETRIES {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-                eprintln!("[llm] API error {}: retrying in {:?}", status, delay);
+                with_console(|| eprintln!("[llm] API error {}: retrying in {:?}", status, delay));
                 thread::sleep(delay);
                 continue;
             }
@@ -1010,7 +1441,7 @@ fn compact_history(config: &LlmConfig, messages: &mut Vec<ChatMessage>) {
     let summarized = match summarize_old_messages(config, &old) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[history] summarization failed ({}); truncating instead", e);
+            with_console(|| eprintln!("[history] summarization failed ({}); truncating instead", e));
             // Fall back to plain truncation: drop the old segment entirely.
             messages.drain(1..cutoff);
             return;
@@ -1043,6 +1474,8 @@ fn process_turn(
     messages: &mut Vec<ChatMessage>,
     state: &mut ToolState,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // Spins while the agent works; erased automatically on return.
+    let _working = SpinnerGuard::start("Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
 
@@ -1069,7 +1502,13 @@ fn process_turn(
                 name: Some("system-nudge".to_string()),
             });
         }
-        let (message, usage) = call_llm(config, messages, true)?;
+        let (message, usage) = match call_llm(config, messages, true) {
+            Ok(result) => result,
+            Err(e) if e.to_string() == "interrupted" => {
+                return Err("interrupted by user (Ctrl+C)".into());
+            }
+            Err(e) => return Err(e),
+        };
         if usage.is_some() {
             last_usage = usage;
         }
@@ -1124,13 +1563,15 @@ fn process_turn(
                 last_tools.push(cache_key.clone());
                 let repeated_count =
                     last_tools.iter().filter(|k| **k == cache_key).count();
-                eprintln!(
-                    "{}[tool input] {} {}{}",
-                    TOOL_INPUT_COLOR,
-                    call.function.name,
-                    terminal_preview(&input),
-                    RESET
-                );
+                with_console(|| {
+                    eprintln!(
+                        "{}[tool input] {} {}{}",
+                        TOOL_INPUT_COLOR,
+                        call.function.name,
+                        terminal_preview(&input),
+                        RESET
+                    );
+                });
 
                 let cacheable = matches!(name.as_str(), "read" | "grep" | "find");
                 let result = if repeated_count >= 3 {
@@ -1138,7 +1579,7 @@ fn process_turn(
                         .to_string()
                 } else if cacheable {
                     if let Some(cached) = state.cache.get(&cache_key) {
-                        eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET);
+                        with_console(|| eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET));
                         cached.clone()
                     } else {
                         let result = result;
@@ -1151,13 +1592,15 @@ fn process_turn(
                     }
                     result
                 };
-                eprintln!(
-                    "{}[tool output] {}:\n{}{}",
-                    TOOL_OUTPUT_COLOR,
-                    name,
-                    terminal_preview(&result),
-                    RESET
-                );
+                with_console(|| {
+                    eprintln!(
+                        "{}[tool output] {}:\n{}{}",
+                        TOOL_OUTPUT_COLOR,
+                        name,
+                        terminal_preview(&result),
+                        RESET
+                    );
+                });
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(model_tool_result(&result)),
@@ -1192,18 +1635,39 @@ fn process_turn(
 
 fn run_one_shot(
     prompt: &str,
-    base_url: Option<String>,
-    model: Option<String>,
+    args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = LlmConfig::from_env(base_url, model)?;
+    let config = LlmConfig::from_env(args.base_url.clone(), args.model.clone())?;
+    let mut skill_dirs = skill_dirs();
+    skill_dirs.extend(args.skill_dirs.iter().cloned());
+    let skills = discover_skills(&skill_dirs);
     let mut messages = vec![
-        ChatMessage { role: "system".to_string(), content: Some(system_prompt()), tool_calls: None, tool_call_id: None, name: None },
+        ChatMessage { role: "system".to_string(), content: Some(system_prompt(&skills)), tool_calls: None, tool_call_id: None, name: None },
         ChatMessage { role: "user".to_string(), content: Some(prompt.to_string()), tool_calls: None, tool_call_id: None, name: None },
     ];
     let mut state = ToolState::load();
-    process_turn(&config, &mut messages, &mut state)?;
+    let result = process_turn(&config, &mut messages, &mut state);
+    if !args.no_session {
+        let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let mut session = if args.new_session {
+            let mut s = Session::new(cwd, args.session_name.clone())?;
+            if let Some(name) = &args.session_name {
+                s.set_name(name.clone())?;
+            }
+            s
+        } else {
+            let mut s = Session::open_or_continue(cwd, args.session_path.as_deref(), false)?;
+            if let Some(name) = &args.session_name {
+                s.set_name(name.clone())?;
+            }
+            s
+        };
+        for msg in &messages[1..] { // skip system
+            session.append_message(msg.clone())?;
+        }
+    }
     println!();
-    Ok(())
+    result.map(|_| ())
 }
 
 enum Key {
@@ -1241,15 +1705,29 @@ struct TerminalEditor {
     last_ctrl_c: Option<std::time::Instant>,
     /// Screen columns of the terminal (queried lazily).
     cols: usize,
-    /// Number of visible rows occupied by the editor at the last refresh.
+    /// Number of visible box rows rendered at the last refresh.
     last_rows: usize,
-    /// Cursor row within the rendered editor block at the last refresh.
+    /// Cursor row within the rendered block at the last refresh.
     last_cursor_row: usize,
     /// First visual row currently shown when the input is taller than the
     /// editor viewport (the editor scrolls internally).
     view_start: usize,
     /// Preferred visual column for consecutive vertical cursor moves.
     preferred_col: Option<usize>,
+    /// Absolute screen row (1-indexed) of the input box top at the last
+    /// refresh; 0 when nothing is rendered.
+    block_top: usize,
+    /// True when the hardware cursor position is unknown (after external
+    /// output scrolled the screen) and must be re-queried via DSR before
+    /// rendering.
+    resync: bool,
+    /// Column count at the last refresh (0 before the first render).
+    last_cols: usize,
+    /// Transcript lines to replay after a width change re-wraps the screen.
+    replay: Vec<String>,
+    /// Input bytes read from the tty but not yet interpreted (e.g. typed
+    /// ahead of a DSR reply).
+    pending: VecDeque<u8>,
 }
 
 /// Query the terminal size via `stty size`, defaulting to (24, 80).
@@ -1291,9 +1769,11 @@ impl TerminalEditor {
         let original_stty = String::from_utf8_lossy(&state.stdout).trim().to_string();
         let raw = Command::new("stty")
             .args([
+                // Keep isig ON so Ctrl+C raises SIGINT even while a
+                // request is streaming; the handler sets a flag that the
+                // stream loop checks.
                 "-icanon",
                 "-echo",
-                "-isig",
                 "-ixon",
                 "-icrnl",
                 "-inlcr",
@@ -1309,9 +1789,10 @@ impl TerminalEditor {
             return Err(io::Error::other("could not enable terminal input mode"));
         }
         let mut stdout = io::stdout();
-        // Use the same keyboard setup as pi: Kitty when supported, with
-        // xterm modifyOtherKeys as the fallback.
-        stdout.write_all(b"\x1b[?2004h\x1b[>7u\x1b[?u\x1b[c\x1b[>4;2m")?;
+        // Kitty keyboard protocol for Shift+Enter, xterm modifyOtherKeys as
+        // the fallback, plus bracketed paste. No capability queries: their
+        // replies would land in the input queue as phantom keystrokes.
+        stdout.write_all(b"\x1b[?2004h\x1b[>7u\x1b[>4;2m")?;
         stdout.flush()?;
         Ok(Self {
             stdin,
@@ -1319,11 +1800,43 @@ impl TerminalEditor {
             original_stty,
             last_ctrl_c: None,
             cols: terminal_cols(),
-            last_rows: 1,
+            last_rows: 0,
             last_cursor_row: 0,
             view_start: 0,
             preferred_col: None,
+            block_top: 0,
+            resync: true,
+            last_cols: 0,
+            replay: Vec::new(),
+            pending: VecDeque::new(),
         })
+    }
+
+    /// Read exactly buf.len() bytes from the tty, honoring pushed-back
+    /// input first. An EINTR interruption (Ctrl+C with isig enabled)
+    /// surfaces as `ErrorKind::Interrupted` so callers can turn it into
+    /// a Ctrl+C key event; it must not be retried transparently.
+    fn tty_read(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        for slot in buf.iter_mut() {
+            *slot = if let Some(b) = self.pending.pop_front() {
+                b
+            } else {
+                let mut one = [0; 1];
+                match self.stdin.read(&mut one) {
+                    Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tty closed")),
+                    Ok(_) => one[0],
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+                    Err(e) => return Err(e),
+                }
+            };
+        }
+        Ok(())
+    }
+
+    /// Set the transcript lines used to rebuild the screen after a width
+    /// change (re-wrapping shifts every cached row).
+    fn set_replay(&mut self, replay: Vec<String>) {
+        self.replay = replay;
     }
 
     fn kitty_key(sequence: &[u8]) -> Option<Key> {
@@ -1370,8 +1883,18 @@ impl TerminalEditor {
     }
 
     fn read_key(&mut self) -> io::Result<Key> {
+        // With isig enabled, Ctrl+C raises SIGINT rather than arriving as
+        // a 0x03 byte. It can surface two ways: the flag set before we
+        // block, or EINTR from read(2) while blocked (SA_RESTART is off).
+        if take_interrupt() {
+            return Ok(Key::CtrlC);
+        }
         let mut byte = [0; 1];
-        self.stdin.read_exact(&mut byte)?;
+        match self.tty_read(&mut byte) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(Key::CtrlC),
+            Err(e) => return Err(e),
+        }
         match byte[0] {
             b'\r' => Ok(Key::Enter),
             // Pi binds Ctrl+J as an alias for Shift+Enter. A terminal that
@@ -1388,7 +1911,7 @@ impl TerminalEditor {
             23 => Ok(Key::CtrlW),
             0x1b => {
                 let mut introducer = [0; 1];
-                self.stdin.read_exact(&mut introducer)?;
+                self.tty_read(&mut introducer)?;
                 match introducer[0] {
                     // Alt+Enter is the fallback sequence used by terminals
                     // that cannot report Shift+Enter directly.
@@ -1397,7 +1920,7 @@ impl TerminalEditor {
                         let mut sequence = Vec::with_capacity(12);
                         loop {
                             let mut next = [0; 1];
-                            self.stdin.read_exact(&mut next)?;
+                            self.tty_read(&mut next)?;
                             sequence.push(next[0]);
                             if (0x40..=0x7e).contains(&next[0]) {
                                 break;
@@ -1428,7 +1951,7 @@ impl TerminalEditor {
                                 let mut pasted = Vec::new();
                                 loop {
                                     let mut next = [0; 1];
-                                    self.stdin.read_exact(&mut next)?;
+                                    self.tty_read(&mut next)?;
                                     pasted.push(next[0]);
                                     if pasted.ends_with(end) {
                                         pasted.truncate(pasted.len() - end.len());
@@ -1459,7 +1982,7 @@ impl TerminalEditor {
                 }
                 let mut bytes = [0; 4];
                 bytes[0] = first;
-                self.stdin.read_exact(&mut bytes[1..width])?;
+                self.tty_read(&mut bytes[1..width])?;
                 let character = std::str::from_utf8(&bytes[..width])
                     .ok()
                     .and_then(|text| text.chars().next())
@@ -1623,21 +2146,77 @@ impl TerminalEditor {
         (start, end)
     }
 
-    fn clear_rendered_input(&mut self) -> io::Result<()> {
-        // The hardware cursor is left on the logical cursor row after every
-        // refresh, so use that saved row rather than assuming it is on the
-        // last line of the block.
-        if self.last_cursor_row > 0 {
-            write!(self.stdout, "\x1b[{}A", self.last_cursor_row)?;
-        }
-        write!(self.stdout, "\r")?;
-        for row in 0..self.last_rows {
-            write!(self.stdout, "\x1b[K")?;
-            if row + 1 < self.last_rows {
-                write!(self.stdout, "\x1b[B\r")?;
+    /// Ask the terminal for its cursor position via DSR. Bytes consumed
+    /// before the actual \x1b[row;colR report (e.g. type-ahead) are pushed
+    /// back onto the input queue. Returns row 1 when no report arrives.
+    /// ponytail: blocks until the terminal answers; every real terminal
+    /// replies to DSR — if a headless oddity ever hangs here, gate it on a
+    /// tty check instead of adding read timeouts.
+    fn query_cursor_row(&mut self) -> io::Result<usize> {
+        self.stdout.write_all(b"\x1b[6n")?;
+        self.stdout.flush()?;
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            let mut byte = [0; 1];
+            self.tty_read(&mut byte)?;
+            raw.push(byte[0]);
+            if let Some((start, end)) = Self::find_cursor_report(&raw) {
+                // Preserve anything that came before the report.
+                let prefix: Vec<u8> = raw[..start].to_vec();
+                for b in prefix.iter().rev() {
+                    self.pending.push_front(*b);
+                }
+                let body = String::from_utf8_lossy(&raw[start..end]);
+                let inner = &body[2..body.len() - 1]; // strip ESC [ ... R
+                let row = inner
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .parse::<usize>()
+                    .unwrap_or(1);
+                return Ok(row.max(1));
+            }
+            if raw.len() >= 256 {
+                break;
             }
         }
-        self.last_rows = 1;
+        // No well-formed report: keep whatever arrived for the key reader.
+        for b in raw.iter().rev() {
+            self.pending.push_front(*b);
+        }
+        Ok(1)
+    }
+
+    /// Locate a complete \x1b[row;colR report in buf; returns the byte
+    /// range of the report.
+    fn find_cursor_report(buf: &[u8]) -> Option<(usize, usize)> {
+        for i in 0..buf.len().saturating_sub(1) {
+            if buf[i] == 0x1b && buf[i + 1] == b'[' {
+                let mut j = i + 2;
+                while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+                    j += 1;
+                }
+                if j < buf.len() && buf[j] == b'R' && j > i + 2 {
+                    return Some((i, j + 1));
+                }
+            }
+        }
+        None
+    }
+
+    /// Erase every row of the previously rendered block (box + chrome).
+    fn clear_block(&mut self) -> io::Result<()> {
+        if self.block_top == 0 {
+            return Ok(());
+        }
+        let bottom = self.block_top + self.last_rows + CHROME_ROWS; // exclusive
+        for row in self.block_top..bottom.min(terminal_size().0.max(1) + 1) {
+            write!(self.stdout, "\x1b[{};1H\x1b[K", row)?;
+        }
+        // Leave the cursor where the block began: that is exactly where new
+        // transcript output should continue.
+        write!(self.stdout, "\x1b[{};1H", self.block_top)?;
+        self.last_rows = 0;
         self.last_cursor_row = 0;
         self.view_start = 0;
         self.preferred_col = None;
@@ -1645,24 +2224,43 @@ impl TerminalEditor {
     }
 
     fn finish_input(&mut self) -> io::Result<()> {
-        self.clear_rendered_input()?;
-        write!(self.stdout, "\r\n")?;
+        self.clear_block()?;
         self.stdout.flush()
     }
 
-    fn refresh(&mut self, line: &[char], cursor: usize) -> io::Result<()> {
-        // Re-check terminal size in case of resize.
+    /// Render the full block — input box, separator, status line — with
+    /// absolute cursor addressing. The block hugs the content: it starts
+    /// right below the last transcript row and is pushed down as output
+    /// arrives until it docks at the bottom edge of the terminal.
+    fn refresh(&mut self, line: &[char], cursor: usize, status: &[String]) -> io::Result<()> {
         let (term_rows, cols) = terminal_size();
         self.cols = cols.max(1);
+        let term_rows = term_rows.max(CHROME_ROWS + 1);
+
+        // A width change re-wraps every transcript line: all cached rows and
+        // on-screen pixels are void. Rebuild from the transcript replay.
+        if self.last_cols != 0 && cols != self.last_cols && !self.replay.is_empty() {
+            self.stdout.write_all(b"\x1b[1;1H\x1b[2J")?;
+            for l in &self.replay {
+                writeln!(self.stdout, "{}", l)?;
+            }
+            self.stdout.flush()?;
+            self.block_top = 0;
+            self.last_rows = 0;
+            self.resync = true;
+        }
+        self.last_cols = cols;
+
         let prefix_width = Self::prefix_width(self.cols);
         let content_width = self.cols.saturating_sub(prefix_width + 1).max(1);
         let (row_ranges, cur_row, cursor_col) = Self::layout(line, cursor, content_width);
         let total_rows = row_ranges.len().max(1);
 
-        // Pi keeps the editor to roughly 30% of the terminal, with a
-        // five-line minimum, and scrolls that editor only when the cursor
-        // leaves its visible window.
-        let viewport = (term_rows.saturating_mul(3) / 10).max(5);
+        // Pi keeps the editor to roughly 30% of the space above the chrome,
+        // with a five-line minimum, and scrolls that editor only when the
+        // cursor leaves its visible window.
+        let viewport = (term_rows.saturating_sub(CHROME_ROWS)).saturating_mul(3) / 10;
+        let viewport = viewport.max(5);
         if cur_row < self.view_start {
             self.view_start = cur_row;
         } else if cur_row >= self.view_start + viewport {
@@ -1674,23 +2272,37 @@ impl TerminalEditor {
             .min(viewport)
             .max(1);
 
-        // Return to the top of the previous block. The terminal cursor can
-        // be anywhere inside it after an edit, so move up by its recorded
-        // visual row, not by the block height.
-        if self.last_cursor_row > 0 {
-            write!(self.stdout, "\x1b[{}A", self.last_cursor_row)?;
+        let block_h = visible_rows + CHROME_ROWS;
+        let max_top = term_rows.saturating_sub(block_h) + 1;
+
+        if self.resync {
+            // The transcript scrolled by an unknown amount since the last
+            // render; find the real content end and hug it.
+            let row = self.query_cursor_row()?;
+            self.block_top = row.min(term_rows);
+            self.resync = false;
         }
-        write!(self.stdout, "\r")?;
-        for row in 0..self.last_rows {
-            write!(self.stdout, "\x1b[K")?;
-            if row + 1 < self.last_rows {
-                write!(self.stdout, "\x1b[B\r")?;
+        // Dock at the bottom edge: scroll the transcript up rather than
+        // letting the block cross it.
+        if self.block_top > max_top {
+            let overflow = self.block_top - max_top;
+            write!(self.stdout, "\x1b[{};1H", term_rows)?;
+            for _ in 0..overflow {
+                write!(self.stdout, "\n")?;
             }
+            self.block_top = max_top;
+            // Everything (including the old block pixels) moved up; the
+            // targeted clear below would miss rows above block_top, but those
+            // now hold scrolled transcript — never clear those.
+            self.last_rows = 0;
         }
-        if self.last_rows > 1 {
-            write!(self.stdout, "\x1b[{}A", self.last_rows - 1)?;
+        let block_top = self.block_top.max(1);
+
+        // Clear whatever the previous render left behind.
+        let old_bottom = block_top + self.last_rows + CHROME_ROWS;
+        for row in block_top..old_bottom.min(term_rows + 1) {
+            write!(self.stdout, "\x1b[{};1H\x1b[K", row)?;
         }
-        write!(self.stdout, "\r")?;
 
         let prompt = if prefix_width == 2 { "> " } else { ">" };
         let indent = " ".repeat(prefix_width);
@@ -1700,10 +2312,8 @@ impl TerminalEditor {
             .skip(self.view_start)
             .take(visible_rows)
         {
-            if offset > self.view_start {
-                write!(self.stdout, "\r\n")?;
-            }
-            write!(self.stdout, "\x1b[K")?;
+            let scr = block_top + offset - self.view_start;
+            write!(self.stdout, "\x1b[{};1H\x1b[K", scr)?;
             let text: String = line[row.start..row.end].iter().collect();
             let prefix = if offset == self.view_start { prompt } else { &indent };
             write!(
@@ -1717,30 +2327,60 @@ impl TerminalEditor {
             )?;
         }
 
-        // Rendering ends at the last visible row. Move to the cursor's row
-        // and then to its exact column, as pi does for its fake cursor.
+        // Separator directly under the box.
+        const DIM: &str = "\x1b[2m";
+        const CYAN: &str = "\x1b[36m";
+        let sep_row = block_top + visible_rows;
+        let line_char = "─".repeat(self.cols.saturating_sub(3).max(1));
+        write!(
+            self.stdout,
+            "\x1b[{};1H\x1b[K{}{}{}",
+            sep_row,
+            DIM,
+            line_char,
+            RESET,
+        )?;
+        // Status line under the separator.
+        let bar_row = sep_row + 1;
+        let body = status_body(status, self.cols);
+        let pad = self.cols.saturating_sub(visible_width(&body));
+        write!(
+            self.stdout,
+            "\x1b[{};1H\x1b[K{}{} {}{}{}",
+            bar_row,
+            DIM,
+            CYAN,
+            body,
+            RESET,
+            " ".repeat(pad),
+        )?;
+
+        // Park the hardware cursor inside the box at the logical cursor.
         let view_cur_row = cur_row - self.view_start;
-        if visible_rows > view_cur_row + 1 {
-            write!(
-                self.stdout,
-                "\x1b[{}A",
-                visible_rows - view_cur_row - 1,
-            )?;
-        }
         let cursor_column = (prefix_width + cursor_col + 1).min(self.cols);
-        write!(self.stdout, "\r\x1b[{}G", cursor_column)?;
+        write!(
+            self.stdout,
+            "\x1b[{};{}H",
+            block_top + view_cur_row,
+            cursor_column,
+        )?;
         self.last_rows = visible_rows;
         self.last_cursor_row = view_cur_row;
+        self.block_top = block_top;
         self.stdout.flush()
     }
 
-    fn read_line(&mut self, history: &[String]) -> io::Result<Option<String>> {
+    fn read_line(&mut self, history: &[String], status: &[String]) -> io::Result<Option<String>> {
         let mut line = Vec::new();
         let mut cursor = 0;
         let mut history_index: Option<usize> = None;
         let mut draft = Vec::new();
         self.preferred_col = None;
-        self.refresh(&line, cursor)?;
+        // External output (streamed transcript) may have scrolled the
+        // screen since the last render; re-locate the content end.
+        self.resync = true;
+        take_interrupt(); // drop any stale Ctrl+C from a previous turn
+        self.refresh(&line, cursor, status)?;
 
         loop {
             match self.read_key()? {
@@ -1749,7 +2389,7 @@ impl TerminalEditor {
                     cursor += 1;
                     history_index = None;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::Paste(text) => {
                     let normalized = text
@@ -1765,14 +2405,14 @@ impl TerminalEditor {
                     cursor += count;
                     history_index = None;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::NewLine => {
                     line.insert(cursor, '\n');
                     cursor += 1;
                     history_index = None;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::Enter => {
                     let value: String = line.iter().collect();
@@ -1785,7 +2425,7 @@ impl TerminalEditor {
                         cursor -= 1;
                         history_index = None;
                         self.preferred_col = None;
-                        self.refresh(&line, cursor)?;
+                        self.refresh(&line, cursor, status)?;
                     }
                 }
                 Key::Delete => {
@@ -1793,32 +2433,32 @@ impl TerminalEditor {
                         line.remove(cursor);
                         history_index = None;
                         self.preferred_col = None;
-                        self.refresh(&line, cursor)?;
+                        self.refresh(&line, cursor, status)?;
                     }
                 }
                 Key::Left => {
                     cursor = cursor.saturating_sub(1);
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::Right => {
                     cursor = (cursor + 1).min(line.len());
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::Home => {
                     cursor = Self::line_bounds(&line, cursor).0;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::End => {
                     cursor = Self::line_bounds(&line, cursor).1;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::Up => {
                     if self.move_cursor_vertically(&line, &mut cursor, -1) {
-                        self.refresh(&line, cursor)?;
+                        self.refresh(&line, cursor, status)?;
                     } else {
                         let line_start = Self::line_bounds(&line, cursor).0;
                         if !history.is_empty()
@@ -1837,17 +2477,17 @@ impl TerminalEditor {
                             line = history[index].chars().collect();
                             cursor = line.len();
                             self.preferred_col = None;
-                            self.refresh(&line, cursor)?;
+                            self.refresh(&line, cursor, status)?;
                         } else {
                             cursor = line_start;
                             self.preferred_col = None;
-                            self.refresh(&line, cursor)?;
+                            self.refresh(&line, cursor, status)?;
                         }
                     }
                 }
                 Key::Down => {
                     if self.move_cursor_vertically(&line, &mut cursor, 1) {
-                        self.refresh(&line, cursor)?;
+                        self.refresh(&line, cursor, status)?;
                     } else if let Some(index) = history_index {
                         if index + 1 < history.len() {
                             let index = index + 1;
@@ -1859,11 +2499,11 @@ impl TerminalEditor {
                         }
                         cursor = line.len();
                         self.preferred_col = None;
-                        self.refresh(&line, cursor)?;
+                        self.refresh(&line, cursor, status)?;
                     } else {
                         cursor = Self::line_bounds(&line, cursor).1;
                         self.preferred_col = None;
-                        self.refresh(&line, cursor)?;
+                        self.refresh(&line, cursor, status)?;
                     }
                 }
                 Key::CtrlU => {
@@ -1877,7 +2517,7 @@ impl TerminalEditor {
                     }
                     history_index = None;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::CtrlK => {
                     let (_, end) = Self::line_bounds(&line, cursor);
@@ -1888,7 +2528,7 @@ impl TerminalEditor {
                     }
                     history_index = None;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::CtrlW => {
                     let (start, _) = Self::line_bounds(&line, cursor);
@@ -1907,7 +2547,7 @@ impl TerminalEditor {
                     }
                     history_index = None;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 Key::CtrlC => {
                     let now = std::time::Instant::now();
@@ -1915,7 +2555,7 @@ impl TerminalEditor {
                         .last_ctrl_c
                         .map(|t| now.duration_since(t).as_millis() <= 1500)
                         .unwrap_or(false);
-                    self.clear_rendered_input()?;
+                    self.clear_block()?;
                     if is_double {
                         writeln!(self.stdout)?;
                         self.stdout.flush()?;
@@ -1938,7 +2578,7 @@ impl TerminalEditor {
                     line.remove(cursor);
                     history_index = None;
                     self.preferred_col = None;
-                    self.refresh(&line, cursor)?;
+                    self.refresh(&line, cursor, status)?;
                 }
                 _ => {}
             }
@@ -1989,8 +2629,8 @@ impl Drop for TerminalEditor {
     }
 }
 
-fn run_chat_repl(base_url: Option<String>, model: Option<String>) {
-    let config = match LlmConfig::from_env(base_url, model) {
+fn run_chat_repl(args: &Args) {
+    let config = match LlmConfig::from_env(args.base_url.clone(), args.model.clone()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("LLM config error: {}", e);
@@ -1999,30 +2639,71 @@ fn run_chat_repl(base_url: Option<String>, model: Option<String>) {
         }
     };
 
-    let mut messages = vec![ChatMessage {
+    let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let mut session = if args.new_session || args.no_session {
+        let s = if args.no_session {
+            Session::in_memory(cwd)
+        } else {
+            let mut s = Session::new(cwd.clone(), args.session_name.clone()).expect("failed to create session");
+            if let Some(name) = &args.session_name {
+                s.set_name(name.clone()).ok();
+            }
+            s
+        };
+        s
+    } else if let Some(path) = &args.session_path {
+        if path.exists() {
+            let mut s = Session::from_path(path).expect("failed to open session");
+            if let Some(name) = &args.session_name {
+                s.set_name(name.clone()).ok();
+            }
+            s
+        } else {
+            let mut s = Session::new(cwd.clone(), args.session_name.clone()).expect("failed to create session");
+            if let Some(name) = &args.session_name {
+                s.set_name(name.clone()).ok();
+            }
+            s
+        }
+    } else {
+        let mut s = Session::open_or_continue(cwd, None, false).expect("failed to open session");
+        if let Some(name) = &args.session_name {
+            s.set_name(name.clone()).ok();
+        }
+        s
+    };
+
+    let mut skill_dirs = skill_dirs();
+    skill_dirs.extend(args.skill_dirs.iter().cloned());
+    let skills = discover_skills(&skill_dirs);
+
+    let mut messages = if session.counter > 0 {
+        // Resuming: load persisted messages (skip system, we prepend it fresh).
+        if let Some(path) = session.path() {
+            load_messages_from_session(path).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Always prepend fresh system prompt.
+    messages.insert(0, ChatMessage {
         role: "system".to_string(),
-        content: Some(system_prompt()),
+        content: Some(system_prompt(&skills)),
         tool_calls: None,
         tool_call_id: None,
         name: None,
-    }];
+    });
 
     println!("{}ak agent{}", AGENT_COLOR, RESET);
-    println!("type a prompt and hit enter. /clear resets history. /quit exits.");
-
-    // Pin a status bar to the bottom of the terminal. All subsequent
-    // output scrolls above it inside the restricted scroll region.
-    let mut tool_state = ToolState::load();
-    let mut status = match StatusBar::new() {
-        Some(bar) => {
-            bar.install();
-            Some(bar)
-        }
-        None => None,
-    };
-    if let Some(bar) = status.as_mut() {
-        bar.draw(&status_segments(&config, &messages, &tool_state));
+    if session.is_persisted() {
+        println!("session: {} ({} turns)", session.display_name(), session.counter);
     }
+    println!("type a prompt and hit enter. /clear resets history. /quit exits. /new starts fresh. /resume lists past sessions. /skill:<name> loads a skill.");
+
+    let mut tool_state = ToolState::load();
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -2042,8 +2723,15 @@ fn run_chat_repl(base_url: Option<String>, model: Option<String>) {
             print!("\n{}> {}", PROMPT_COLOR, INPUT_COLOR);
         }
         let _ = stdout.flush();
+        let mut status = status_segments(&config, &messages, &tool_state);
+        if session.is_persisted() {
+            status.push(format!("session: {}", session.display_name()));
+        }
+        if let Some(editor) = editor.as_mut() {
+            editor.set_replay(transcript_replay(&messages));
+        }
         let line = match editor.as_mut() {
-            Some(editor) => match editor.read_line(&history) {
+            Some(editor) => match editor.read_line(&history, &status) {
                 Ok(line) => line,
                 Err(e) => {
                     eprintln!("terminal input error: {}", e);
@@ -2067,37 +2755,108 @@ fn run_chat_repl(base_url: Option<String>, model: Option<String>) {
             messages.truncate(1);
             history.clear();
             println!("history cleared.");
-            if let Some(bar) = status.as_mut() {
-                bar.draw(&status_segments(&config, &messages, &tool_state));
+            continue;
+        }
+        if line == "/new" {
+            messages.truncate(1);
+            history.clear();
+            let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let mut new_s = Session::new(cwd, None).expect("failed to create session");
+            new_s.append_message(messages[0].clone()).ok(); // system
+            session = new_s;
+            println!("new session started.");
+            continue;
+        }
+        if line.starts_with("/name ") {
+            let name = line["/name ".len()..].trim().to_string();
+            if !name.is_empty() {
+                session.set_name(name.clone()).ok();
+                println!("session name: {}", name);
+            }
+            continue;
+        }
+        if line == "/session" {
+            println!("session: {}", session.display_name());
+            if let Some(path) = session.path() {
+                println!("path: {}", path.display());
+            }
+            println!("turns: {}", session.counter);
+            continue;
+        }
+        if line == "/resume" {
+            let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            match Session::list(&cwd) {
+                Ok(sessions) if !sessions.is_empty() => {
+                    println!("sessions:");
+                    for (i, (path, header)) in sessions.iter().enumerate() {
+                        let name = header.name.as_ref().map(|n| n.as_str()).unwrap_or("(unnamed)");
+                        println!("  {}: {} ({})", i, name, path.display());
+                    }
+                    println!("  (not implemented: select a session by index or path)");
+                }
+                _ => println!("no sessions found."),
+            }
+            continue;
+        }
+        if line.starts_with("/skill:") {
+            let name = line["/skill:".len()..].trim();
+            if let Some(skill) = skills.iter().find(|s| s.name == name) {
+                let content = fs::read_to_string(&skill.path).unwrap_or_default();
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(format!("--- Skill: {} ---\n{}", skill.name, content)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("skill".to_string()),
+                });
+                println!("loaded skill: {}", skill.name);
+            } else {
+                println!("skill not found: {}", name);
+                println!("available skills:");
+                for s in &skills {
+                    println!("  - {}", s.name);
+                }
             }
             continue;
         }
         if line.is_empty() {
             continue;
         }
+        // The editor erases the input box on submit; echo the sent prompt
+        // so it stays visible in the transcript.
+        if editor.is_some() {
+            println!("{}> {}{}{}", PROMPT_COLOR, INPUT_COLOR, line, RESET);
+            let _ = stdout.flush();
+        }
         history.push(line.clone());
-        messages.push(ChatMessage {
+        let user_msg = ChatMessage {
             role: "user".to_string(),
             content: Some(line),
             tool_calls: None,
             tool_call_id: None,
             name: None,
-        });
+        };
+        let before = messages.len();
+        messages.push(user_msg);
         match process_turn(&config, &mut messages, &mut tool_state) {
-            Ok(_) => println!(),
-            Err(e) => eprintln!("{}error: {}{}", ERROR_COLOR, e, RESET),
-        }
-        if let Some(bar) = status.as_mut() {
-            bar.draw(&status_segments(&config, &messages, &tool_state));
+            Ok(_) => {
+                println!();
+                // Persist every message added during this turn (assistant, tool calls, results).
+                for msg in &messages[before..] {
+                    session.append_message(msg.clone()).ok();
+                }
+            }
+            Err(e) => {
+                eprintln!("{}error: {}{}", ERROR_COLOR, e, RESET);
+                // Persist even on error so the failed turn is recorded.
+                for msg in &messages[before..] {
+                    session.append_message(msg.clone()).ok();
+                }
+            }
         }
     }
-    // Clean up the display before handing the terminal back to the shell:
-    // clear the screen, home the cursor, then restore the scroll region.
-    print!("\x1b[2J\x1b[1;1H");
+    // Hand the terminal back with the transcript still visible.
     io::stdout().flush().ok();
-    if let Some(bar) = status.as_ref() {
-        bar.uninstall();
-    }
 }
 
 fn run_interactive() {
@@ -2146,9 +2905,25 @@ fn run_interactive() {
     }
 }
 
-fn parse_args() -> (Option<String>, Option<String>, Vec<String>) {
+struct Args {
+    base_url: Option<String>,
+    model: Option<String>,
+    session_path: Option<PathBuf>,
+    no_session: bool,
+    new_session: bool,
+    session_name: Option<String>,
+    skill_dirs: Vec<PathBuf>,
+    rest: Vec<String>,
+}
+
+fn parse_args() -> Args {
     let mut base_url: Option<String> = None;
     let mut model: Option<String> = None;
+    let mut session_path: Option<PathBuf> = None;
+    let mut no_session = false;
+    let mut new_session = false;
+    let mut session_name: Option<String> = None;
+    let mut skill_dirs: Vec<PathBuf> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -2168,24 +2943,62 @@ fn parse_args() -> (Option<String>, Option<String>, Vec<String>) {
                     std::process::exit(1);
                 }
             }
+        } else if arg == "--session" || arg == "-s" {
+            match args.next() {
+                Some(p) => session_path = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("error: --session requires a value");
+                    std::process::exit(1);
+                }
+            }
+        } else if arg == "--no-session" {
+            no_session = true;
+        } else if arg == "--new" || arg == "-n" {
+            new_session = true;
+        } else if arg == "--name" {
+            match args.next() {
+                Some(n) => session_name = Some(n),
+                None => {
+                    eprintln!("error: --name requires a value");
+                    std::process::exit(1);
+                }
+            }
+        } else if arg == "--skill" {
+            match args.next() {
+                Some(p) => skill_dirs.push(PathBuf::from(p)),
+                None => {
+                    eprintln!("error: --skill requires a value");
+                    std::process::exit(1);
+                }
+            }
         } else {
             rest.push(arg);
         }
     }
-    (base_url, model, rest)
+    Args {
+        base_url,
+        model,
+        session_path,
+        no_session,
+        new_session,
+        session_name,
+        skill_dirs,
+        rest,
+    }
 }
 
 fn main() {
-    let (base_url, model, args) = parse_args();
-    if args.len() == 1 && args[0] == "--tool" {
+    install_sigint_handler();
+    let args = parse_args();
+    if args.rest.len() == 1 && args.rest[0] == "--tool" {
         run_interactive();
-    } else if !args.is_empty() {
-        let prompt = args.join(" ");
-        if let Err(e) = run_one_shot(&prompt, base_url, model) {
+    } else if !args.rest.is_empty() {
+        let prompt = args.rest.join(" ");
+        if let Err(e) = run_one_shot(&prompt, &args) {
             eprintln!("agent error: {}", e);
             std::process::exit(1);
         }
     } else {
-        run_chat_repl(base_url, model);
+        run_chat_repl(&args);
     }
 }
