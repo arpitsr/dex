@@ -57,6 +57,7 @@ cp config.sample.json ~/.config/ak/config.json
 
 | Field            | Type     | Description                                                        |
 | ---------------- | -------- | ------------------------------------------------------------------ |
+| `provider`       | string   | `opencode` or `openai-codex`.                                     |
 | `api_key`        | string   | Default API key (overridable by `OPENAI_API_KEY`).                 |
 | `base_url`       | string   | Default API base URL (overridable by `OPENAI_BASE_URL`).           |
 | `model`          | string   | Default model (overridable by `OPENAI_MODEL`).                     |
@@ -66,6 +67,22 @@ cp config.sample.json ~/.config/ak/config.json
 
 The `api` field follows the provider/model API distinction used by Pi and Codex.
 It defaults to `openai-completions` for existing configurations.
+
+For OpenCode, use its API key and endpoint. For ChatGPT-backed Codex, first run
+`codex --login`, then select the Codex provider:
+
+```json
+{
+  "provider": "openai-codex",
+  "model": "gpt-5.6-luna",
+  "api": "openai-responses"
+}
+```
+
+When `provider` is `openai-codex`, `ak` reads the current access token and
+account ID from `CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or
+`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`). Run `codex --login`
+again when the local token expires.
 
 A minimal example:
 
@@ -222,6 +239,9 @@ cache (`ak-tool-cache.json`) is kept across runs to reduce redundant work.
 | `OPENAI_BASE_URL`    | API base URL override (non-empty).                       |
 | `OPENAI_MODEL`       | Model override.                                          |
 | `OPENAI_API`         | Wire protocol override (`openai-completions` or `openai-responses`). |
+| `AK_PROVIDER`        | Provider override (`opencode` or `openai-codex`).          |
+| `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |
+| `CODEX_ACCOUNT_ID`   | Account ID paired with `CODEX_ACCESS_TOKEN`.               |
 | `AK_CONTEXT_WINDOW`  | Token context window for compaction/status (overrides `config.json`). |
 | `RUSTY_PI_CONFIG`    | Explicit path to `config.json`.                          |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
