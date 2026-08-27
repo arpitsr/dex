@@ -1,15 +1,23 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
+
+mod ui;
+mod session;
+mod tools;
+
+pub(crate) use session::{load_messages_from_session, Session};
+pub(crate) use tools::{execute, execute_to_string};
 
 // --- Skills ---
 // Lightweight Agent Skills support. Skills are discovered from directories
@@ -31,22 +39,17 @@ fn parse_skill(path: &Path) -> Option<Skill> {
     if first.trim() != "---" {
         return None;
     }
-    let mut frontmatter = String::new();
+    let mut name = None;
+    let mut description = None;
     for line in lines {
         if line.trim() == "---" {
             break;
         }
-        frontmatter.push_str(line);
-        frontmatter.push('\n');
-    }
-    let mut name = None;
-    let mut description = None;
-    for line in frontmatter.lines() {
         let line = line.trim();
         if let Some(val) = line.strip_prefix("name:") {
-            name = Some(val.trim().to_string());
+            name = Some(unquote(val.trim()));
         } else if let Some(val) = line.strip_prefix("description:") {
-            description = Some(val.trim().to_string());
+            description = Some(unquote(val.trim()));
         }
     }
     Some(Skill {
@@ -54,6 +57,20 @@ fn parse_skill(path: &Path) -> Option<Skill> {
         description: description.unwrap_or_default(),
         path: path.to_path_buf(),
     })
+}
+
+/// Strip a single layer of surrounding quotes (single or double) from a YAML
+/// scalar value, so `description: "Short description"` yields the bare value.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 {
+        let first = s.chars().next().unwrap();
+        let last = s.chars().last().unwrap();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
 }
 
 fn discover_skills(dirs: &[PathBuf]) -> Vec<Skill> {
@@ -98,270 +115,16 @@ fn format_skills_for_prompt(skills: &[Skill]) -> String {
     out
 }
 
-// --- Session persistence ---
-// Linear JSONL session file: header + message entries.
-// Auto-saved after each message exchange so crashes and Ctrl+C
-// never lose more than one turn. Simpler than pi's tree model
-// because this agent is linear (no branching).
-
-const SESSION_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct SessionHeader {
-    #[serde(rename = "type")]
-    entry_type: String,
-    version: u32,
-    id: String,
-    timestamp: String,
-    cwd: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct SessionMessageEntry {
-    #[serde(rename = "type")]
-    entry_type: String,
-    id: String,
-    timestamp: String,
-    #[serde(flatten)]
-    message: ChatMessage,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct SessionInfoEntry {
-    #[serde(rename = "type")]
-    entry_type: String,
-    id: String,
-    timestamp: String,
-    name: String,
-}
-
-#[derive(Debug)]
-struct Session {
-    header: SessionHeader,
-    path: Option<PathBuf>,
-    counter: u64,
-}
-
-impl Session {
-    fn session_dir() -> PathBuf {
-        if let Some(dir) = env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(dir).join("ak/sessions");
-        }
-        env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".local/share/ak/sessions"))
-            .unwrap_or_else(|| PathBuf::from(".ak/sessions"))
-    }
-
-    fn cwd_slug(cwd: &str) -> String {
-        cwd.replace('/', "-").replace("\\", "-")
-    }
-
-    fn new(cwd: String, name: Option<String>) -> io::Result<Self> {
-        let id = format!("{}_{}", Self::now_ms(), uuid4());
-        let dir = Self::session_dir().join(Self::cwd_slug(&cwd));
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.jsonl", id));
-        let header = SessionHeader {
-            entry_type: "session".to_string(),
-            version: SESSION_VERSION,
-            id: id.clone(),
-            timestamp: Self::now_iso(),
-            cwd,
-            name,
-        };
-        let line = serde_json::to_string(&header).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{}", line)?;
-        let session = Self {
-            header,
-            path: Some(path),
-            counter: 0,
-        };
-        Ok(session)
-    }
-
-    fn from_path(path: &Path) -> io::Result<Self> {
-        let file = fs::read_to_string(path)?;
-        let mut lines = file.lines();
-        let first = lines.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty session file"))?;
-        let header: SessionHeader = serde_json::from_str(first)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad session header: {}", e)))?;
-        let counter = lines.count() as u64;
-        Ok(Self { header, path: Some(path.to_path_buf()), counter })
-    }
-
-    fn in_memory(cwd: String) -> Self {
-        let id = format!("{}_{}", Self::now_ms(), uuid4());
-        Self {
-            header: SessionHeader {
-                entry_type: "session".to_string(),
-                version: SESSION_VERSION,
-                id,
-                timestamp: Self::now_iso(),
-                cwd,
-                name: None,
-            },
-            path: None,
-            counter: 0,
-        }
-    }
-
-    fn open_or_continue(cwd: String, session_path: Option<&Path>, no_session: bool) -> io::Result<Self> {
-        if no_session {
-            return Ok(Self::in_memory(cwd));
-        }
-        if let Some(path) = session_path {
-            if path.exists() {
-                return Self::from_path(path);
-            }
-        }
-        // Try to continue the most recent session for this cwd
-        let dir = Self::session_dir().join(Self::cwd_slug(&cwd));
-        if let Ok(mut entries) = fs::read_dir(&dir) {
-            let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
-            while let Some(Ok(entry)) = entries.next() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(modified) = meta.modified() {
-                            if latest.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
-                                latest = Some((path, modified));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((path, _)) = latest {
-                return Self::from_path(&path);
-            }
-        }
-        Self::new(cwd, None)
-    }
-
-    fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
-        let dir = Self::session_dir().join(Self::cwd_slug(cwd));
-        let mut sessions = Vec::new();
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        if let Some(first) = text.lines().next() {
-                            if let Ok(header) = serde_json::from_str::<SessionHeader>(first) {
-                                sessions.push((path, header));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
-        Ok(sessions)
-    }
-
-    fn set_name(&mut self, name: String) -> io::Result<()> {
-        self.header.name = Some(name.clone());
-        let entry = SessionInfoEntry {
-            entry_type: "session_info".to_string(),
-            id: self.next_id(),
-            timestamp: Self::now_iso(),
-            name,
-        };
-        self.append_line(&entry)
-    }
-
-    fn append_message(&mut self, message: ChatMessage) -> io::Result<()> {
-        let entry = SessionMessageEntry {
-            entry_type: "message".to_string(),
-            id: self.next_id(),
-            timestamp: Self::now_iso(),
-            message,
-        };
-        self.append_line(&entry)
-    }
-
-    fn append_line<T: Serialize>(&mut self, entry: &T) -> io::Result<()> {
-        if let Some(path) = &self.path {
-            let line = serde_json::to_string(entry).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
-            writeln!(file, "{}", line)?;
-        }
-        Ok(())
-    }
-
-    fn next_id(&mut self) -> String {
-        self.counter += 1;
-        format!("{:x}", self.counter)
-    }
-
-    fn now_iso() -> String {
-        let now = SystemTime::now();
-        let secs = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
-        // Naive RFC3339-ish
-        let dt = chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or_default();
-        dt.to_rfc3339()
-    }
-
-    fn now_ms() -> u64 {
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
-    }
-
-    fn id(&self) -> &str {
-        &self.header.id
-    }
-
-    fn name(&self) -> Option<&str> {
-        self.header.name.as_deref()
-    }
-
-    fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
-    fn is_persisted(&self) -> bool {
-        self.path.is_some()
-    }
-
-    fn display_name(&self) -> String {
-        self.name().map(|n| n.to_string()).unwrap_or_else(|| self.id().to_string())
-    }
-}
-
-fn uuid4() -> String {
-    let mut bytes = [0u8; 16];
-    for b in bytes.iter_mut() {
-        *b = rand::random();
-    }
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-    )
-}
-
-/// Load messages from a session file (excluding the header and metadata entries).
-fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
-    let text = fs::read_to_string(path)?;
-    let mut messages = Vec::new();
-    for line in text.lines().skip(1) {
-        let value: Value = serde_json::from_str(line)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad session line: {}", e)))?;
-        if value.get("type").and_then(Value::as_str) == Some("message") {
-            let msg: ChatMessage = serde_json::from_value(value)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad message: {}", e)))?;
-            if msg.role != "system" {
-                messages.push(msg);
-            }
-        }
-    }
-    Ok(messages)
-}
-
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn request_cancel() {
+    CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn take_cancel_requested() -> bool {
+    CANCEL_REQUESTED.swap(false, Ordering::SeqCst)
+}
 
 extern "C" fn handle_sigint(_: i32) {
     INTERRUPTED.store(true, Ordering::SeqCst);
@@ -382,11 +145,10 @@ fn install_sigint_handler() {
     unsafe extern "C" {
         fn sigaction(signum: i32, act: *const SigAction, old: *mut SigAction) -> i32;
     }
-    const SA_RESTART: i32 = 0x1000_0000;
     let action = SigAction {
         handler: handle_sigint,
         mask: [0; 16],
-        flags: 0 & !SA_RESTART, // no SA_RESTART => read() returns EINTR
+        flags: 0, // no SA_RESTART => read() returns EINTR
         restorer: 0,
     };
     unsafe {
@@ -400,12 +162,9 @@ fn take_interrupt() -> bool {
 }
 
 const RESET: &str = "\x1b[0m";
-const PROMPT_COLOR: &str = "\x1b[1;36m";
-const INPUT_COLOR: &str = "\x1b[1;37m";
 const TOOL_INPUT_COLOR: &str = "\x1b[1;33m";
 const TOOL_OUTPUT_COLOR: &str = "\x1b[0;34m";
 const AGENT_COLOR: &str = "\x1b[1;32m";
-const ERROR_COLOR: &str = "\x1b[1;31m";
 
 // --- Working spinner ---
 //
@@ -419,6 +178,31 @@ static CONSOLE_LOCK: Mutex<()> = Mutex::new(());
 static SPINNER_RUNNING: AtomicBool = AtomicBool::new(false);
 static SPINNER_DRAWN: AtomicBool = AtomicBool::new(false);
 
+/// A single streamed line destined for the UI transcript. Plain text (no
+/// ANSI) so the UI applies its own styling. Ratatui-agnostic.
+#[derive(Debug, Clone)]
+pub enum SinkLine {
+    Assistant(String),
+    ToolInput(String),
+    ToolOutput { name: String, summary: String },
+    System(String),
+    Error(String),
+}
+
+/// When set (ratatui UI mode), the agent routes streamed output here instead
+/// of printing to the console.
+static CONSOLE_SINK: Mutex<Option<mpsc::Sender<SinkLine>>> = Mutex::new(None);
+
+/// Enable/disable the console sink (used by the ratatui UI path).
+pub fn set_console_sink(sink: Option<mpsc::Sender<SinkLine>>) {
+    *CONSOLE_SINK.lock().unwrap_or_else(|e| e.into_inner()) = sink;
+}
+
+/// Clone of the active sink sender, if any.
+pub fn console_sink() -> Option<mpsc::Sender<SinkLine>> {
+    CONSOLE_SINK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Erase the drawn spinner frame, if any. Caller holds CONSOLE_LOCK.
 fn erase_spinner_frame() {
     if SPINNER_DRAWN.swap(false, Ordering::SeqCst) {
@@ -429,7 +213,10 @@ fn erase_spinner_frame() {
 }
 
 /// Run `f` with the spinner suspended so output never interleaves with frames.
-fn with_console<T>(f: impl FnOnce() -> T) -> T {
+fn with_console(f: impl FnOnce()) {
+    if console_sink().is_some() {
+        return; // UI mode: output is routed through the sink; skip console IO
+    }
     let _lock = CONSOLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     erase_spinner_frame();
     f()
@@ -443,6 +230,9 @@ struct SpinnerGuard {
 
 impl SpinnerGuard {
     fn start(label: &str) -> Self {
+        if console_sink().is_some() {
+            return Self { worker: None }; // UI mode shows "working…" in the status bar
+        }
         if !io::stdout().is_terminal() {
             return Self { worker: None };
         }
@@ -480,114 +270,6 @@ impl Drop for SpinnerGuard {
             SPINNER_RUNNING.store(false, Ordering::SeqCst);
             erase_spinner_frame();
         }
-    }
-}
-
-#[derive(Debug)]
-enum ToolError {
-    Missing(&'static str),
-    NotString(&'static str),
-    Io(io::Error),
-    EditNotUnique(usize),
-    Unknown(String),
-}
-
-impl std::fmt::Display for ToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ToolError::Missing(k) => write!(f, "missing argument '{}'", k),
-            ToolError::NotString(k) => write!(f, "argument '{}' must be a string", k),
-            ToolError::Io(e) => write!(f, "io error: {}", e),
-            ToolError::EditNotUnique(n) => write!(f, "edit target appears {} times (need exactly 1)", n),
-            ToolError::Unknown(t) => write!(f, "unknown tool '{}'", t),
-        }
-    }
-}
-
-fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolError> {
-    match args.get(key) {
-        Some(Value::String(s)) => Ok(s.clone()),
-        Some(_) => Err(ToolError::NotString(key)),
-        None => Err(ToolError::Missing(key)),
-    }
-}
-
-fn run_bash(command: &str) -> Result<String, ToolError> {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()
-        .map_err(ToolError::Io)?;
-    let mut result = String::new();
-    result.push_str(&String::from_utf8_lossy(&out.stdout));
-    result.push_str(&String::from_utf8_lossy(&out.stderr));
-    if !out.status.success() {
-        result.push_str(&format!("\n[exit {}]", out.status.code().unwrap_or(-1)));
-    }
-    Ok(result)
-}
-
-fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let path = arg_str(args, "path")?;
-    fs::read_to_string(&path).map_err(ToolError::Io)
-}
-
-fn tool_bash(args: &Map<String, Value>) -> Result<String, ToolError> {
-    run_bash(&arg_str(args, "command")?)
-}
-
-fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let path = arg_str(args, "path")?;
-    let content = arg_str(args, "content")?;
-    fs::write(&path, content).map_err(ToolError::Io)?;
-    Ok(format!("wrote {}", path))
-}
-
-fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let path = arg_str(args, "path")?;
-    let old = arg_str(args, "oldText")?;
-    let new = arg_str(args, "newText")?;
-    let content = fs::read_to_string(&path).map_err(ToolError::Io)?;
-    let count = content.matches(&old).count();
-    if count != 1 {
-        return Err(ToolError::EditNotUnique(count));
-    }
-    fs::write(&path, content.replacen(&old, &new, 1)).map_err(ToolError::Io)?;
-    Ok(format!("edited {}", path))
-}
-
-fn tool_grep(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let pattern = arg_str(args, "pattern")?;
-    let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
-    run_bash(&format!("grep -R -I -n -- {} {}", shell_escape(&pattern), shell_escape(&path)))
-}
-
-fn tool_find(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let pattern = arg_str(args, "pattern")?;
-    let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
-    run_bash(&format!("find {} -path '*{}*' -print", shell_escape(&path), pattern))
-}
-
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
-
-fn execute(name: &str, args: &Map<String, Value>) -> Result<String, ToolError> {
-    match name {
-        "read" => tool_read(args),
-        "bash" => tool_bash(args),
-        "write" => tool_write(args),
-        "edit" => tool_edit(args),
-        "grep" => tool_grep(args),
-        "find" => tool_find(args),
-        other => Err(ToolError::Unknown(other.to_string())),
-    }
-}
-
-fn execute_to_string(name: &str, args: &Map<String, Value>) -> String {
-    match execute(name, args) {
-        Ok(out) => out,
-        Err(e) => format!("Error: {}", e),
     }
 }
 
@@ -631,6 +313,56 @@ fn terminal_preview(text: &str) -> String {
     truncate_text(text, 10 * 1024, 100)
 }
 
+/// Compact single-line summary of a tool's arguments for the REPL transcript.
+/// Pulls the primary arg (path/command/pattern) instead of dumping raw JSON.
+fn short_arg(name: &str, input: &str) -> String {
+    let obj = serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|v| v.as_object().cloned());
+    let get = |k: &str| obj.as_ref().and_then(|o| o.get(k)).and_then(|x| x.as_str());
+    let primary = match name {
+        "read" | "write" | "edit" | "grep" | "glob" => get("path")
+            .or_else(|| get("file"))
+            .or_else(|| get("pattern"))
+            .or_else(|| get("glob")),
+        "bash" => get("command"),
+        _ => None,
+    };
+    let s = primary.filter(|s| !s.is_empty()).unwrap_or(input);
+    let s = s.lines().next().unwrap_or(s).trim();
+    let limit = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
+    s[..limit].to_string()
+}
+
+/// First non-empty, trimmed line of a tool result, truncated — a one-line
+/// confirmation for the REPL transcript instead of the full output.
+fn one_line_summary(text: &str) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let line = line.trim();
+    let limit = line.char_indices().nth(120).map(|(i, _)| i).unwrap_or(line.len());
+    line[..limit].to_string()
+}
+
+/// Human-sized result for the TUI. The full result still goes to the model;
+/// the transcript only needs enough information to explain what happened.
+fn tool_result_summary(name: &str, text: &str) -> String {
+    if text.starts_with("Error:") || text.contains("[exit ") {
+        return format!("failed · {}", one_line_summary(text));
+    }
+    let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let bytes = text.len();
+    match name {
+        "read" => format!("ok · {lines} lines · {bytes} bytes"),
+        "grep" => format!("ok · {lines} matches"),
+        "find" => format!("ok · {lines} entries"),
+        "bash" => match one_line_summary(text).as_str() {
+            "" => "ok".to_string(),
+            first => format!("ok · {first}"),
+        },
+        _ => format!("ok · {}", one_line_summary(text)),
+    }
+}
+
 // --- Markdown / syntax highlighting for assistant output ---
 
 /// Render an assistant message to the terminal as markdown, with
@@ -650,20 +382,17 @@ fn print_code_block(lang: &str, body: &str) {
         if !lang.is_empty() {
             cmd.args(["-l", lang]);
         }
-        match cmd.arg("-").stdin(Stdio::piped()).spawn() {
-            Ok(mut child) => {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(body.as_bytes());
-                }
-                drop(child.stdin.take());
-                if let Ok(out) = child.wait_with_output() {
-                    if out.status.success() {
-                        print!("{}", String::from_utf8_lossy(&out.stdout));
-                        return;
-                    }
+        if let Ok(mut child) = cmd.arg("-").stdin(Stdio::piped()).spawn() {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(body.as_bytes());
+            }
+            drop(child.stdin.take());
+            if let Ok(out) = child.wait_with_output() {
+                if out.status.success() {
+                    print!("{}", String::from_utf8_lossy(&out.stdout));
+                    return;
                 }
             }
-            Err(_) => {}
         }
         let _ = bin;
     }
@@ -694,125 +423,8 @@ fn model_tool_result(text: &str) -> String {
 // once it reaches the bottom edge of the terminal it docks there and
 // stays visible (like pi/codex CLIs).
 
-const CHROME_ROWS: usize = 2;
-
 /// Width of a string as displayed, ignoring ANSI escape sequences.
-fn visible_width(s: &str) -> usize {
-    let mut w = 0;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip CSI sequence up to its final byte (@ through ~).
-            for f in chars.by_ref() {
-                if f.is_ascii_alphabetic() || ('@'..='~').contains(&f) {
-                    break;
-                }
-            }
-        } else {
-            w += 1;
-        }
-    }
-    w
-}
-
-/// Truncate a styled status body to `cols` visible columns.
-fn truncate_visible(body: &str, cols: usize) -> String {
-    let budget = cols.saturating_sub(2);
-    let mut visible = String::new();
-    let mut w = 0usize;
-    let mut in_escape = false;
-    for c in body.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-            visible.push(c);
-            continue;
-        }
-        if in_escape {
-            visible.push(c);
-            if c.is_ascii_alphabetic() || ('@'..='~').contains(&c) {
-                in_escape = false;
-            }
-            continue;
-        }
-        w += 1;
-        if w > budget {
-            break;
-        }
-        visible.push(c);
-    }
-    visible
-}
-
-/// Compose the status line body from segments, left-aligned with dim
 /// dividers, truncated to fit the terminal width.
-fn status_body(segments: &[String], cols: usize) -> String {
-    const DIM: &str = "\x1b[2m";
-    let divider = format!("{} │ {}", DIM, RESET);
-    let mut body = String::new();
-    let mut width = 0usize;
-    let mut first = true;
-    for seg in segments {
-        if !first {
-            body.push_str(&divider);
-            width += 3;
-        }
-        first = false;
-        body.push_str(seg);
-        width += visible_width(seg);
-        if width + 4 >= cols {
-            break;
-        }
-    }
-    if width >= cols {
-        body = truncate_visible(&body, cols);
-    }
-    body
-}
-
-/// Build the status segments shown while waiting for user input.
-fn status_segments(config: &LlmConfig, messages: &[ChatMessage], state: &ToolState) -> Vec<String> {
-    let model_seg = format!("\x1b[1m{}\x1b[22m", config.model);
-    let turns = messages.iter().filter(|m| m.role == "user" && m.name.is_none()).count();
-    let msgs_seg = format!("{} msgs", messages.len());
-    // Context usage: prefer last API-reported prompt_tokens, else estimate.
-    let used = state.last_usage.unwrap_or_else(|| estimate_tokens(messages));
-    let pct = ((used as f64 / config.context_window.max(1) as f64) * 100.0).round() as u64;
-    let ctx_seg = format!(
-        "{}k/{}k ({}% left)",
-        (used + 999) / 1000,
-        config.context_window / 1000,
-        100usize.saturating_sub(pct as usize)
-    );
-    let tools_seg = format!("{} cached", state.cache.len());
-    vec![model_seg, msgs_seg, ctx_seg, tools_seg, format!("turn {}", turns)]
-}
-
-/// Plain-text transcript lines used to repaint the screen after a width
-/// change re-wraps everything.
-fn transcript_replay(messages: &[ChatMessage]) -> Vec<String> {
-    let mut lines = vec![format!("{}ak agent{}", AGENT_COLOR, RESET)];
-    for m in messages {
-        match m.role.as_str() {
-            "user" if m.name.is_none() => {
-                let body = m.content.clone().unwrap_or_default();
-                lines.push(format!("{}> {}{}{}", PROMPT_COLOR, INPUT_COLOR, body, RESET));
-            }
-            "assistant" => match (&m.tool_calls, &m.content) {
-                (Some(calls), _) => {
-                    let names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
-                    lines.push(format!("{}⋮ {}{}", TOOL_INPUT_COLOR, names.join(", "), RESET));
-                }
-                (None, Some(text)) => lines.push(text.clone()),
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-    lines
-}
-
-// --- OpenAI-compatible LLM integration ---
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ChatMessage {
     role: String,
@@ -848,8 +460,6 @@ struct ChatRequest {
     stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1054,6 +664,7 @@ fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
         .map_err(|e| format!("invalid config file {}: {}", path.display(), e).into())
 }
 
+#[derive(Clone)]
 struct LlmConfig {
     api_key: String,
     base_url: String,
@@ -1083,7 +694,7 @@ impl LlmConfig {
             model: model_override
                 .or_else(|| env::var("OPENAI_MODEL").ok())
                 .or(file.model)
-                .unwrap_or_else(|| "gpt-4o-mini".to_string()),
+                .unwrap_or_else(|| "gpt-5.6-luna".to_string()),
             thinking_effort: file.thinking_effort,
             // Context window in tokens; configurable via file (`context_window`)
             // or AK_CONTEXT_WINDOW env, with a conservative default.
@@ -1113,14 +724,26 @@ impl StreamPrinter {
     }
 
     fn feed_line(&mut self, line: &str) {
-        with_console(|| self.feed_line_inner(line))
+        if console_sink().is_some() {
+            // Sink mode: no spinner to erase; stream directly.
+            self.feed_line_inner(line);
+        } else {
+            with_console(|| self.feed_line_inner(line));
+        }
     }
 
     fn feed_line_inner(&mut self, line: &str) {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             if self.in_code {
-                print_code_block(&self.code_lang, &self.code_body);
+                if let Some(sink) = console_sink() {
+                    sink.send(SinkLine::Assistant(format!(
+                        "```{}:\n{}\n```",
+                        self.code_lang, self.code_body
+                    ))).ok();
+                } else {
+                    print_code_block(&self.code_lang, &self.code_body);
+                }
                 self.code_body.clear();
                 self.code_lang.clear();
                 self.in_code = false;
@@ -1133,13 +756,24 @@ impl StreamPrinter {
             self.code_body.push_str(line);
             self.code_body.push('\n');
         } else {
-            termimad::print_text(&format!("{}\n", line));
+            if let Some(sink) = console_sink() {
+                sink.send(SinkLine::Assistant(line.to_string())).ok();
+            } else {
+                termimad::print_text(&format!("{}\n", line));
+            }
         }
     }
 
     fn finish(self) {
         if self.in_code && !self.code_body.is_empty() {
-            with_console(|| print_code_block(&self.code_lang, &self.code_body));
+            if let Some(sink) = console_sink() {
+                sink.send(SinkLine::Assistant(format!(
+                    "```{}:\n{}\n```",
+                    self.code_lang, self.code_body
+                ))).ok();
+            } else {
+                with_console(|| print_code_block(&self.code_lang, &self.code_body));
+            }
         }
     }
 }
@@ -1251,7 +885,6 @@ fn call_llm(
         stream: true,
         stream_options: StreamOptions { include_usage: true },
         reasoning_effort: config.thinking_effort.clone(),
-        prompt_cache_key: Some("ak-agent-session".to_string()),
     };
 
     for attempt in 0..=MAX_RETRIES {
@@ -1287,7 +920,7 @@ fn call_llm(
             return Err(format!("API error: {}", body).into());
         }
 
-        return Ok(read_stream(resp)?);
+        return read_stream(resp);
     }
 
     unreachable!()
@@ -1374,7 +1007,7 @@ fn summarize_old_messages(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let transcript: String = old
         .iter()
-        .map(|m| message_to_transcript(m))
+        .map(message_to_transcript)
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = vec![
@@ -1473,6 +1106,8 @@ fn process_turn(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
     state: &mut ToolState,
+    steering_rx: Option<&mpsc::Receiver<String>>,
+    steering_accepted_tx: Option<&mpsc::Sender<String>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Spins while the agent works; erased automatically on return.
     let _working = SpinnerGuard::start("Working");
@@ -1480,6 +1115,26 @@ fn process_turn(
     let mut last_usage: Option<u64> = state.last_usage;
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
+        if take_cancel_requested() {
+            return Err("cancelled by user".into());
+        }
+        // Steering is consumed between turns/tool batches, while the worker
+        // still owns the conversation state. This avoids concurrent mutation
+        // of `messages` while allowing the UI to accept input immediately.
+        if let Some(rx) = steering_rx {
+            while let Ok(steering) = rx.try_recv() {
+                if let Some(accepted) = &steering_accepted_tx {
+                    let _ = accepted.send(steering.clone());
+                }
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(steering),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("steering".to_string()),
+                });
+            }
+        }
         // Nudge the model to finish as we approach the iteration budget.
         let remaining = MAX_TOOL_ITERATIONS - iteration;
         if remaining == WRAP_UP_THRESHOLD {
@@ -1563,26 +1218,36 @@ fn process_turn(
                 last_tools.push(cache_key.clone());
                 let repeated_count =
                     last_tools.iter().filter(|k| **k == cache_key).count();
-                with_console(|| {
-                    eprintln!(
-                        "{}[tool input] {} {}{}",
-                        TOOL_INPUT_COLOR,
-                        call.function.name,
-                        terminal_preview(&input),
-                        RESET
-                    );
-                });
+                if let Some(sink) = console_sink() {
+                    let _ = sink.send(SinkLine::ToolInput(format!(
+                        "{} {}",
+                        call.function.name, short_arg(&name, &input)
+                    )));
+                } else {
+                    with_console(|| {
+                        eprintln!(
+                            "{}[tool input] {} {}{}",
+                            TOOL_INPUT_COLOR,
+                            call.function.name,
+                            terminal_preview(&input),
+                            RESET
+                        );
+                    });
+                }
 
                 let cacheable = matches!(name.as_str(), "read" | "grep" | "find");
+                let mut cache_hit = false;
                 let result = if repeated_count >= 3 {
                     "Error: repeated identical tool call; choose a different action or finish."
                         .to_string()
                 } else if cacheable {
                     if let Some(cached) = state.cache.get(&cache_key) {
-                        with_console(|| eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET));
+                        cache_hit = true;
+                        if console_sink().is_none() {
+                            with_console(|| eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET));
+                        }
                         cached.clone()
                     } else {
-                        let result = result;
                         state.insert(cache_key, result.clone());
                         result
                     }
@@ -1592,15 +1257,23 @@ fn process_turn(
                     }
                     result
                 };
-                with_console(|| {
-                    eprintln!(
-                        "{}[tool output] {}:\n{}{}",
-                        TOOL_OUTPUT_COLOR,
-                        name,
-                        terminal_preview(&result),
-                        RESET
-                    );
-                });
+                if let Some(sink) = console_sink() {
+                    let mut summary = tool_result_summary(&name, &result);
+                    if cache_hit {
+                        summary = format!("cached · {summary}");
+                    }
+                    let _ = sink.send(SinkLine::ToolOutput { name: name.clone(), summary });
+                } else {
+                    with_console(|| {
+                        eprintln!(
+                            "{}[tool output] {}:\n{}{}",
+                            TOOL_OUTPUT_COLOR,
+                            name,
+                            terminal_preview(&result),
+                            RESET
+                        );
+                    });
+                }
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(model_tool_result(&result)),
@@ -1619,6 +1292,25 @@ fn process_turn(
                 tool_call_id: None,
                 name: None,
             });
+            if let Some(rx) = steering_rx {
+                let steering: Vec<String> = rx.try_iter().collect();
+                if !steering.is_empty() {
+                    for content in steering {
+                        if let Some(accepted) = &steering_accepted_tx {
+                            let _ = accepted.send(content.clone());
+                        }
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: Some(content),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: Some("steering".to_string()),
+                        });
+                    }
+                    state.last_usage = last_usage;
+                    continue;
+                }
+            }
             state.last_usage = last_usage;
             return Ok(text);
         }
@@ -1646,1217 +1338,48 @@ fn run_one_shot(
         ChatMessage { role: "user".to_string(), content: Some(prompt.to_string()), tool_calls: None, tool_call_id: None, name: None },
     ];
     let mut state = ToolState::load();
-    let result = process_turn(&config, &mut messages, &mut state);
+    let result = process_turn(&config, &mut messages, &mut state, None, None);
     if !args.no_session {
         let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        let mut session = if args.new_session {
-            let mut s = Session::new(cwd, args.session_name.clone())?;
-            if let Some(name) = &args.session_name {
-                s.set_name(name.clone())?;
-            }
-            s
+        // A corrupt/truncated resume target must not abort the prompt — fall
+        // back to a fresh session instead of propagating the error with `?`.
+        let mut session = match if args.new_session {
+            Session::new(cwd.clone(), args.session_name.clone())
         } else {
-            let mut s = Session::open_or_continue(cwd, args.session_path.as_deref(), false)?;
-            if let Some(name) = &args.session_name {
-                s.set_name(name.clone())?;
+            Session::open_or_continue(cwd.clone(), args.session_path.as_deref(), false)
+        } {
+            Ok(mut s) => {
+                if let Some(name) = &args.session_name {
+                    s.set_name(name.clone()).ok();
+                }
+                s
             }
-            s
+            Err(e) => {
+                eprintln!("[session] could not open session ({}); starting fresh", e);
+                match Session::new(cwd, args.session_name.clone()) {
+                    Ok(mut s) => {
+                        if let Some(name) = &args.session_name {
+                            s.set_name(name.clone()).ok();
+                        }
+                        s
+                    }
+                    Err(e2) => {
+                        eprintln!("[session] could not create session ({}); skipping save", e2);
+                        // Continue without persistence — the prompt still ran.
+                        for msg in &messages[1..] {
+                            let _ = msg;
+                        }
+                        return result.map(|_| ());
+                    }
+                }
+            }
         };
         for msg in &messages[1..] { // skip system
-            session.append_message(msg.clone())?;
+            session.append_message(msg.clone()).ok();
         }
     }
     println!();
     result.map(|_| ())
-}
-
-enum Key {
-    Char(char),
-    Paste(String),
-    Enter,
-    NewLine,
-    Backspace,
-    Delete,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    CtrlC,
-    CtrlD,
-    CtrlU,
-    CtrlK,
-    CtrlW,
-    Noop,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct InputVisualRow {
-    start: usize,
-    end: usize,
-    width: usize,
-}
-
-struct TerminalEditor {
-    stdin: fs::File,
-    stdout: io::Stdout,
-    original_stty: String,
-    last_ctrl_c: Option<std::time::Instant>,
-    /// Screen columns of the terminal (queried lazily).
-    cols: usize,
-    /// Number of visible box rows rendered at the last refresh.
-    last_rows: usize,
-    /// Cursor row within the rendered block at the last refresh.
-    last_cursor_row: usize,
-    /// First visual row currently shown when the input is taller than the
-    /// editor viewport (the editor scrolls internally).
-    view_start: usize,
-    /// Preferred visual column for consecutive vertical cursor moves.
-    preferred_col: Option<usize>,
-    /// Absolute screen row (1-indexed) of the input box top at the last
-    /// refresh; 0 when nothing is rendered.
-    block_top: usize,
-    /// True when the hardware cursor position is unknown (after external
-    /// output scrolled the screen) and must be re-queried via DSR before
-    /// rendering.
-    resync: bool,
-    /// Column count at the last refresh (0 before the first render).
-    last_cols: usize,
-    /// Transcript lines to replay after a width change re-wraps the screen.
-    replay: Vec<String>,
-    /// Input bytes read from the tty but not yet interpreted (e.g. typed
-    /// ahead of a DSR reply).
-    pending: VecDeque<u8>,
-}
-
-/// Query the terminal size via `stty size`, defaulting to (24, 80).
-fn terminal_size() -> (usize, usize) {
-    let out = Command::new("stty")
-        .arg("size")
-        .stdin(Stdio::inherit())
-        .output()
-        .ok();
-    out.and_then(|out| {
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut parts = text.split_whitespace();
-        let rows = parts.next()?.parse::<usize>().ok()?;
-        let cols = parts.next()?.parse::<usize>().ok()?;
-        Some((rows, cols))
-    })
-    .filter(|&(r, c)| r > 0 && c > 0)
-    .unwrap_or((24, 80))
-}
-
-#[allow(dead_code)]
-fn terminal_cols() -> usize {
-    terminal_size().1
-}
-
-impl TerminalEditor {
-    fn new() -> io::Result<Self> {
-        let stdin = fs::File::open("/dev/tty")?;
-        let state = Command::new("stty")
-            .arg("-g")
-            .stdin(Stdio::from(stdin.try_clone()?))
-            .output()?;
-        if !state.status.success() {
-            return Err(io::Error::other("could not read terminal settings"));
-        }
-        let original_stty = String::from_utf8_lossy(&state.stdout).trim().to_string();
-        let raw = Command::new("stty")
-            .args([
-                // Keep isig ON so Ctrl+C raises SIGINT even while a
-                // request is streaming; the handler sets a flag that the
-                // stream loop checks.
-                "-icanon",
-                "-echo",
-                "-ixon",
-                "-icrnl",
-                "-inlcr",
-                "-igncr",
-                "min",
-                "1",
-                "time",
-                "0",
-            ])
-            .stdin(Stdio::from(stdin.try_clone()?))
-            .status()?;
-        if !raw.success() {
-            return Err(io::Error::other("could not enable terminal input mode"));
-        }
-        let mut stdout = io::stdout();
-        // Kitty keyboard protocol for Shift+Enter, xterm modifyOtherKeys as
-        // the fallback, plus bracketed paste. No capability queries: their
-        // replies would land in the input queue as phantom keystrokes.
-        stdout.write_all(b"\x1b[?2004h\x1b[>7u\x1b[>4;2m")?;
-        stdout.flush()?;
-        Ok(Self {
-            stdin,
-            stdout,
-            original_stty,
-            last_ctrl_c: None,
-            cols: terminal_cols(),
-            last_rows: 0,
-            last_cursor_row: 0,
-            view_start: 0,
-            preferred_col: None,
-            block_top: 0,
-            resync: true,
-            last_cols: 0,
-            replay: Vec::new(),
-            pending: VecDeque::new(),
-        })
-    }
-
-    /// Read exactly buf.len() bytes from the tty, honoring pushed-back
-    /// input first. An EINTR interruption (Ctrl+C with isig enabled)
-    /// surfaces as `ErrorKind::Interrupted` so callers can turn it into
-    /// a Ctrl+C key event; it must not be retried transparently.
-    fn tty_read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        for slot in buf.iter_mut() {
-            *slot = if let Some(b) = self.pending.pop_front() {
-                b
-            } else {
-                let mut one = [0; 1];
-                match self.stdin.read(&mut one) {
-                    Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tty closed")),
-                    Ok(_) => one[0],
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
-                    Err(e) => return Err(e),
-                }
-            };
-        }
-        Ok(())
-    }
-
-    /// Set the transcript lines used to rebuild the screen after a width
-    /// change (re-wrapping shifts every cached row).
-    fn set_replay(&mut self, replay: Vec<String>) {
-        self.replay = replay;
-    }
-
-    fn kitty_key(sequence: &[u8]) -> Option<Key> {
-        if !sequence.ends_with(b"u") {
-            return None;
-        }
-        let fields: Vec<u32> = std::str::from_utf8(&sequence[..sequence.len() - 1])
-            .ok()?
-            .split(';')
-            .map(str::parse)
-            .collect::<Result<_, _>>()
-            .ok()?;
-        let codepoint = *fields.first()?;
-        let modifiers = fields.get(1).copied().unwrap_or(1).saturating_sub(1);
-        let shift = modifiers & 1 != 0;
-        let ctrl = modifiers & 4 != 0;
-
-        match codepoint {
-            13 => Some(if shift || ctrl { Key::NewLine } else { Key::Enter }),
-            127 => Some(Key::Backspace),
-            1 if ctrl => Some(Key::Home),
-            3 if ctrl => Some(Key::CtrlC),
-            4 if ctrl => Some(Key::CtrlD),
-            5 if ctrl => Some(Key::End),
-            10 if ctrl => Some(Key::NewLine),
-            11 if ctrl => Some(Key::CtrlK),
-            21 if ctrl => Some(Key::CtrlU),
-            23 if ctrl => Some(Key::CtrlW),
-            _ if ctrl => match char::from_u32(codepoint)?.to_ascii_lowercase() {
-                'a' => Some(Key::Home),
-                'c' => Some(Key::CtrlC),
-                'd' => Some(Key::CtrlD),
-                'e' => Some(Key::End),
-                'j' => Some(Key::NewLine),
-                'k' => Some(Key::CtrlK),
-                'u' => Some(Key::CtrlU),
-                'w' => Some(Key::CtrlW),
-                _ => Some(Key::Noop),
-            },
-            _ => char::from_u32(codepoint)
-                .filter(|&character| !character.is_control())
-                .map(Key::Char),
-        }
-    }
-
-    fn read_key(&mut self) -> io::Result<Key> {
-        // With isig enabled, Ctrl+C raises SIGINT rather than arriving as
-        // a 0x03 byte. It can surface two ways: the flag set before we
-        // block, or EINTR from read(2) while blocked (SA_RESTART is off).
-        if take_interrupt() {
-            return Ok(Key::CtrlC);
-        }
-        let mut byte = [0; 1];
-        match self.tty_read(&mut byte) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(Key::CtrlC),
-            Err(e) => return Err(e),
-        }
-        match byte[0] {
-            b'\r' => Ok(Key::Enter),
-            // Pi binds Ctrl+J as an alias for Shift+Enter. A terminal that
-            // sends a plain line feed therefore gets the same newline
-            // behavior without confusing it with submit.
-            b'\n' => Ok(Key::NewLine),
-            8 | 127 => Ok(Key::Backspace),
-            1 => Ok(Key::Home),
-            5 => Ok(Key::End),
-            3 => Ok(Key::CtrlC),
-            4 => Ok(Key::CtrlD),
-            11 => Ok(Key::CtrlK),
-            21 => Ok(Key::CtrlU),
-            23 => Ok(Key::CtrlW),
-            0x1b => {
-                let mut introducer = [0; 1];
-                self.tty_read(&mut introducer)?;
-                match introducer[0] {
-                    // Alt+Enter is the fallback sequence used by terminals
-                    // that cannot report Shift+Enter directly.
-                    b'\r' | b'\n' => Ok(Key::NewLine),
-                    b'[' | b'O' => {
-                        let mut sequence = Vec::with_capacity(12);
-                        loop {
-                            let mut next = [0; 1];
-                            self.tty_read(&mut next)?;
-                            sequence.push(next[0]);
-                            if (0x40..=0x7e).contains(&next[0]) {
-                                break;
-                            }
-                            if sequence.len() >= 32 {
-                                return Ok(Key::Noop);
-                            }
-                        }
-
-                        if let Some(key) = Self::kitty_key(&sequence) {
-                            return Ok(key);
-                        }
-                        Ok(match sequence.as_slice() {
-                            // Plain and modified cursor sequences. Kitty's
-                            // protocol adds a modifier parameter before the
-                            // final cursor letter, so match that suffix too.
-                            s if s.ends_with(b"A") => Key::Up,
-                            s if s.ends_with(b"B") => Key::Down,
-                            s if s.ends_with(b"C") => Key::Right,
-                            s if s.ends_with(b"D") => Key::Left,
-                            s if s.ends_with(b"H") => Key::Home,
-                            s if s.ends_with(b"F") => Key::End,
-                            b"1~" | b"7~" => Key::Home,
-                            b"3~" => Key::Delete,
-                            b"4~" | b"8~" => Key::End,
-                            b"200~" => {
-                                let end = b"\x1b[201~";
-                                let mut pasted = Vec::new();
-                                loop {
-                                    let mut next = [0; 1];
-                                    self.tty_read(&mut next)?;
-                                    pasted.push(next[0]);
-                                    if pasted.ends_with(end) {
-                                        pasted.truncate(pasted.len() - end.len());
-                                        break;
-                                    }
-                                }
-                                Key::Paste(String::from_utf8_lossy(&pasted).into_owned())
-                            }
-                            // Kitty keyboard protocol and xterm
-                            // modifyOtherKeys encodings for Enter.
-                            b"13u" | b"13;1u" => Key::Enter,
-                            b"13;2u" | b"13;2~" | b"27;2;13~" => Key::NewLine,
-                            _ => Key::Noop,
-                        })
-                    }
-                    _ => Ok(Key::Noop),
-                }
-            }
-            first => {
-                let width = match first {
-                    0xc0..=0xdf => 2,
-                    0xe0..=0xef => 3,
-                    0xf0..=0xf7 => 4,
-                    _ => 1,
-                };
-                if width == 1 {
-                    return Ok(Key::Char(first as char));
-                }
-                let mut bytes = [0; 4];
-                bytes[0] = first;
-                self.tty_read(&mut bytes[1..width])?;
-                let character = std::str::from_utf8(&bytes[..width])
-                    .ok()
-                    .and_then(|text| text.chars().next())
-                    .unwrap_or('\u{fffd}');
-                Ok(Key::Char(character))
-            }
-        }
-    }
-
-    /// Display width of a char; treats anything non-ASCII as width 2 as an
-    /// approximation (good enough to avoid wrap-math drift).
-    fn char_width(c: char) -> usize {
-        if c.is_ascii() { 1 } else { 2 }
-    }
-
-    fn prefix_width(cols: usize) -> usize {
-        cols.min(2)
-    }
-
-    /// Lay out logical input (including explicit newlines) into visual rows.
-    /// The final spare column is reserved for the cursor, matching pi's
-    /// editor layout and avoiding a deferred terminal wrap at the right edge.
-    fn layout(
-        line: &[char],
-        cursor: usize,
-        content_width: usize,
-    ) -> (Vec<InputVisualRow>, usize, usize) {
-        let cursor = cursor.min(line.len());
-        let mut rows = Vec::new();
-        let mut start = 0;
-        let mut width = 0;
-        let mut cursor_row = 0;
-        let mut cursor_col = 0;
-
-        let mut wrap_opportunity: Option<(usize, usize)> = None;
-        for (index, &character) in line.iter().enumerate() {
-            if character == '\n' {
-                if index == cursor {
-                    cursor_row = rows.len();
-                    cursor_col = width;
-                }
-                rows.push(InputVisualRow { start, end: index, width });
-                start = index + 1;
-                width = 0;
-                wrap_opportunity = None;
-                continue;
-            }
-
-            let char_width = Self::char_width(character);
-            if start < index && width + char_width > content_width {
-                if let Some((break_at, break_width)) = wrap_opportunity.take() {
-                    if break_at > start
-                        && width.saturating_sub(break_width) + char_width <= content_width
-                    {
-                        rows.push(InputVisualRow {
-                            start,
-                            end: break_at,
-                            width: break_width,
-                        });
-                        start = break_at;
-                        width -= break_width;
-                    } else {
-                        rows.push(InputVisualRow { start, end: index, width });
-                        start = index;
-                        width = 0;
-                    }
-                } else {
-                    rows.push(InputVisualRow { start, end: index, width });
-                    start = index;
-                    width = 0;
-                }
-            }
-            if index == cursor {
-                cursor_row = rows.len();
-                cursor_col = width;
-            }
-            width += char_width;
-
-            if character.is_whitespace()
-                && matches!(
-                    line.get(index + 1),
-                    Some(&next) if next != '\n' && !next.is_whitespace()
-                )
-            {
-                wrap_opportunity = Some((index + 1, width));
-            }
-        }
-
-        if cursor == line.len() {
-            cursor_row = rows.len();
-            cursor_col = width;
-        }
-        rows.push(InputVisualRow { start, end: line.len(), width });
-        (rows, cursor_row, cursor_col)
-    }
-
-    fn cursor_for_visual_row(
-        line: &[char],
-        rows: &[InputVisualRow],
-        row_index: usize,
-        desired_col: usize,
-    ) -> usize {
-        let row = &rows[row_index];
-        // A hard-wrapped row does not own the insertion point after its last
-        // character; that point belongs to the following visual row.
-        let max_col = if row.end < line.len() && line[row.end] == '\n' {
-            row.width
-        } else if row_index + 1 < rows.len() && rows[row_index + 1].start == row.end {
-            row.width.saturating_sub(1)
-        } else {
-            row.width
-        };
-        let target_col = desired_col.min(max_col);
-        let mut col = 0;
-        for (index, &character) in line
-            .iter()
-            .enumerate()
-            .skip(row.start)
-            .take(row.end - row.start)
-        {
-            let next = col + Self::char_width(character);
-            if next > target_col {
-                return index;
-            }
-            col = next;
-        }
-        row.end
-    }
-
-    fn move_cursor_vertically(
-        &mut self,
-        line: &[char],
-        cursor: &mut usize,
-        direction: isize,
-    ) -> bool {
-        let prefix_width = Self::prefix_width(self.cols);
-        let content_width = self.cols.saturating_sub(prefix_width + 1).max(1);
-        let (rows, current_row, current_col) = Self::layout(line, *cursor, content_width);
-        let target_row = if direction < 0 {
-            if current_row == 0 { return false; }
-            current_row - 1
-        } else {
-            if current_row + 1 >= rows.len() { return false; }
-            current_row + 1
-        };
-        let desired_col = *self.preferred_col.get_or_insert(current_col);
-        *cursor = Self::cursor_for_visual_row(line, &rows, target_row, desired_col);
-        true
-    }
-
-    fn line_bounds(line: &[char], cursor: usize) -> (usize, usize) {
-        let cursor = cursor.min(line.len());
-        let start = line[..cursor]
-            .iter()
-            .rposition(|&character| character == '\n')
-            .map_or(0, |index| index + 1);
-        let end = line[cursor..]
-            .iter()
-            .position(|&character| character == '\n')
-            .map_or(line.len(), |index| cursor + index);
-        (start, end)
-    }
-
-    /// Ask the terminal for its cursor position via DSR. Bytes consumed
-    /// before the actual \x1b[row;colR report (e.g. type-ahead) are pushed
-    /// back onto the input queue. Returns row 1 when no report arrives.
-    /// ponytail: blocks until the terminal answers; every real terminal
-    /// replies to DSR — if a headless oddity ever hangs here, gate it on a
-    /// tty check instead of adding read timeouts.
-    fn query_cursor_row(&mut self) -> io::Result<usize> {
-        self.stdout.write_all(b"\x1b[6n")?;
-        self.stdout.flush()?;
-        let mut raw: Vec<u8> = Vec::new();
-        loop {
-            let mut byte = [0; 1];
-            self.tty_read(&mut byte)?;
-            raw.push(byte[0]);
-            if let Some((start, end)) = Self::find_cursor_report(&raw) {
-                // Preserve anything that came before the report.
-                let prefix: Vec<u8> = raw[..start].to_vec();
-                for b in prefix.iter().rev() {
-                    self.pending.push_front(*b);
-                }
-                let body = String::from_utf8_lossy(&raw[start..end]);
-                let inner = &body[2..body.len() - 1]; // strip ESC [ ... R
-                let row = inner
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .parse::<usize>()
-                    .unwrap_or(1);
-                return Ok(row.max(1));
-            }
-            if raw.len() >= 256 {
-                break;
-            }
-        }
-        // No well-formed report: keep whatever arrived for the key reader.
-        for b in raw.iter().rev() {
-            self.pending.push_front(*b);
-        }
-        Ok(1)
-    }
-
-    /// Locate a complete \x1b[row;colR report in buf; returns the byte
-    /// range of the report.
-    fn find_cursor_report(buf: &[u8]) -> Option<(usize, usize)> {
-        for i in 0..buf.len().saturating_sub(1) {
-            if buf[i] == 0x1b && buf[i + 1] == b'[' {
-                let mut j = i + 2;
-                while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
-                    j += 1;
-                }
-                if j < buf.len() && buf[j] == b'R' && j > i + 2 {
-                    return Some((i, j + 1));
-                }
-            }
-        }
-        None
-    }
-
-    /// Erase every row of the previously rendered block (box + chrome).
-    fn clear_block(&mut self) -> io::Result<()> {
-        if self.block_top == 0 {
-            return Ok(());
-        }
-        let bottom = self.block_top + self.last_rows + CHROME_ROWS; // exclusive
-        for row in self.block_top..bottom.min(terminal_size().0.max(1) + 1) {
-            write!(self.stdout, "\x1b[{};1H\x1b[K", row)?;
-        }
-        // Leave the cursor where the block began: that is exactly where new
-        // transcript output should continue.
-        write!(self.stdout, "\x1b[{};1H", self.block_top)?;
-        self.last_rows = 0;
-        self.last_cursor_row = 0;
-        self.view_start = 0;
-        self.preferred_col = None;
-        Ok(())
-    }
-
-    fn finish_input(&mut self) -> io::Result<()> {
-        self.clear_block()?;
-        self.stdout.flush()
-    }
-
-    /// Render the full block — input box, separator, status line — with
-    /// absolute cursor addressing. The block hugs the content: it starts
-    /// right below the last transcript row and is pushed down as output
-    /// arrives until it docks at the bottom edge of the terminal.
-    fn refresh(&mut self, line: &[char], cursor: usize, status: &[String]) -> io::Result<()> {
-        let (term_rows, cols) = terminal_size();
-        self.cols = cols.max(1);
-        let term_rows = term_rows.max(CHROME_ROWS + 1);
-
-        // A width change re-wraps every transcript line: all cached rows and
-        // on-screen pixels are void. Rebuild from the transcript replay.
-        if self.last_cols != 0 && cols != self.last_cols && !self.replay.is_empty() {
-            self.stdout.write_all(b"\x1b[1;1H\x1b[2J")?;
-            for l in &self.replay {
-                writeln!(self.stdout, "{}", l)?;
-            }
-            self.stdout.flush()?;
-            self.block_top = 0;
-            self.last_rows = 0;
-            self.resync = true;
-        }
-        self.last_cols = cols;
-
-        let prefix_width = Self::prefix_width(self.cols);
-        let content_width = self.cols.saturating_sub(prefix_width + 1).max(1);
-        let (row_ranges, cur_row, cursor_col) = Self::layout(line, cursor, content_width);
-        let total_rows = row_ranges.len().max(1);
-
-        // Pi keeps the editor to roughly 30% of the space above the chrome,
-        // with a five-line minimum, and scrolls that editor only when the
-        // cursor leaves its visible window.
-        let viewport = (term_rows.saturating_sub(CHROME_ROWS)).saturating_mul(3) / 10;
-        let viewport = viewport.max(5);
-        if cur_row < self.view_start {
-            self.view_start = cur_row;
-        } else if cur_row >= self.view_start + viewport {
-            self.view_start = cur_row + 1 - viewport;
-        }
-        self.view_start = self.view_start.min(total_rows.saturating_sub(viewport));
-        let visible_rows = total_rows
-            .saturating_sub(self.view_start)
-            .min(viewport)
-            .max(1);
-
-        let block_h = visible_rows + CHROME_ROWS;
-        let max_top = term_rows.saturating_sub(block_h) + 1;
-
-        if self.resync {
-            // The transcript scrolled by an unknown amount since the last
-            // render; find the real content end and hug it.
-            let row = self.query_cursor_row()?;
-            self.block_top = row.min(term_rows);
-            self.resync = false;
-        }
-        // Dock at the bottom edge: scroll the transcript up rather than
-        // letting the block cross it.
-        if self.block_top > max_top {
-            let overflow = self.block_top - max_top;
-            write!(self.stdout, "\x1b[{};1H", term_rows)?;
-            for _ in 0..overflow {
-                write!(self.stdout, "\n")?;
-            }
-            self.block_top = max_top;
-            // Everything (including the old block pixels) moved up; the
-            // targeted clear below would miss rows above block_top, but those
-            // now hold scrolled transcript — never clear those.
-            self.last_rows = 0;
-        }
-        let block_top = self.block_top.max(1);
-
-        // Clear whatever the previous render left behind.
-        let old_bottom = block_top + self.last_rows + CHROME_ROWS;
-        for row in block_top..old_bottom.min(term_rows + 1) {
-            write!(self.stdout, "\x1b[{};1H\x1b[K", row)?;
-        }
-
-        let prompt = if prefix_width == 2 { "> " } else { ">" };
-        let indent = " ".repeat(prefix_width);
-        for (offset, row) in row_ranges
-            .iter()
-            .enumerate()
-            .skip(self.view_start)
-            .take(visible_rows)
-        {
-            let scr = block_top + offset - self.view_start;
-            write!(self.stdout, "\x1b[{};1H\x1b[K", scr)?;
-            let text: String = line[row.start..row.end].iter().collect();
-            let prefix = if offset == self.view_start { prompt } else { &indent };
-            write!(
-                self.stdout,
-                "{}{}{}{}{}",
-                PROMPT_COLOR,
-                INPUT_COLOR,
-                prefix,
-                text,
-                RESET,
-            )?;
-        }
-
-        // Separator directly under the box.
-        const DIM: &str = "\x1b[2m";
-        const CYAN: &str = "\x1b[36m";
-        let sep_row = block_top + visible_rows;
-        let line_char = "─".repeat(self.cols.saturating_sub(3).max(1));
-        write!(
-            self.stdout,
-            "\x1b[{};1H\x1b[K{}{}{}",
-            sep_row,
-            DIM,
-            line_char,
-            RESET,
-        )?;
-        // Status line under the separator.
-        let bar_row = sep_row + 1;
-        let body = status_body(status, self.cols);
-        let pad = self.cols.saturating_sub(visible_width(&body));
-        write!(
-            self.stdout,
-            "\x1b[{};1H\x1b[K{}{} {}{}{}",
-            bar_row,
-            DIM,
-            CYAN,
-            body,
-            RESET,
-            " ".repeat(pad),
-        )?;
-
-        // Park the hardware cursor inside the box at the logical cursor.
-        let view_cur_row = cur_row - self.view_start;
-        let cursor_column = (prefix_width + cursor_col + 1).min(self.cols);
-        write!(
-            self.stdout,
-            "\x1b[{};{}H",
-            block_top + view_cur_row,
-            cursor_column,
-        )?;
-        self.last_rows = visible_rows;
-        self.last_cursor_row = view_cur_row;
-        self.block_top = block_top;
-        self.stdout.flush()
-    }
-
-    fn read_line(&mut self, history: &[String], status: &[String]) -> io::Result<Option<String>> {
-        let mut line = Vec::new();
-        let mut cursor = 0;
-        let mut history_index: Option<usize> = None;
-        let mut draft = Vec::new();
-        self.preferred_col = None;
-        // External output (streamed transcript) may have scrolled the
-        // screen since the last render; re-locate the content end.
-        self.resync = true;
-        take_interrupt(); // drop any stale Ctrl+C from a previous turn
-        self.refresh(&line, cursor, status)?;
-
-        loop {
-            match self.read_key()? {
-                Key::Char(character) if !character.is_control() => {
-                    line.insert(cursor, character);
-                    cursor += 1;
-                    history_index = None;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::Paste(text) => {
-                    let normalized = text
-                        .replace("\r\n", "\n")
-                        .replace('\r', "\n")
-                        .replace('\t', "    ");
-                    let chars: Vec<char> = normalized
-                        .chars()
-                        .filter(|&character| character == '\n' || !character.is_control())
-                        .collect();
-                    let count = chars.len();
-                    line.splice(cursor..cursor, chars);
-                    cursor += count;
-                    history_index = None;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::NewLine => {
-                    line.insert(cursor, '\n');
-                    cursor += 1;
-                    history_index = None;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::Enter => {
-                    let value: String = line.iter().collect();
-                    self.finish_input()?;
-                    return Ok(Some(value));
-                }
-                Key::Backspace => {
-                    if cursor > 0 {
-                        line.remove(cursor - 1);
-                        cursor -= 1;
-                        history_index = None;
-                        self.preferred_col = None;
-                        self.refresh(&line, cursor, status)?;
-                    }
-                }
-                Key::Delete => {
-                    if cursor < line.len() {
-                        line.remove(cursor);
-                        history_index = None;
-                        self.preferred_col = None;
-                        self.refresh(&line, cursor, status)?;
-                    }
-                }
-                Key::Left => {
-                    cursor = cursor.saturating_sub(1);
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::Right => {
-                    cursor = (cursor + 1).min(line.len());
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::Home => {
-                    cursor = Self::line_bounds(&line, cursor).0;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::End => {
-                    cursor = Self::line_bounds(&line, cursor).1;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::Up => {
-                    if self.move_cursor_vertically(&line, &mut cursor, -1) {
-                        self.refresh(&line, cursor, status)?;
-                    } else {
-                        let line_start = Self::line_bounds(&line, cursor).0;
-                        if !history.is_empty()
-                            && (line.is_empty()
-                                || history_index.is_some()
-                                || cursor == line_start)
-                        {
-                            let index = match history_index {
-                                Some(index) => index.saturating_sub(1),
-                                None => {
-                                    draft = line.clone();
-                                    history.len() - 1
-                                }
-                            };
-                            history_index = Some(index);
-                            line = history[index].chars().collect();
-                            cursor = line.len();
-                            self.preferred_col = None;
-                            self.refresh(&line, cursor, status)?;
-                        } else {
-                            cursor = line_start;
-                            self.preferred_col = None;
-                            self.refresh(&line, cursor, status)?;
-                        }
-                    }
-                }
-                Key::Down => {
-                    if self.move_cursor_vertically(&line, &mut cursor, 1) {
-                        self.refresh(&line, cursor, status)?;
-                    } else if let Some(index) = history_index {
-                        if index + 1 < history.len() {
-                            let index = index + 1;
-                            history_index = Some(index);
-                            line = history[index].chars().collect();
-                        } else {
-                            history_index = None;
-                            line = draft.clone();
-                        }
-                        cursor = line.len();
-                        self.preferred_col = None;
-                        self.refresh(&line, cursor, status)?;
-                    } else {
-                        cursor = Self::line_bounds(&line, cursor).1;
-                        self.preferred_col = None;
-                        self.refresh(&line, cursor, status)?;
-                    }
-                }
-                Key::CtrlU => {
-                    let (start, _) = Self::line_bounds(&line, cursor);
-                    if cursor == start && start > 0 {
-                        line.remove(start - 1);
-                        cursor = start - 1;
-                    } else {
-                        line.drain(start..cursor);
-                        cursor = start;
-                    }
-                    history_index = None;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::CtrlK => {
-                    let (_, end) = Self::line_bounds(&line, cursor);
-                    if cursor < end {
-                        line.drain(cursor..end);
-                    } else if end < line.len() {
-                        line.remove(end);
-                    }
-                    history_index = None;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::CtrlW => {
-                    let (start, _) = Self::line_bounds(&line, cursor);
-                    if cursor == start && start > 0 {
-                        line.remove(start - 1);
-                        cursor = start - 1;
-                    } else {
-                        while cursor > start && line[cursor - 1].is_whitespace() {
-                            line.remove(cursor - 1);
-                            cursor -= 1;
-                        }
-                        while cursor > start && !line[cursor - 1].is_whitespace() {
-                            line.remove(cursor - 1);
-                            cursor -= 1;
-                        }
-                    }
-                    history_index = None;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                Key::CtrlC => {
-                    let now = std::time::Instant::now();
-                    let is_double = self
-                        .last_ctrl_c
-                        .map(|t| now.duration_since(t).as_millis() <= 1500)
-                        .unwrap_or(false);
-                    self.clear_block()?;
-                    if is_double {
-                        writeln!(self.stdout)?;
-                        self.stdout.flush()?;
-                        return Ok(None); // exit the REPL
-                    }
-                    self.last_ctrl_c = Some(now);
-                    writeln!(
-                        self.stdout,
-                        "{}^C press Ctrl+C again to quit{}",
-                        ERROR_COLOR, RESET
-                    )?;
-                    self.stdout.flush()?;
-                    return Ok(Some(String::new()));
-                }
-                Key::CtrlD if line.is_empty() => {
-                    self.finish_input()?;
-                    return Ok(None);
-                }
-                Key::CtrlD if cursor < line.len() => {
-                    line.remove(cursor);
-                    history_index = None;
-                    self.preferred_col = None;
-                    self.refresh(&line, cursor, status)?;
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod editor_tests {
-    use super::{InputVisualRow, TerminalEditor};
-
-    #[test]
-    fn layout_tracks_wraps_and_explicit_newlines() {
-        let wrapped: Vec<char> = "abcdef".chars().collect();
-        let (rows, cursor_row, cursor_col) = TerminalEditor::layout(&wrapped, 4, 4);
-        assert_eq!(
-            rows,
-            vec![
-                InputVisualRow { start: 0, end: 4, width: 4 },
-                InputVisualRow { start: 4, end: 6, width: 2 },
-            ]
-        );
-        assert_eq!((cursor_row, cursor_col), (1, 0));
-
-        let exact: Vec<char> = "abcd".chars().collect();
-        let (rows, cursor_row, cursor_col) = TerminalEditor::layout(&exact, 4, 4);
-        assert_eq!(rows.len(), 1);
-        assert_eq!((cursor_row, cursor_col), (0, 4));
-
-        let multiline: Vec<char> = "ab\ncd".chars().collect();
-        let (_, cursor_row, cursor_col) = TerminalEditor::layout(&multiline, 3, 4);
-        assert_eq!((cursor_row, cursor_col), (1, 0));
-    }
-}
-
-impl Drop for TerminalEditor {
-    fn drop(&mut self) {
-        let _ = self
-            .stdout
-            .write_all(b"\x1b[?2004l\x1b[<u\x1b[>4;0m");
-        let _ = self.stdout.flush();
-        if let Ok(stdin) = self.stdin.try_clone() {
-            let _ = Command::new("stty")
-                .arg(&self.original_stty)
-                .stdin(Stdio::from(stdin))
-                .status();
-        }
-    }
-}
-
-fn run_chat_repl(args: &Args) {
-    let config = match LlmConfig::from_env(args.base_url.clone(), args.model.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("LLM config error: {}", e);
-            eprintln!("Set OPENAI_API_KEY, add api_key to ~/.config/ak/config.json, or run with --tool for raw JSON tool mode.");
-            std::process::exit(1);
-        }
-    };
-
-    let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-    let mut session = if args.new_session || args.no_session {
-        let s = if args.no_session {
-            Session::in_memory(cwd)
-        } else {
-            let mut s = Session::new(cwd.clone(), args.session_name.clone()).expect("failed to create session");
-            if let Some(name) = &args.session_name {
-                s.set_name(name.clone()).ok();
-            }
-            s
-        };
-        s
-    } else if let Some(path) = &args.session_path {
-        if path.exists() {
-            let mut s = Session::from_path(path).expect("failed to open session");
-            if let Some(name) = &args.session_name {
-                s.set_name(name.clone()).ok();
-            }
-            s
-        } else {
-            let mut s = Session::new(cwd.clone(), args.session_name.clone()).expect("failed to create session");
-            if let Some(name) = &args.session_name {
-                s.set_name(name.clone()).ok();
-            }
-            s
-        }
-    } else {
-        let mut s = Session::open_or_continue(cwd, None, false).expect("failed to open session");
-        if let Some(name) = &args.session_name {
-            s.set_name(name.clone()).ok();
-        }
-        s
-    };
-
-    let mut skill_dirs = skill_dirs();
-    skill_dirs.extend(args.skill_dirs.iter().cloned());
-    let skills = discover_skills(&skill_dirs);
-
-    let mut messages = if session.counter > 0 {
-        // Resuming: load persisted messages (skip system, we prepend it fresh).
-        if let Some(path) = session.path() {
-            load_messages_from_session(path).unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
-
-    // Always prepend fresh system prompt.
-    messages.insert(0, ChatMessage {
-        role: "system".to_string(),
-        content: Some(system_prompt(&skills)),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-    });
-
-    println!("{}ak agent{}", AGENT_COLOR, RESET);
-    if session.is_persisted() {
-        println!("session: {} ({} turns)", session.display_name(), session.counter);
-    }
-    println!("type a prompt and hit enter. /clear resets history. /quit exits. /new starts fresh. /resume lists past sessions. /skill:<name> loads a skill.");
-
-    let mut tool_state = ToolState::load();
-
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut history = Vec::new();
-    let mut editor = match TerminalEditor::new() {
-        Ok(editor) => Some(editor),
-        Err(e) => {
-            eprintln!("terminal line editor unavailable ({}); using basic input", e);
-            None
-        }
-    };
-
-    loop {
-        if editor.is_some() {
-            println!();
-        } else {
-            print!("\n{}> {}", PROMPT_COLOR, INPUT_COLOR);
-        }
-        let _ = stdout.flush();
-        let mut status = status_segments(&config, &messages, &tool_state);
-        if session.is_persisted() {
-            status.push(format!("session: {}", session.display_name()));
-        }
-        if let Some(editor) = editor.as_mut() {
-            editor.set_replay(transcript_replay(&messages));
-        }
-        let line = match editor.as_mut() {
-            Some(editor) => match editor.read_line(&history, &status) {
-                Ok(line) => line,
-                Err(e) => {
-                    eprintln!("terminal input error: {}", e);
-                    break;
-                }
-            },
-            None => {
-                let mut line = String::new();
-                if stdin.read_line(&mut line).is_err() {
-                    break;
-                }
-                Some(line)
-            }
-        };
-        let Some(line) = line else { break };
-        let line = line.trim().to_string();
-        if line == "/quit" {
-            break;
-        }
-        if line == "/clear" {
-            messages.truncate(1);
-            history.clear();
-            println!("history cleared.");
-            continue;
-        }
-        if line == "/new" {
-            messages.truncate(1);
-            history.clear();
-            let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            let mut new_s = Session::new(cwd, None).expect("failed to create session");
-            new_s.append_message(messages[0].clone()).ok(); // system
-            session = new_s;
-            println!("new session started.");
-            continue;
-        }
-        if line.starts_with("/name ") {
-            let name = line["/name ".len()..].trim().to_string();
-            if !name.is_empty() {
-                session.set_name(name.clone()).ok();
-                println!("session name: {}", name);
-            }
-            continue;
-        }
-        if line == "/session" {
-            println!("session: {}", session.display_name());
-            if let Some(path) = session.path() {
-                println!("path: {}", path.display());
-            }
-            println!("turns: {}", session.counter);
-            continue;
-        }
-        if line == "/resume" {
-            let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            match Session::list(&cwd) {
-                Ok(sessions) if !sessions.is_empty() => {
-                    println!("sessions:");
-                    for (i, (path, header)) in sessions.iter().enumerate() {
-                        let name = header.name.as_ref().map(|n| n.as_str()).unwrap_or("(unnamed)");
-                        println!("  {}: {} ({})", i, name, path.display());
-                    }
-                    println!("  (not implemented: select a session by index or path)");
-                }
-                _ => println!("no sessions found."),
-            }
-            continue;
-        }
-        if line.starts_with("/skill:") {
-            let name = line["/skill:".len()..].trim();
-            if let Some(skill) = skills.iter().find(|s| s.name == name) {
-                let content = fs::read_to_string(&skill.path).unwrap_or_default();
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(format!("--- Skill: {} ---\n{}", skill.name, content)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: Some("skill".to_string()),
-                });
-                println!("loaded skill: {}", skill.name);
-            } else {
-                println!("skill not found: {}", name);
-                println!("available skills:");
-                for s in &skills {
-                    println!("  - {}", s.name);
-                }
-            }
-            continue;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        // The editor erases the input box on submit; echo the sent prompt
-        // so it stays visible in the transcript.
-        if editor.is_some() {
-            println!("{}> {}{}{}", PROMPT_COLOR, INPUT_COLOR, line, RESET);
-            let _ = stdout.flush();
-        }
-        history.push(line.clone());
-        let user_msg = ChatMessage {
-            role: "user".to_string(),
-            content: Some(line),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        };
-        let before = messages.len();
-        messages.push(user_msg);
-        match process_turn(&config, &mut messages, &mut tool_state) {
-            Ok(_) => {
-                println!();
-                // Persist every message added during this turn (assistant, tool calls, results).
-                for msg in &messages[before..] {
-                    session.append_message(msg.clone()).ok();
-                }
-            }
-            Err(e) => {
-                eprintln!("{}error: {}{}", ERROR_COLOR, e, RESET);
-                // Persist even on error so the failed turn is recorded.
-                for msg in &messages[before..] {
-                    session.append_message(msg.clone()).ok();
-                }
-            }
-        }
-    }
-    // Hand the terminal back with the transcript still visible.
-    io::stdout().flush().ok();
 }
 
 fn run_interactive() {
@@ -2998,7 +1521,8 @@ fn main() {
             eprintln!("agent error: {}", e);
             std::process::exit(1);
         }
-    } else {
-        run_chat_repl(&args);
+    } else if let Err(e) = ui::run_ratatui_repl(&args) {
+        eprintln!("ui error: {}", e);
+        std::process::exit(1);
     }
 }
