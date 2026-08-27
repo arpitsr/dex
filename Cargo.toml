@@ -13,5 +13,18 @@ rand = "0.8"
 ratatui = "0.29"
 crossterm = "0.28"
 tui-textarea = "0.7"
-ratatui-markdown = "0.3.6"
+ratatui-markdown = { version = "0.3.6", features = [
+    "highlight-lang-bash",
+    "highlight-lang-c",
+    "highlight-lang-cpp",
+    "highlight-lang-go",
+    "highlight-lang-java",
+    "highlight-lang-javascript",
+    "highlight-lang-json",
+    "highlight-lang-python",
+    "highlight-lang-rust",
+    "highlight-lang-typescript",
+    "highlight-lang-toml",
+    "highlight-lang-yaml",
+] }
 unicode-width = "0.1"
