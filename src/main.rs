@@ -462,6 +462,12 @@ struct ChatRequest {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApiProtocol {
+    ChatCompletions,
+    Responses,
+}
+
 #[derive(Serialize)]
 struct StreamOptions {
     include_usage: bool,
@@ -637,6 +643,7 @@ struct FileConfig {
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    api: Option<String>,
     thinking_effort: Option<String>,
     context_window: Option<u64>,
 }
@@ -669,6 +676,7 @@ struct LlmConfig {
     api_key: String,
     base_url: String,
     model: String,
+    api: ApiProtocol,
     thinking_effort: Option<String>,
     /// Model context window size in tokens (used for compaction + status bar).
     context_window: u64,
@@ -681,20 +689,37 @@ impl LlmConfig {
         model_override: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let file = load_file_config()?;
+        let model = model_override
+            .or_else(|| env::var("OPENAI_MODEL").ok())
+            .or(file.model)
+            .unwrap_or_else(|| "gpt-5.6-luna".to_string());
+        let base_url = base_url_override
+            .or_else(|| env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty()))
+            .or(file.base_url)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let api_name = env::var("OPENAI_API")
+            .ok()
+            .or(file.api)
+            .unwrap_or_else(|| "openai-completions".to_string());
+        let api = match api_name.as_str() {
+            "responses" | "openai-responses" => ApiProtocol::Responses,
+            "chat" | "chat-completions" | "openai-completions" => {
+                ApiProtocol::ChatCompletions
+            }
+            other => return Err(format!(
+                "unsupported api '{}'; use openai-completions or openai-responses",
+                other
+            ).into()),
+        };
         Ok(Self {
             api_key: env::var("OPENAI_API_KEY")
                 .ok()
                 .or(file.api_key)
                 .ok_or("OPENAI_API_KEY not set and no api_key in config file")?,
-            base_url: base_url_override
-                .or_else(|| env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty()))
-                .or(file.base_url)
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            model: model_override
-                .or_else(|| env::var("OPENAI_MODEL").ok())
-                .or(file.model)
-                .unwrap_or_else(|| "gpt-5.6-luna".to_string()),
+            base_url,
+            model,
+            api,
             thinking_effort: file.thinking_effort,
             // Context window in tokens; configurable via file (`context_window`)
             // or AK_CONTEXT_WINDOW env, with a conservative default.
@@ -872,7 +897,7 @@ fn read_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Op
     ))
 }
 
-fn call_llm(
+fn call_chat_completions(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
@@ -924,6 +949,228 @@ fn call_llm(
     }
 
     unreachable!()
+}
+
+fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for message in messages {
+        if message.role == "system" {
+            if let Some(content) = &message.content {
+                instructions.push(content.clone());
+            }
+            continue;
+        }
+        if message.role == "tool" {
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id.clone().unwrap_or_default(),
+                "output": message.content.clone().unwrap_or_default(),
+            }));
+            continue;
+        }
+        if message.role == "assistant" {
+            if let Some(content) = &message.content {
+                if !content.is_empty() {
+                    input.push(json!({ "role": "assistant", "content": content }));
+                }
+            }
+            for call in message.tool_calls.as_deref().unwrap_or_default() {
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                }));
+            }
+            continue;
+        }
+        input.push(json!({
+            "role": message.role,
+            "content": message.content.clone().unwrap_or_default(),
+        }));
+    }
+    (if instructions.is_empty() { None } else { Some(instructions.join("\n\n")) }, input)
+}
+
+fn responses_tools() -> Vec<Value> {
+    tools_schema()
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "parameters": tool.function.parameters,
+            })
+        })
+        .collect()
+}
+
+fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) {
+    while calls.len() <= index {
+        calls.push(LlmToolCall {
+            id: String::new(),
+            call_type: "function".to_string(),
+            function: FunctionCall { name: String::new(), arguments: String::new() },
+        });
+    }
+    let call = &mut calls[index];
+    if let Some(id) = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str) {
+        call.id = id.to_string();
+    }
+    if let Some(name) = item.get("name").and_then(Value::as_str) {
+        call.function.name = name.to_string();
+    }
+    if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+        call.function.arguments = arguments.to_string();
+    }
+}
+
+fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    let mut content = String::new();
+    let mut pending = String::new();
+    let mut printer = StreamPrinter::new();
+    let mut tool_calls = Vec::new();
+    let mut usage_tokens = None;
+
+    loop {
+        if take_interrupt() {
+            with_console(|| println!());
+            io::stdout().flush()?;
+            return Err("interrupted".into());
+        }
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if data == "[DONE]" || data.is_empty() { continue; }
+        let event: Value = serde_json::from_str(data)?;
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    content.push_str(delta);
+                    pending.push_str(delta);
+                    while let Some(pos) = pending.find('\n') {
+                        let complete: String = pending.drain(..=pos).collect();
+                        printer.feed_line(complete.trim_end_matches('\n'));
+                    }
+                    io::stdout().flush()?;
+                }
+            }
+            "response.output_item.added" => {
+                if event.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
+                    let index = event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize;
+                    response_tool_call(&mut tool_calls, index, event.get("item").unwrap_or(&Value::Null));
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let index = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while tool_calls.len() <= index {
+                    response_tool_call(&mut tool_calls, index, &Value::Null);
+                }
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    tool_calls[index].function.arguments.push_str(delta);
+                }
+            }
+            "response.output_item.done" => {
+                if event.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
+                    let index = event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize;
+                    response_tool_call(&mut tool_calls, index, event.get("item").unwrap_or(&Value::Null));
+                }
+            }
+            "response.completed" | "response.done" => {
+                if let Some(usage) = event.pointer("/response/usage") {
+                    usage_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !pending.is_empty() {
+        printer.feed_line(&pending);
+        io::stdout().flush()?;
+    }
+    printer.finish();
+    io::stdout().flush()?;
+    if !content.is_empty() {
+        with_console(|| println!());
+        io::stdout().flush()?;
+    }
+    Ok((ChatMessage {
+        role: "assistant".to_string(),
+        content: (!content.is_empty()).then_some(content),
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        tool_call_id: None,
+        name: None,
+    }, usage_tokens))
+}
+
+fn call_responses(
+    config: &LlmConfig,
+    messages: &[ChatMessage],
+    with_tools: bool,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    let (instructions, input) = responses_input(messages);
+    let mut body = json!({
+        "model": config.model,
+        "input": input,
+        "stream": true,
+        "store": false,
+    });
+    if let Some(instructions) = instructions {
+        body["instructions"] = json!(instructions);
+    }
+    if with_tools {
+        body["tools"] = json!(responses_tools());
+    }
+    if let Some(effort) = &config.thinking_effort {
+        body["reasoning"] = json!({ "effort": effort });
+    }
+    const MAX_RETRIES: u32 = 3;
+    for attempt in 0..=MAX_RETRIES {
+        let resp = match config.client.post(format!("{}/responses", config.base_url)).bearer_auth(&config.api_key).json(&body).send() {
+            Ok(resp) => resp,
+            Err(e) if attempt < MAX_RETRIES => {
+                let delay = Duration::from_millis(500 * 2u64.pow(attempt));
+                with_console(|| eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay));
+                thread::sleep(delay);
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text()?;
+            let retryable = status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
+            if retryable && attempt < MAX_RETRIES {
+                let delay = Duration::from_millis(500 * 2u64.pow(attempt));
+                with_console(|| eprintln!("[llm] API error {}: retrying in {:?}", status, delay));
+                thread::sleep(delay);
+                continue;
+            }
+            return Err(format!("API error: {}", error_body).into());
+        }
+        return read_responses_stream(resp);
+    }
+    unreachable!()
+}
+
+fn call_llm(
+    config: &LlmConfig,
+    messages: &[ChatMessage],
+    with_tools: bool,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    match config.api {
+        ApiProtocol::ChatCompletions => call_chat_completions(config, messages, with_tools),
+        ApiProtocol::Responses => call_responses(config, messages, with_tools),
+    }
 }
 
 const CACHE_FILE_NAME: &str = "ak-tool-cache.json";

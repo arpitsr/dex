@@ -1,16 +1,16 @@
 # ak
 
-A terminal-based coding agent written in Rust. `ak` talks to an OpenAI-compatible
-chat-completions API, calls tools (`read`, `bash`, `write`, `edit`, `grep`,
+A terminal-based coding agent written in Rust. `ak` talks to OpenAI-compatible
+Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`, `grep`,
 `find`) to operate on your local files, and offers an interactive TUI, a
 one-shot prompt mode, and a raw JSON tool mode. Conversations are persisted as
 sessions and can be resumed.
 
 ## Features
 
-- **OpenAI-compatible backend** — works with any `/chat/completions` endpoint
-  (OpenAI, Moonshot/Kimi, etc.). Streaming responses, automatic retries with
-  exponential backoff, and configurable reasoning effort.
+- **OpenAI-compatible backend** — supports Chat Completions and Responses
+  endpoints (OpenAI, OpenCode Zen, Moonshot/Kimi, etc.). Streaming responses,
+  automatic retries with exponential backoff, and configurable reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write
   and edit files, and search the filesystem. Multiple tool calls in a single
   assistant turn run in parallel.
@@ -60,19 +60,21 @@ cp config.sample.json ~/.config/ak/config.json
 | `api_key`        | string   | Default API key (overridable by `OPENAI_API_KEY`).                 |
 | `base_url`       | string   | Default API base URL (overridable by `OPENAI_BASE_URL`).           |
 | `model`          | string   | Default model (overridable by `OPENAI_MODEL`).                     |
+| `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
 | `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
 | `context_window` | integer  | Token context window used for compaction/status (overridable by `AK_CONTEXT_WINDOW`). |
 
-> Note: the `providers` array in `config.sample.json` is illustrative — the
-> code reads a single flat config (`api_key`/`base_url`/`model`), not a provider list.
+The `api` field follows the provider/model API distinction used by Pi and Codex.
+It defaults to `openai-completions` for existing configurations.
 
 A minimal example:
 
 ```json
 {
   "api_key": "sk-...",
-  "base_url": "https://api.openai.com/v1",
-  "model": "gpt-5.6-luna"
+  "base_url": "https://opencode.ai/zen/v1",
+  "model": "gpt-5.6-luna",
+  "api": "openai-responses"
 }
 ```
 
@@ -219,6 +221,7 @@ cache (`ak-tool-cache.json`) is kept across runs to reduce redundant work.
 | `OPENAI_API_KEY`     | API key (takes precedence over `config.json`).           |
 | `OPENAI_BASE_URL`    | API base URL override (non-empty).                       |
 | `OPENAI_MODEL`       | Model override.                                          |
+| `OPENAI_API`         | Wire protocol override (`openai-completions` or `openai-responses`). |
 | `AK_CONTEXT_WINDOW`  | Token context window for compaction/status (overrides `config.json`). |
 | `RUSTY_PI_CONFIG`    | Explicit path to `config.json`.                          |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
