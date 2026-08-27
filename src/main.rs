@@ -468,6 +468,12 @@ enum ApiProtocol {
     Responses,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    OpenCode,
+    OpenAiCodex,
+}
+
 #[derive(Serialize)]
 struct StreamOptions {
     include_usage: bool,
@@ -640,6 +646,7 @@ fn system_prompt(skills: &[Skill]) -> String {
 
 #[derive(Default, Deserialize)]
 struct FileConfig {
+    provider: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
@@ -673,10 +680,12 @@ fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
 
 #[derive(Clone)]
 struct LlmConfig {
+    provider: Provider,
     api_key: String,
     base_url: String,
     model: String,
     api: ApiProtocol,
+    account_id: Option<String>,
     thinking_effort: Option<String>,
     /// Model context window size in tokens (used for compaction + status bar).
     context_window: u64,
@@ -689,19 +698,43 @@ impl LlmConfig {
         model_override: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let file = load_file_config()?;
+        let provider_name = env::var("AK_PROVIDER")
+            .ok()
+            .or(file.provider)
+            .unwrap_or_else(|| "opencode".to_string());
+        let provider = match provider_name.as_str() {
+            "opencode" => Provider::OpenCode,
+            "openai-codex" | "codex" => Provider::OpenAiCodex,
+            other => return Err(format!(
+                "unsupported provider '{}'; use opencode or openai-codex",
+                other
+            ).into()),
+        };
         let model = model_override
             .or_else(|| env::var("OPENAI_MODEL").ok())
             .or(file.model)
-            .unwrap_or_else(|| "gpt-5.6-luna".to_string());
-        let base_url = base_url_override
-            .or_else(|| env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty()))
-            .or(file.base_url)
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            .unwrap_or_else(|| match provider {
+                Provider::OpenCode => "gpt-5.6-luna".to_string(),
+                Provider::OpenAiCodex => "gpt-5.6-luna".to_string(),
+            });
+        let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
+        let base_url = match provider {
+            Provider::OpenCode => base_url_override
+                .or(env_base_url)
+                .or(file.base_url)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            Provider::OpenAiCodex => base_url_override
+                .or(env_base_url)
+                .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex".to_string()),
+        };
         let api_name = env::var("OPENAI_API")
             .ok()
             .or(file.api)
-            .unwrap_or_else(|| "openai-completions".to_string());
+            .unwrap_or_else(|| match provider {
+                Provider::OpenCode => "openai-responses".to_string(),
+                Provider::OpenAiCodex => "openai-responses".to_string(),
+            });
         let api = match api_name.as_str() {
             "responses" | "openai-responses" => ApiProtocol::Responses,
             "chat" | "chat-completions" | "openai-completions" => {
@@ -712,14 +745,23 @@ impl LlmConfig {
                 other
             ).into()),
         };
+        let (api_key, account_id) = match provider {
+            Provider::OpenCode => (
+                env::var("OPENAI_API_KEY")
+                    .ok()
+                    .or(file.api_key)
+                    .ok_or("OPENAI_API_KEY not set and no api_key in config file")?,
+                None,
+            ),
+            Provider::OpenAiCodex => load_codex_credentials()?,
+        };
         Ok(Self {
-            api_key: env::var("OPENAI_API_KEY")
-                .ok()
-                .or(file.api_key)
-                .ok_or("OPENAI_API_KEY not set and no api_key in config file")?,
+            provider,
+            api_key,
             base_url,
             model,
             api,
+            account_id,
             thinking_effort: file.thinking_effort,
             // Context window in tokens; configurable via file (`context_window`)
             // or AK_CONTEXT_WINDOW env, with a conservative default.
@@ -731,6 +773,59 @@ impl LlmConfig {
             client: reqwest::blocking::Client::new(),
         })
     }
+}
+
+#[derive(Deserialize)]
+struct CodexAuthFile {
+    tokens: Option<CodexTokens>,
+}
+
+#[derive(Deserialize)]
+struct CodexTokens {
+    access_token: String,
+    account_id: Option<String>,
+}
+
+fn load_codex_credentials() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    if let Some(access_token) = env::var_os("CODEX_ACCESS_TOKEN") {
+        let access_token = access_token.to_string_lossy().trim().to_string();
+        if !access_token.is_empty() {
+            return Ok((
+                access_token,
+                env::var("CODEX_ACCOUNT_ID").ok().filter(|id| !id.is_empty()),
+            ));
+        }
+    }
+    let path = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .ok_or("HOME is not set; cannot locate Codex credentials")?
+        .join("auth.json");
+    let contents = fs::read_to_string(&path).map_err(|e| {
+        format!("could not read Codex credentials {}: {}", path.display(), e)
+    })?;
+    let auth: CodexAuthFile = serde_json::from_str(&contents)
+        .map_err(|e| format!("invalid Codex credentials {}: {}", path.display(), e))?;
+    let tokens = auth.tokens.ok_or("Codex auth.json has no OAuth tokens; run `codex --login`")?;
+    if tokens.access_token.trim().is_empty() {
+        return Err("Codex auth.json contains an empty access token".into());
+    }
+    Ok((tokens.access_token, tokens.account_id))
+}
+
+fn authenticated_request(
+    request: reqwest::blocking::RequestBuilder,
+    config: &LlmConfig,
+) -> reqwest::blocking::RequestBuilder {
+    let request = request.bearer_auth(&config.api_key);
+    if config.provider == Provider::OpenAiCodex {
+        let request = request.header("originator", "codex_cli_rs");
+        if let Some(account_id) = &config.account_id {
+            return request.header("ChatGPT-Account-ID", account_id);
+        }
+        return request;
+    }
+    request
 }
 
 /// Incremental markdown printer: prose is flushed as soon as a full line
@@ -913,13 +1008,10 @@ fn call_chat_completions(
     };
 
     for attempt in 0..=MAX_RETRIES {
-        let resp = match config
+        let request = config
             .client
-            .post(format!("{}/chat/completions", config.base_url))
-            .bearer_auth(&config.api_key)
-            .json(&req)
-            .send()
-        {
+            .post(format!("{}/chat/completions", config.base_url));
+        let resp = match authenticated_request(request, config).json(&req).send() {
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
@@ -1027,6 +1119,14 @@ fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) 
     }
 }
 
+fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Value) -> usize {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .and_then(|id| calls.iter().position(|call| call.id == id))
+        .unwrap_or(index)
+}
+
 fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
@@ -1034,6 +1134,8 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
     let mut pending = String::new();
     let mut printer = StreamPrinter::new();
     let mut tool_calls = Vec::new();
+    let mut response_items: HashMap<String, usize> = HashMap::new();
+    let mut pending_arguments: HashMap<String, String> = HashMap::new();
     let mut usage_tokens = None;
 
     loop {
@@ -1065,23 +1167,59 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
             }
             "response.output_item.added" => {
                 if event.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
-                    let index = event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize;
-                    response_tool_call(&mut tool_calls, index, event.get("item").unwrap_or(&Value::Null));
+                    let item = event.get("item").unwrap_or(&Value::Null);
+                    let index = response_call_index(
+                        &tool_calls,
+                        event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize,
+                        item,
+                    );
+                    response_tool_call(&mut tool_calls, index, item);
+                    if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                        response_items.insert(item_id.to_string(), index);
+                        if let Some(arguments) = pending_arguments.remove(item_id) {
+                            tool_calls[index].function.arguments.push_str(&arguments);
+                        }
+                    }
                 }
             }
             "response.function_call_arguments.delta" => {
-                let index = event.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                while tool_calls.len() <= index {
-                    response_tool_call(&mut tool_calls, index, &Value::Null);
-                }
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    tool_calls[index].function.arguments.push_str(delta);
+                    let key = event
+                        .get("item_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "output:{}",
+                                event.get("output_index").and_then(Value::as_u64).unwrap_or(0)
+                            )
+                        });
+                    if let Some(index) = event
+                        .get("item_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| response_items.get(id).copied())
+                    {
+                        tool_calls[index].function.arguments.push_str(delta);
+                    } else {
+                        pending_arguments.entry(key).or_default().push_str(delta);
+                    }
                 }
             }
             "response.output_item.done" => {
                 if event.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
-                    let index = event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize;
-                    response_tool_call(&mut tool_calls, index, event.get("item").unwrap_or(&Value::Null));
+                    let item = event.get("item").unwrap_or(&Value::Null);
+                    let index = response_call_index(
+                        &tool_calls,
+                        event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize,
+                        item,
+                    );
+                    response_tool_call(&mut tool_calls, index, item);
+                    if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                        response_items.insert(item_id.to_string(), index);
+                        if let Some(arguments) = pending_arguments.remove(item_id) {
+                            tool_calls[index].function.arguments.push_str(&arguments);
+                        }
+                    }
                 }
             }
             "response.completed" | "response.done" => {
@@ -1103,6 +1241,7 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
         with_console(|| println!());
         io::stdout().flush()?;
     }
+    tool_calls.retain(|call| !call.id.is_empty() && !call.function.name.is_empty());
     Ok((ChatMessage {
         role: "assistant".to_string(),
         content: (!content.is_empty()).then_some(content),
@@ -1135,7 +1274,8 @@ fn call_responses(
     }
     const MAX_RETRIES: u32 = 3;
     for attempt in 0..=MAX_RETRIES {
-        let resp = match config.client.post(format!("{}/responses", config.base_url)).bearer_auth(&config.api_key).json(&body).send() {
+        let request = config.client.post(format!("{}/responses", config.base_url));
+        let resp = match authenticated_request(request, config).json(&body).send() {
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
