@@ -10,7 +10,7 @@
 use std::env;
 use std::io::IsTerminal;
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{block::Padding, Block, Borders, Paragraph};
 use ratatui::Terminal;
+use ratatui_markdown::highlight::{HighlightHooks, TreeSitterHighlighter};
 use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 use ratatui_markdown::ThemeConfig;
 use unicode_width::UnicodeWidthChar as _;
@@ -393,12 +394,17 @@ fn is_block_start(t: &str) -> bool {
 
 /// Render a streamed assistant fragment as styled lines via ratatui-markdown.
 fn markdown_lines(s: &str) -> Vec<Line<'static>> {
+    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+    let highlighter = HIGHLIGHTER
+        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
+        .clone();
     let blocks = split_markdown(s);
     // Width zero disables the renderer's own wrapping. The final transcript
-    // wrapper knows the actual terminal width, so
-    // using two independent widths can otherwise spill a character onto a
-    // new row at column zero.
-    let renderer = MarkdownRenderer::new(0);
+    // wrapper knows the actual terminal width, so using two independent
+    // widths can otherwise spill a character onto a new row at column zero.
+    let renderer = MarkdownRenderer::new(0).with_render_hooks(Box::new(
+        HighlightHooks::new(highlighter, usize::MAX),
+    ));
     renderer.render(&blocks, &ThemeConfig::default())
 }
 
