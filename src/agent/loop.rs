@@ -300,7 +300,7 @@ pub(crate) fn process_turn(
             // Execute all tool calls in this assistant message in parallel.
             let batch_has_mutation = calls
                 .iter()
-                .any(|call| crate::tools::permissions::is_mutating(&call.function.name));
+                .any(|call| crate::tools::is_mutating(&call.function.name));
             let serialize_batch = batch_has_mutation || tool_calls_conflict(&calls);
             let results: Vec<_> = if serialize_batch {
                 let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
