@@ -158,12 +158,48 @@ pub(crate) fn persist_pending(
 ) {
     if let Some(session) = session.as_deref_mut() {
         for message in messages.get(*cursor..).unwrap_or_default() {
-            let _ = crate::session::SessionStore::append_message(session, message.clone());
+            let _ = session.append_message(message.clone());
         }
         *cursor = messages.len();
     }
 }
 
+/// Run a blocking model call behind a small polling boundary so the turn can
+/// return promptly when cancellation is requested. Mirrors the prior
+/// `call_llm_cancellable` behavior but takes the client and cancellation source
+/// as parameters so the loop is unit-testable without network access or crate
+/// globals.
+fn call_client_cancellable(
+    client: &(impl ModelClient + Sync + Send + Clone + 'static),
+    cancel: &(impl CancellationSource + ?Sized),
+    messages: &[ChatMessage],
+    with_tools: bool,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    let client = (*client).clone();
+    let messages = messages.to_vec();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = client
+            .complete(&messages, with_tools)
+            .map_err(|error| error.to_string());
+        let _ = tx.send(result);
+    });
+    loop {
+        if cancel.is_cancelled() {
+            return Err("cancelled by user".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Ok(result)) => return Ok(result),
+            Ok(Err(error)) => return Err(error.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("provider worker disconnected".into())
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_turn(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
@@ -171,12 +207,14 @@ pub(crate) fn process_turn(
     steering_rx: Option<&mpsc::Receiver<String>>,
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
     mut session: Option<&mut Session>,
+    client: &(impl ModelClient + Sync + Send + Clone + 'static),
+    cancel: &(impl CancellationSource + ?Sized),
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Spins while the agent works; erased automatically on return.
     let _working = SpinnerGuard::start("Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
-    let cancellation = crate::agent::state::GlobalCancellation;
+    let cancellation = cancel;
     let mut persisted_cursor = messages.len();
 
     let limits = crate::agent::state::TurnLimits {
@@ -184,16 +222,13 @@ pub(crate) fn process_turn(
     };
     let turn_deadline = crate::agent::r#loop::deadline(limits);
     for iteration in 0..config.max_tool_iterations {
-        if !crate::agent::r#loop::within_budget(turn_deadline) {
-            return Err("turn exceeded configured budget".into());
+        if !within_budget(turn_deadline) {
+            return Err("turn exceeded configured time limit".into());
         }
         persist_pending(&mut session, messages, &mut persisted_cursor);
         if cancellation.is_cancelled() {
             let _ = cancellation.take_cancelled();
             return Err("cancelled by user".into());
-        }
-        if std::time::Instant::now() >= turn_deadline {
-            return Err("turn exceeded configured time limit".into());
         }
         if estimate_tokens(messages) > config.max_prompt_tokens {
             return Err("prompt exceeded configured token limit".into());
@@ -238,7 +273,7 @@ pub(crate) fn process_turn(
             });
             persist_pending(&mut session, messages, &mut persisted_cursor);
         }
-        let (message, usage) = match call_llm_cancellable(config, messages, true) {
+        let (message, usage) = match call_client_cancellable(client, cancel, messages, true) {
             Ok(result) => result,
             Err(e) if e.to_string() == "interrupted" => {
                 return Err("interrupted by user (Ctrl+C)".into());
@@ -430,4 +465,92 @@ pub(crate) fn process_turn(
          \"try a different approach\"."
             .into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::state::{CancellationSource, ToolState};
+    use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
+    use crate::llm::client::ModelClient;
+
+    #[derive(Clone)]
+    struct MockModel;
+
+    impl ModelClient for MockModel {
+        fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _with_tools: bool,
+        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+            Ok((
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: Some("hello from mock".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                Some(1),
+            ))
+        }
+    }
+
+    struct NeverCancel;
+
+    impl CancellationSource for NeverCancel {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        fn take_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn test_config() -> LlmConfig {
+        LlmConfig {
+            provider: Provider::OpenCode,
+            api_key: String::new(),
+            base_url: String::new(),
+            model: "mock".into(),
+            available_models: vec!["mock".into()],
+            api: ApiProtocol::Responses,
+            account_id: None,
+            thinking_effort: None,
+            context_window: 128_000,
+            permission: PermissionMode::Trusted,
+            max_tool_iterations: 8,
+            max_prompt_tokens: 128_000,
+            max_turn_seconds: 60,
+            client: reqwest::blocking::Client::new(),
+        }
+    }
+
+    #[test]
+    fn process_turn_completes_with_injected_client() {
+        let config = test_config();
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let mut state = ToolState::default();
+        let result = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &MockModel,
+            &NeverCancel,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "hello from mock");
+        assert!(messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("hello from mock")));
+    }
 }
