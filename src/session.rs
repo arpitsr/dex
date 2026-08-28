@@ -47,11 +47,47 @@ struct SessionInfoEntry {
     name: String,
 }
 
-#[derive(Debug)]
+#[derive(Serialize)]
+struct SessionClearEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    id: String,
+    timestamp: String,
+}
+
+#[derive(Serialize)]
+struct SessionEventEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    id: String,
+    timestamp: String,
+}
+
+#[derive(Serialize)]
+struct SessionStateEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    id: String,
+    timestamp: String,
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Session {
     header: SessionHeader,
     path: Option<PathBuf>,
     counter: u64,
+}
+
+pub(crate) trait SessionStore {
+    fn append_message(&mut self, message: ChatMessage) -> io::Result<()>;
+}
+
+impl SessionStore for Session {
+    fn append_message(&mut self, message: ChatMessage) -> io::Result<()> {
+        Session::append_message(self, message)
+    }
 }
 
 impl Session {
@@ -65,7 +101,11 @@ impl Session {
     }
 
     fn cwd_slug(cwd: &str) -> String {
-        cwd.replace(['/', '\\'], "-")
+        let mut hash = 2166136261u64;
+        for byte in cwd.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(16777619);
+        }
+        format!("{}-{:016x}", cwd.replace(['/', '\\'], "-"), hash)
     }
 
     pub(crate) fn new(cwd: String, name: Option<String>) -> io::Result<Self> {
@@ -106,6 +146,18 @@ impl Session {
                 format!("bad session header: {}", e),
             )
         })?;
+        if header.entry_type != "session" || header.id.is_empty() || header.cwd.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid session metadata",
+            ));
+        }
+        if header.version != SESSION_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported session version {}", header.version),
+            ));
+        }
         let counter = lines.count() as u64;
         Ok(Self {
             header,
@@ -166,6 +218,24 @@ impl Session {
         Ok(sessions)
     }
 
+    pub(crate) fn resume(cwd: &str, selector: &str) -> io::Result<Self> {
+        let sessions = Self::list(cwd)?;
+        let path = if let Ok(index) = selector.parse::<usize>() {
+            sessions.get(index).map(|(path, _)| path.clone())
+        } else {
+            let candidate = PathBuf::from(selector);
+            sessions
+                .iter()
+                .find(|(path, _)| {
+                    path == &candidate
+                        || path.file_name().and_then(|n| n.to_str()) == Some(selector)
+                })
+                .map(|(path, _)| path.clone())
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session not found"))?;
+        Self::from_path(&path)
+    }
+
     pub(crate) fn set_name(&mut self, name: String) -> io::Result<()> {
         self.header.name = Some(name.clone());
         let entry = SessionInfoEntry {
@@ -183,6 +253,35 @@ impl Session {
             id: self.next_id(),
             timestamp: Self::now_iso(),
             message,
+        };
+        self.append_line(&entry)
+    }
+
+    pub(crate) fn clear_messages(&mut self) -> io::Result<()> {
+        let entry = SessionClearEntry {
+            entry_type: "clear".into(),
+            id: self.next_id(),
+            timestamp: Self::now_iso(),
+        };
+        self.append_line(&entry)
+    }
+
+    pub(crate) fn turn_event(&mut self, event: &str) -> io::Result<()> {
+        let entry = SessionEventEntry {
+            entry_type: event.to_string(),
+            id: self.next_id(),
+            timestamp: Self::now_iso(),
+        };
+        self.append_line(&entry)
+    }
+
+    pub(crate) fn set_state(&mut self, key: &str, value: &str) -> io::Result<()> {
+        let entry = SessionStateEntry {
+            entry_type: "session_state".into(),
+            id: self.next_id(),
+            timestamp: Self::now_iso(),
+            key: key.into(),
+            value: value.into(),
         };
         self.append_line(&entry)
     }
@@ -264,7 +363,9 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
                 continue;
             }
         };
-        if value.get("type").and_then(Value::as_str) == Some("message") {
+        if value.get("type").and_then(Value::as_str) == Some("clear") {
+            messages.clear();
+        } else if value.get("type").and_then(Value::as_str) == Some("message") {
             match serde_json::from_value::<ChatMessage>(value) {
                 Ok(msg) if msg.role != "system" => messages.push(msg),
                 Ok(_) => {}
@@ -278,4 +379,41 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
         }
     }
     Ok(messages)
+}
+
+pub(crate) fn load_session_state(
+    path: &Path,
+) -> io::Result<std::collections::HashMap<String, String>> {
+    let text = fs::read_to_string(path)?;
+    let mut state = std::collections::HashMap::new();
+    for line in text.lines().skip(1) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_state") {
+            if let (Some(key), Some(val)) = (
+                value.get("key").and_then(Value::as_str),
+                value.get("value").and_then(Value::as_str),
+            ) {
+                state.insert(key.into(), val.into());
+            }
+        }
+    }
+    Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn clear_marker_removes_messages_during_recovery() {
+        let path =
+            std::env::temp_dir().join(format!("ak-session-test-{}.jsonl", std::process::id()));
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        let message = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"old"}"#;
+        let clear = r#"{"type":"clear","id":"2","timestamp":"2020-01-01T00:00:00Z"}"#;
+        fs::write(&path, format!("{}\n{}\n{}\n", header, message, clear)).unwrap();
+        assert!(load_messages_from_session(&path).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
 }

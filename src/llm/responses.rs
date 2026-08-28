@@ -1,0 +1,9 @@
+use crate::{ChatMessage, LlmConfig};
+
+pub(crate) fn complete(
+    config: &LlmConfig,
+    messages: &[ChatMessage],
+    with_tools: bool,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    crate::call_responses(config, messages, with_tools)
+}
