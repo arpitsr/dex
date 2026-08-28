@@ -124,7 +124,7 @@ pub(crate) fn with_console(f: impl FnOnce()) {
 /// Animates `<label> ...` frames until dropped (no-op when stdout is piped).
 pub(crate) struct SpinnerGuard {
     #[allow(dead_code)]
-    pub(crate)     worker: Option<thread::JoinHandle<()>>,
+    pub(crate) worker: Option<thread::JoinHandle<()>>,
 }
 
 impl SpinnerGuard {

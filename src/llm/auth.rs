@@ -1,21 +1,21 @@
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use serde::Deserialize;
-
 
 #[derive(Deserialize)]
 pub(crate) struct CodexAuthFile {
-    pub(crate)     tokens: Option<CodexTokens>,
+    pub(crate) tokens: Option<CodexTokens>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct CodexTokens {
-    pub(crate)     access_token: String,
-    pub(crate)     account_id: Option<String>,
+    pub(crate) access_token: String,
+    pub(crate) account_id: Option<String>,
 }
 
-pub(crate) fn load_codex_credentials() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+pub(crate) fn load_codex_credentials(
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     if let Some(access_token) = env::var_os("CODEX_ACCESS_TOKEN") {
         let access_token = access_token.to_string_lossy().trim().to_string();
         if !access_token.is_empty() {

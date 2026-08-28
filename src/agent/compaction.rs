@@ -1,8 +1,7 @@
-
 use crate::core::format::*;
+use crate::core::types::*;
 use crate::llm::client::*;
 use crate::llm::config::*;
-use crate::core::types::*;
 
 pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
     let chars: usize = messages
@@ -73,7 +72,10 @@ pub(crate) fn summarize_old_messages(
     Ok(summary.content.unwrap_or_default())
 }
 
-pub(crate) fn compact_history(config: &LlmConfig, messages: &mut Vec<ChatMessage>) -> Result<(), String> {
+pub(crate) fn compact_history(
+    config: &LlmConfig,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<(), String> {
     // Find where the protected recent window begins (never split a
     // tool_call/tool pairing, so back up to the last non-tool message).
     let total = messages.len();

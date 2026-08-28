@@ -1,9 +1,8 @@
+use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use serde_json::Value;
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TurnLimits {
@@ -59,10 +58,10 @@ pub(crate) fn cache_fingerprint(name: &str, input: &str) -> String {
 
 #[derive(Default)]
 pub(crate) struct ToolState {
-    pub(crate)     cache: HashMap<String, String>,
-    pub(crate)     dirty: bool,
+    pub(crate) cache: HashMap<String, String>,
+    pub(crate) dirty: bool,
     /// Last API-reported prompt token count for the main conversation.
-    pub(crate)     last_usage: Option<u64>,
+    pub(crate) last_usage: Option<u64>,
 }
 
 impl ToolState {

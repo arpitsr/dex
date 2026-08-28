@@ -1,6 +1,5 @@
 use serde_json::Value;
 
-
 pub(crate) fn truncate_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
     let mut preview = String::new();
     let mut truncated = false;
