@@ -18,8 +18,8 @@ use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 
 use crate::{
-    ApprovalDecision, ApprovalRequest, Args, ChatMessage, LlmConfig, Provider, Session, SinkLine,
-    ToolState,
+    ApprovalDecision, ApprovalRequest, Args, ChatMessage, Console, LlmConfig, Provider, Session,
+    SinkLine, ToolState,
 };
 
 use super::slash::{complete_slash, handle_slash, slash_suggestions};
@@ -29,6 +29,7 @@ use super::{
     SUBMITTED_PROMPT_BG, TRANSCRIPT_INDENT,
 };
 
+#[allow(clippy::too_many_arguments)]
 fn submit(
     app: &mut App,
     tx: &mpsc::Sender<UiEvent>,
@@ -37,6 +38,7 @@ fn submit(
     followup_tx: &mpsc::Sender<String>,
     followup_accepted_tx: &mpsc::Sender<String>,
     is_followup: bool,
+    console: &Console,
 ) {
     let line: String = app.input.text().trim().to_string();
     app.history_push(line.clone());
@@ -94,6 +96,7 @@ fn submit(
     app.turn_started = Some(Instant::now());
     app.active_tool = None;
     app.last_activity = None;
+    let console = console.clone();
     thread::spawn(move || {
         let result = loop {
             let result = crate::process_turn(
@@ -105,6 +108,7 @@ fn submit(
                 Some(&mut persist_session),
                 &config,
                 &crate::agent::state::GlobalCancellation,
+                &console,
             );
             if result.is_err() {
                 break result;
@@ -128,7 +132,7 @@ fn submit(
             }
         };
         if let Err(e) = &result {
-            if let Some(sink) = crate::console_sink() {
+            if let Some(sink) = console.sink() {
                 let _ = sink.send(SinkLine::Error(format!("{}", e)));
             }
         }
@@ -325,10 +329,11 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
     app.followup_rx = Some(followup_rx);
     let (followup_accepted_tx, followup_accepted_rx) = mpsc::channel::<String>();
     let (sink_tx, sink_rx) = mpsc::channel::<SinkLine>();
-    crate::set_console_sink(Some(sink_tx));
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>();
-    crate::set_approval_sink(Some(approval_tx));
     app.approval_rx = Some(approval_rx);
+    // Bundled sinks for this REPL session; cloned into each worker turn so the
+    // agent pipeline no longer reads process-global console state.
+    let console = Console::new(sink_tx, approval_tx);
 
     let mut run = || -> std::io::Result<()> {
         loop {
@@ -460,6 +465,7 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
                                 &followup_tx,
                                 &followup_accepted_tx,
                                 key.modifiers.contains(KeyModifiers::ALT),
+                                &console,
                             );
                         } else {
                             app.input.handle_key(key);
@@ -566,7 +572,6 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
         Ok(())
     };
     let res = run();
-    crate::set_approval_sink(None);
     // Always restore the terminal, even if the loop returned early via `?`.
     disable_raw_mode().ok();
     let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);

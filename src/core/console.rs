@@ -77,29 +77,76 @@ pub(crate) static SPINNER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) static SPINNER_DRAWN: AtomicBool = AtomicBool::new(false);
 
-/// When set (ratatui UI mode), the agent routes streamed output here instead
-/// of printing to the console.
-pub(crate) static CONSOLE_SINK: Mutex<Option<mpsc::Sender<SinkLine>>> = Mutex::new(None);
-
-pub(crate) static APPROVAL_SINK: Mutex<Option<mpsc::Sender<ApprovalRequest>>> = Mutex::new(None);
-
-pub(crate) static SESSION_APPROVALS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
-/// Enable/disable the console sink (used by the ratatui UI path).
-pub fn set_console_sink(sink: Option<mpsc::Sender<SinkLine>>) {
-    *CONSOLE_SINK.lock().unwrap_or_else(|e| e.into_inner()) = sink;
+/// Bundles the output sinks used by a single agent turn. Previously these were
+/// process-global statics (CONSOLE_SINK / APPROVAL_SINK / SESSION_APPROVALS);
+/// threading a `Console` through `process_turn` removes the singleton that the
+/// REPL worker thread used to read via crate-level globals.
+pub(crate) struct Console {
+    sink: Option<mpsc::Sender<SinkLine>>,
+    approval: Option<mpsc::Sender<ApprovalRequest>>,
+    session_approvals: Mutex<Option<HashSet<String>>>,
 }
 
-/// Clone of the active sink sender, if any.
-pub fn console_sink() -> Option<mpsc::Sender<SinkLine>> {
-    CONSOLE_SINK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+impl Clone for Console {
+    fn clone(&self) -> Self {
+        Self {
+            sink: self.sink.clone(),
+            approval: self.approval.clone(),
+            session_approvals: Mutex::new(
+                self.session_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+        }
+    }
 }
 
-pub(crate) fn set_approval_sink(sink: Option<mpsc::Sender<ApprovalRequest>>) {
-    *APPROVAL_SINK.lock().unwrap_or_else(|e| e.into_inner()) = sink;
+impl Console {
+    pub(crate) fn new(
+        sink: mpsc::Sender<SinkLine>,
+        approval: mpsc::Sender<ApprovalRequest>,
+    ) -> Self {
+        Self {
+            sink: Some(sink),
+            approval: Some(approval),
+            session_approvals: Mutex::new(None),
+        }
+    }
+
+    /// A console with no sinks: streamed output prints directly to the terminal
+    /// (used by the one-shot CLI path).
+    pub(crate) fn none() -> Self {
+        Self {
+            sink: None,
+            approval: None,
+            session_approvals: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn sink(&self) -> Option<&mpsc::Sender<SinkLine>> {
+        self.sink.as_ref()
+    }
+
+    pub(crate) fn approval(&self) -> Option<&mpsc::Sender<ApprovalRequest>> {
+        self.approval.as_ref()
+    }
+
+    pub(crate) fn session_approved(&self, name: &str) -> bool {
+        self.session_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|approved| approved.contains(name))
+    }
+
+    pub(crate) fn record_session_approval(&self, name: &str) {
+        self.session_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashSet::new)
+            .insert(name.to_string());
+    }
 }
 
 /// Erase the drawn spinner frame, if any. Caller holds CONSOLE_LOCK.
@@ -112,8 +159,10 @@ pub(crate) fn erase_spinner_frame() {
 }
 
 /// Run `f` with the spinner suspended so output never interleaves with frames.
-pub(crate) fn with_console(f: impl FnOnce()) {
-    if console_sink().is_some() {
+/// `ui_mode` is true when streamed output is routed through a sink instead of
+/// the terminal (e.g. the ratatui REPL), in which case console IO is skipped.
+pub(crate) fn with_console(ui_mode: bool, f: impl FnOnce()) {
+    if ui_mode {
         return; // UI mode: output is routed through the sink; skip console IO
     }
     let _lock = CONSOLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -128,8 +177,8 @@ pub(crate) struct SpinnerGuard {
 }
 
 impl SpinnerGuard {
-    pub(crate) fn start(label: &str) -> Self {
-        if console_sink().is_some() {
+    pub(crate) fn start(console: &Console, label: &str) -> Self {
+        if console.sink().is_some() {
             return Self { worker: None }; // UI mode shows "working…" in the status bar
         }
         if !io::stdout().is_terminal() {
