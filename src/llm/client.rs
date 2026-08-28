@@ -1,3 +1,4 @@
+use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -5,14 +6,13 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use serde_json::json;
 
 use crate::core::console::*;
+use crate::core::types::*;
 use crate::llm::auth::*;
 use crate::llm::config::*;
 use crate::llm::protocol::*;
 use crate::llm::stream::*;
-use crate::core::types::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelCapabilities {
@@ -44,36 +44,6 @@ impl ModelClient for LlmConfig {
         with_tools: bool,
     ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
         call_llm(self, messages, with_tools)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    struct MockModel;
-    impl ModelClient for MockModel {
-        fn complete(
-            &self,
-            _messages: &[ChatMessage],
-            _with_tools: bool,
-        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
-            Ok((
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: Some("mock response".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                },
-                Some(3),
-            ))
-        }
-    }
-    #[test]
-    fn model_boundary_supports_deterministic_mock() {
-        let (message, usage) = MockModel.complete(&[], false).unwrap();
-        assert_eq!(message.content.as_deref(), Some("mock response"));
-        assert_eq!(usage, Some(3));
     }
 }
 
@@ -296,5 +266,38 @@ pub(crate) fn call_llm_cancellable(
                 return Err("provider worker disconnected".into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockModel;
+
+    impl ModelClient for MockModel {
+        fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _with_tools: bool,
+        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+            Ok((
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: Some("mock response".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                Some(3),
+            ))
+        }
+    }
+
+    #[test]
+    fn model_boundary_supports_deterministic_mock() {
+        let (message, usage) = MockModel.complete(&[], false).unwrap();
+        assert_eq!(message.content.as_deref(), Some("mock response"));
+        assert_eq!(usage, Some(3));
     }
 }

@@ -1,29 +1,29 @@
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::io;
 use std::time::Duration;
-use serde::Deserialize;
 
-use crate::llm::auth::*;
 use crate::core::types::*;
+use crate::llm::auth::*;
 
 #[derive(Default, Deserialize)]
 pub(crate) struct FileConfig {
-    pub(crate)     provider: Option<String>,
-    pub(crate)     api_key: Option<String>,
-    pub(crate)     base_url: Option<String>,
-    pub(crate)     model: Option<String>,
-    pub(crate)     models: Option<Vec<String>>,
-    pub(crate)     api: Option<String>,
-    pub(crate)     thinking_effort: Option<String>,
-    pub(crate)     context_window: Option<u64>,
-    pub(crate)     permission: Option<String>,
-    pub(crate)     max_tool_iterations: Option<usize>,
-    pub(crate)     max_prompt_tokens: Option<u64>,
-    pub(crate)     max_tool_output_bytes: Option<usize>,
-    pub(crate)     max_turn_seconds: Option<u64>,
-    pub(crate)     http_connect_timeout_secs: Option<u64>,
-    pub(crate)     http_request_timeout_secs: Option<u64>,
+    pub(crate) provider: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) models: Option<Vec<String>>,
+    pub(crate) api: Option<String>,
+    pub(crate) thinking_effort: Option<String>,
+    pub(crate) context_window: Option<u64>,
+    pub(crate) permission: Option<String>,
+    pub(crate) max_tool_iterations: Option<usize>,
+    pub(crate) max_prompt_tokens: Option<u64>,
+    pub(crate) max_tool_output_bytes: Option<usize>,
+    pub(crate) max_turn_seconds: Option<u64>,
+    pub(crate) http_connect_timeout_secs: Option<u64>,
+    pub(crate) http_request_timeout_secs: Option<u64>,
 }
 
 pub(crate) fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
@@ -39,23 +39,33 @@ pub(crate) fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error
         .map_err(|e| format!("invalid config file {}: {}", path.display(), e).into())
 }
 
+pub(crate) fn permission_from_env_or_file(
+    file: &FileConfig,
+) -> Result<PermissionMode, Box<dyn std::error::Error>> {
+    let value = env::var("AK_PERMISSION")
+        .ok()
+        .or_else(|| file.permission.clone())
+        .unwrap_or_else(|| "ask-writes".to_string());
+    PermissionMode::parse(&value).map_err(Into::into)
+}
+
 #[derive(Clone)]
 pub(crate) struct LlmConfig {
-    pub(crate)     provider: Provider,
-    pub(crate)     api_key: String,
-    pub(crate)     base_url: String,
-    pub(crate)     model: String,
-    pub(crate)     available_models: Vec<String>,
-    pub(crate)     api: ApiProtocol,
-    pub(crate)     account_id: Option<String>,
-    pub(crate)     thinking_effort: Option<String>,
+    pub(crate) provider: Provider,
+    pub(crate) api_key: String,
+    pub(crate) base_url: String,
+    pub(crate) model: String,
+    pub(crate) available_models: Vec<String>,
+    pub(crate) api: ApiProtocol,
+    pub(crate) account_id: Option<String>,
+    pub(crate) thinking_effort: Option<String>,
     /// Model context window size in tokens (used for compaction + status bar).
-    pub(crate)     context_window: u64,
-    pub(crate)     permission: PermissionMode,
-    pub(crate)     max_tool_iterations: usize,
-    pub(crate)     max_prompt_tokens: u64,
-    pub(crate)     max_turn_seconds: u64,
-    pub(crate)     client: reqwest::blocking::Client,
+    pub(crate) context_window: u64,
+    pub(crate) permission: PermissionMode,
+    pub(crate) max_tool_iterations: usize,
+    pub(crate) max_prompt_tokens: u64,
+    pub(crate) max_turn_seconds: u64,
+    pub(crate) client: reqwest::blocking::Client,
 }
 
 impl LlmConfig {
@@ -74,7 +84,7 @@ impl LlmConfig {
         );
         let permission = match permission_override {
             Some(mode) => mode,
-            None => PermissionMode::from_env_or_file(&file)?,
+            None => permission_from_env_or_file(&file)?,
         };
         let provider_name = env::var("AK_PROVIDER")
             .ok()
@@ -193,7 +203,10 @@ impl LlmConfig {
         })
     }
 
-    pub(crate) fn switch_provider(&mut self, provider: Provider) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn switch_provider(
+        &mut self,
+        provider: Provider,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let file = load_file_config()?;
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
         let (api_key, account_id) = match provider {

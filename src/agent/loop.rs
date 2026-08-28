@@ -1,20 +1,20 @@
+use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use serde_json::Value;
 
 use crate::agent::compaction::*;
 use crate::agent::state::*;
 use crate::core::console::*;
 use crate::core::format::*;
+use crate::core::types::*;
 use crate::llm::client::*;
 use crate::llm::config::*;
 use crate::session::*;
 use crate::tools::*;
-use crate::core::types::*;
 
 pub(crate) fn deadline(limits: TurnLimits) -> Instant {
     Instant::now() + Duration::from_secs(limits.elapsed_seconds)
@@ -104,7 +104,10 @@ pub(crate) fn approve_tool(mode: PermissionMode, name: &str, input: &str) -> boo
         && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-pub(crate) fn execute_tool_call(call: &LlmToolCall, permission: PermissionMode) -> (String, String, String) {
+pub(crate) fn execute_tool_call(
+    call: &LlmToolCall,
+    permission: PermissionMode,
+) -> (String, String, String) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
     let value: Value = match serde_json::from_str(&raw_args) {
@@ -303,10 +306,16 @@ pub(crate) fn process_turn(
                     input,
                     cache_fingerprint(&name, &input)
                 );
-                if last_tools.len() >= 6 {
-                    last_tools.remove(0);
+                // Only successful calls count toward the repeated-identical
+                // limit; a failed call is a legitimate retry and must stay
+                // allowed so the model can recover instead of being blocked.
+                let succeeded = !result.starts_with("Error: ");
+                if succeeded {
+                    if last_tools.len() >= 6 {
+                        last_tools.remove(0);
+                    }
+                    last_tools.push(cache_key.clone());
                 }
-                last_tools.push(cache_key.clone());
                 let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
                 if let Some(sink) = console_sink() {
                     let _ = sink.send(SinkLine::ToolInput(format!(
@@ -331,7 +340,7 @@ pub(crate) fn process_turn(
                 let result = if repeated_count >= 3 {
                     "Error: repeated identical tool call; choose a different action or finish."
                         .to_string()
-                } else if cacheable {
+                } else if cacheable && succeeded {
                     if let Some(cached) = state.cache.get(&cache_key) {
                         cache_hit = true;
                         if console_sink().is_none() {

@@ -1,11 +1,11 @@
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
-use serde_json::Value;
 
 use crate::core::console::*;
 use crate::core::highlight::*;
-use crate::llm::protocol::*;
 use crate::core::types::*;
+use crate::llm::protocol::*;
 
 /// Incremental markdown printer: prose is flushed as soon as a full line
 /// arrives; code fences are buffered until closed so they can be highlighted

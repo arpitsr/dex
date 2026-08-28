@@ -35,6 +35,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{Args, ChatMessage, LlmConfig, Provider, Session, SinkLine, Skill, ToolState};
 
+mod input;
+mod wrapping;
+use input::InputField;
+use wrapping::wrap_line;
+
 /// Events from the agent worker thread into the UI loop.
 enum UiEvent {
     /// Updated conversation + tool state after a turn completes.
@@ -46,141 +51,6 @@ enum UiEvent {
     Done {
         success: bool,
     },
-}
-
-/// A minimal single-line/multi-line input editor with an inline block cursor.
-/// Avoids tui_textarea's default (which underlines the cursor line and does not
-/// wrap long input, causing overflow). Text wraps in a Paragraph so long lines
-/// never overflow the box.
-struct InputField {
-    lines: Vec<String>,
-    row: usize,
-    col: usize,
-}
-impl InputField {
-    fn new() -> Self {
-        InputField {
-            lines: vec![String::new()],
-            row: 0,
-            col: 0,
-        }
-    }
-    fn from_text(text: &str) -> Self {
-        let lines: Vec<String> = if text.is_empty() {
-            vec![String::new()]
-        } else {
-            text.split('\n').map(|s| s.to_string()).collect()
-        };
-        let row = lines.len().saturating_sub(1);
-        let col = lines[row].len();
-        InputField { lines, row, col }
-    }
-    fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-    fn reset(&mut self) {
-        self.lines = vec![String::new()];
-        self.row = 0;
-        self.col = 0;
-    }
-    fn insert_char(&mut self, c: char) {
-        if c == '\n' {
-            let line = std::mem::take(&mut self.lines[self.row]);
-            let (left, right) = line.split_at(self.col);
-            self.lines.insert(self.row + 1, right.to_string());
-            self.lines[self.row] = left.to_string();
-            self.row += 1;
-            self.col = 0;
-            return;
-        }
-        if self.col > self.lines[self.row].len() {
-            self.col = self.lines[self.row].len();
-        }
-        self.lines[self.row].insert(self.col, c);
-        self.col += c.len_utf8();
-    }
-    fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::KeyCode;
-        match key.code {
-            KeyCode::Char(c) => self.insert_char(c),
-            KeyCode::Enter => self.insert_char('\n'),
-            KeyCode::Backspace => {
-                if self.col == 0 {
-                    if self.row > 0 {
-                        let removed = self.lines.remove(self.row);
-                        self.row -= 1;
-                        self.col = self.lines[self.row].len();
-                        self.lines[self.row].push_str(&removed);
-                    }
-                } else {
-                    let line = &mut self.lines[self.row];
-                    let mut idx = self.col;
-                    while idx > 0 && !line.is_char_boundary(idx - 1) {
-                        idx -= 1;
-                    }
-                    line.remove(idx - 1);
-                    self.col = idx - 1;
-                }
-            }
-            KeyCode::Delete => {
-                let line = &mut self.lines[self.row];
-                if self.col < line.len() {
-                    let mut idx = self.col;
-                    while idx < line.len() && !line.is_char_boundary(idx + 1) {
-                        idx += 1;
-                    }
-                    line.remove(idx);
-                } else if self.row + 1 < self.lines.len() {
-                    let removed = self.lines.remove(self.row + 1);
-                    self.lines[self.row].push_str(&removed);
-                }
-            }
-            KeyCode::Left => {
-                if self.col > 0 {
-                    let line = &self.lines[self.row];
-                    let mut idx = self.col;
-                    while idx > 0 && !line.is_char_boundary(idx - 1) {
-                        idx -= 1;
-                    }
-                    self.col = idx - 1;
-                } else if self.row > 0 {
-                    self.row -= 1;
-                    self.col = self.lines[self.row].len();
-                }
-            }
-            KeyCode::Right => {
-                let line = &self.lines[self.row];
-                if self.col < line.len() {
-                    let mut idx = self.col;
-                    while idx < line.len() && !line.is_char_boundary(idx + 1) {
-                        idx += 1;
-                    }
-                    self.col = idx + 1;
-                } else if self.row + 1 < self.lines.len() {
-                    self.row += 1;
-                    self.col = 0;
-                }
-            }
-            KeyCode::Up if self.row > 0 => {
-                self.row -= 1;
-                self.clamp_col();
-            }
-            KeyCode::Down if self.row + 1 < self.lines.len() => {
-                self.row += 1;
-                self.clamp_col();
-            }
-            KeyCode::Home => self.col = 0,
-            KeyCode::End => self.col = self.lines[self.row].len(),
-            KeyCode::Tab => self.insert_char('\t'),
-            _ => {}
-        }
-    }
-    fn clamp_col(&mut self) {
-        let max = self.lines[self.row].len();
-        if self.col > max {
-            self.col = max;
-        }
-    }
 }
 
 struct App {
@@ -283,9 +153,12 @@ impl App {
 const VERTICAL_GUTTER: u16 = 1;
 const HORIZONTAL_GUTTER: u16 = 1;
 const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
-const INPUT_BORDER_ROWS: u16 = 2;
+const INPUT_BORDER_ROWS: u16 = 0;
+const INPUT_PAD_Y: u16 = 1;
 const STATUS_CONTENT_ROWS: u16 = 1;
 const INPUT_MIN_ROWS: u16 = 3;
+const INPUT_STATUS_GUTTER: u16 = 0;
+const APPROVAL_HEIGHT: u16 = 11;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "Exit the REPL"),
@@ -385,22 +258,24 @@ fn surface_padding() -> Padding {
     }
 }
 
-fn input_block(border_color: Color) -> Block<'static> {
-    Block::new()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        // Keep the editor compact vertically; the borders provide its visual
-        // separation while the horizontal gutter keeps text off the edges.
+const SUBMITTED_PROMPT_BG: Color = Color::Rgb(20, 38, 54);
+const INPUT_BG: Color = SUBMITTED_PROMPT_BG;
+
+fn input_block() -> Block<'static> {
+    Block::default()
         .padding(Padding {
-            left: HORIZONTAL_GUTTER,
+            left: HORIZONTAL_GUTTER + 1,
             right: HORIZONTAL_GUTTER,
-            top: 0,
-            bottom: 0,
+            top: INPUT_PAD_Y,
+            bottom: INPUT_PAD_Y,
         })
-        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(INPUT_BG))
 }
 
 fn input_outer_height(content_rows: u16) -> u16 {
-    content_rows.saturating_add(INPUT_BORDER_ROWS)
+    content_rows
+        .saturating_add(INPUT_BORDER_ROWS)
+        .saturating_add(INPUT_PAD_Y * 2)
 }
 
 fn activity_height(item_count: u16) -> u16 {
@@ -412,15 +287,22 @@ fn activity_height(item_count: u16) -> u16 {
 }
 
 fn input_content_width(width: u16) -> u16 {
-    width.saturating_sub(HORIZONTAL_GUTTER * 2)
+    // Must match input_block's horizontal padding: HORIZONTAL_GUTTER+1 on the
+    // left, HORIZONTAL_GUTTER on the right.
+    width.saturating_sub(HORIZONTAL_GUTTER * 2 + 1)
 }
 
 fn status_height() -> u16 {
     STATUS_CONTENT_ROWS + VERTICAL_GUTTER * 2
 }
 
-fn minimum_view_height(activity_h: u16) -> u16 {
-    activity_h + VERTICAL_GUTTER * 2 + status_height() + INPUT_MIN_ROWS
+fn minimum_view_height(activity_h: u16, approval_h: u16) -> u16 {
+    activity_h
+        + approval_h
+        + VERTICAL_GUTTER
+        + status_height()
+        + INPUT_MIN_ROWS
+        + INPUT_STATUS_GUTTER
 }
 
 /// Rectangles owned by the main transcript and bottom pane. Keeping geometry
@@ -429,6 +311,7 @@ fn minimum_view_height(activity_h: u16) -> u16 {
 struct UiLayout {
     transcript: ratatui::layout::Rect,
     activity: ratatui::layout::Rect,
+    approval: ratatui::layout::Rect,
     input: ratatui::layout::Rect,
     footer: ratatui::layout::Rect,
 }
@@ -437,30 +320,35 @@ fn compute_layout(
     area: ratatui::layout::Rect,
     input_rows: u16,
     activity_items: u16,
+    approval_pending: bool,
 ) -> Option<UiLayout> {
     let activity_h = activity_height(activity_items);
-    let footer_height = VERTICAL_GUTTER * 2 + status_height();
-    if area.height < minimum_view_height(activity_h) {
+    let approval_h = if approval_pending { APPROVAL_HEIGHT } else { 0 };
+    let footer_height = INPUT_STATUS_GUTTER + status_height();
+    if area.height < minimum_view_height(activity_h, approval_h) {
         // Degrade gracefully on a short terminal. Keeping the transcript
         // visible is preferable to returning a blank frame; the bottom pane
         // will be restored automatically on the next resize.
         return Some(UiLayout {
             transcript: area,
             activity: Rect::new(area.x, area.y, area.width, 0),
+            approval: Rect::new(area.x, area.y, area.width, 0),
             input: Rect::new(area.x, area.y, area.width, 0),
             footer: Rect::new(area.x, area.y, area.width, 0),
         });
     }
 
-    let input_h = input_outer_height(input_rows)
-        .clamp(INPUT_MIN_ROWS, 8)
-        .min(area.height.saturating_sub(activity_h + footer_height));
+    let input_h = input_outer_height(input_rows).clamp(INPUT_MIN_ROWS, 8).min(
+        area.height
+            .saturating_sub(activity_h + approval_h + footer_height),
+    );
     let chunks = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(VERTICAL_GUTTER),
         Constraint::Length(activity_h),
+        Constraint::Length(approval_h),
         Constraint::Length(input_h),
-        Constraint::Length(VERTICAL_GUTTER),
+        Constraint::Length(INPUT_STATUS_GUTTER),
         Constraint::Length(status_height()),
     ])
     .split(area);
@@ -468,8 +356,9 @@ fn compute_layout(
     Some(UiLayout {
         transcript: chunks[0],
         activity: chunks[2],
-        input: chunks[3],
-        footer: chunks[5],
+        approval: chunks[3],
+        input: chunks[4],
+        footer: chunks[6],
     })
 }
 
@@ -953,23 +842,23 @@ struct ComposerView;
 
 impl ComposerView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
-        let border_color = if app.busy {
-            Color::DarkGray
+        let input_style = if app.busy || app.pending_approval.is_some() {
+            Style::default().fg(Color::DarkGray).bg(INPUT_BG)
         } else {
-            Color::LightGreen
+            Style::default().fg(Color::White).bg(INPUT_BG)
         };
-        let block = input_block(border_color);
+        let block = input_block();
         let inner = block.inner(area);
         let (lines, cursor) = render_input(&app.input, inner.width);
         let content_rows = inner.height;
         let scroll = (cursor.0 + 1).saturating_sub(content_rows);
         let paragraph = Paragraph::new(lines)
-            .style(Style::default().fg(Color::White))
+            .style(input_style)
             .scroll((scroll, 0))
             .block(block);
         f.render_widget(paragraph, area);
 
-        if !app.busy {
+        if !app.busy && app.pending_approval.is_none() {
             let cur_y = cursor.2.saturating_sub(scroll);
             f.set_cursor_position((inner.x + cursor.1, inner.y + cur_y));
         }
@@ -1074,15 +963,14 @@ impl BottomPane {
 struct ApprovalOverlay;
 
 impl ApprovalOverlay {
-    fn render(f: &mut ratatui::Frame, app: &App) {
+    fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let Some(approval) = app.pending_approval.as_ref() else {
             return;
         };
-        let area = centered_rect(76, 12, f.area());
         f.render_widget(Clear, area);
         let block = Block::default()
             .title(" Approval required ")
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::BOTTOM)
             .border_style(Style::default().fg(Color::Yellow))
             .style(Style::default().bg(Color::Black));
         let inner = block.inner(area);
@@ -1151,17 +1039,6 @@ impl ApprovalOverlay {
     }
 }
 
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width.saturating_sub(2));
-    let height = height.min(area.height.saturating_sub(2));
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
-}
-
 fn view(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     // Measure the composer using the exact inner width it will receive, then
@@ -1173,63 +1050,20 @@ fn view(f: &mut ratatui::Frame, app: &mut App) {
     let visible_pending = pending_total.min(3) as u16;
     let extra_queue_line = u16::from(pending_total > 3);
     let activity_items = 1 + visible_pending + extra_queue_line;
-    let layout = compute_layout(area, input_rows, activity_items).expect("layout always exists");
+    let layout = compute_layout(
+        area,
+        input_rows,
+        activity_items,
+        app.pending_approval.is_some(),
+    )
+    .expect("layout always exists");
 
     TranscriptView::render(f, layout.transcript, app);
     BottomPane::render(f, &layout, app);
+    if app.pending_approval.is_some() {
+        ApprovalOverlay::render(f, layout.approval, app);
+    }
     SlashSuggestionsView::render(f, layout.input, app);
-    ApprovalOverlay::render(f, app);
-}
-
-/// Greedily wrap a logical line into segments of display width <= `w`.
-/// `col` is a *byte* offset into `line`; the returned tuple is
-/// `(segments, cursor_segment_index, cursor_x_in_cells)`.
-fn wrap_line(line: &str, w: usize, col: usize) -> (Vec<String>, u16, u16) {
-    let w = w.max(1);
-    let col = col.min(line.len());
-    // Collect char byte boundaries so we can measure per-character widths.
-    let mut bounds: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
-    bounds.push(line.len());
-
-    // First pass: split into byte-range segments greedily by display width.
-    let mut segs: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    let mut cur_w = 0usize;
-    for k in 0..bounds.len() - 1 {
-        let ci = bounds[k];
-        let cn = bounds[k + 1];
-        let cw = line[ci..cn]
-            .chars()
-            .next()
-            .unwrap()
-            .width()
-            .unwrap_or(0)
-            .max(1);
-        if cur_w + cw > w && ci > start {
-            segs.push((start, ci));
-            start = ci;
-            cur_w = 0;
-        }
-        cur_w += cw;
-    }
-    segs.push((start, line.len()));
-
-    let strings: Vec<String> = segs.iter().map(|&(s, e)| line[s..e].to_string()).collect();
-
-    // Second pass: locate the cursor within a segment.
-    let mut cur_seg: u16 = 0;
-    let mut cur_x: u16 = 0;
-    for (i, &(s, e)) in segs.iter().enumerate() {
-        if col >= s && col <= e {
-            cur_seg = i as u16;
-            cur_x = line[s..col]
-                .chars()
-                .map(|c| c.width().unwrap_or(0).max(1))
-                .sum::<usize>() as u16;
-            break;
-        }
-    }
-    (strings, cur_seg, cur_x)
 }
 
 /// Move the transcript scroll offset by `delta` rows (negative = up) and drop
@@ -1246,12 +1080,6 @@ fn scroll_transcript(app: &mut App, delta: i32) {
 /// `Line` == one rendered row, so a scroll offset is exact.
 fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     let w = width.max(1) as usize;
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut cur: Vec<Span<'static>> = Vec::new();
-    let mut cur_w = 0usize;
-    // Assistant output carries the shared transcript prefix. Treat it as a
-    // hanging indent so wrapped continuation rows receive the same prefix.
-    // Submitted input has a background style on its prefix and is excluded.
     let output_indent = line.spans.first().is_some_and(|span| {
         span.content.as_ref() == transcript_indent() && span.style.bg.is_none()
     });
@@ -1260,35 +1088,77 @@ fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     } else {
         0
     };
+
+    #[derive(Clone)]
+    struct Unit {
+        text: String,
+        style: Style,
+        width: usize,
+        whitespace: bool,
+    }
+
     let mut graphemes = line.styled_graphemes(Style::default());
     if output_indent {
-        // The prefix is one grapheme. Do not consume the first character of
-        // the actual transcript content (e.g. `▸`, `└`, or a code fence).
+        // The prefix is rendered separately, including on continuation rows.
         graphemes.next();
-        cur.push(Span::raw(" ".repeat(indent_width)));
-        cur_w = indent_width;
     }
-    for sg in graphemes {
-        let cw = sg
-            .symbol
-            .chars()
-            .map(|c| c.width().unwrap_or(0))
-            .sum::<usize>()
-            .max(1);
-        if cur_w + cw > w && !cur.is_empty() {
-            out.push(Line::from(std::mem::take(&mut cur)));
-            cur.push(Span::raw(" ".repeat(indent_width)));
-            cur_w = indent_width;
+    let units: Vec<Unit> = graphemes
+        .map(|sg| Unit {
+            text: sg.symbol.to_string(),
+            style: sg.style,
+            width: sg
+                .symbol
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>()
+                .max(1),
+            whitespace: sg.symbol.chars().all(char::is_whitespace),
+        })
+        .collect();
+
+    let mut rows: Vec<Vec<Unit>> = Vec::new();
+    let mut row = Vec::new();
+    let mut row_width = indent_width;
+    let mut last_space = None;
+    for unit in units {
+        if row_width + unit.width > w && !row.is_empty() {
+            if let Some(space) = last_space {
+                // Drop the break-space rather than leaving a leading space on
+                // the next row. The following word starts at column zero
+                // (after the normal transcript indent).
+                let remainder = row.split_off(space + 1);
+                row.truncate(space);
+                rows.push(row);
+                row = remainder;
+            } else {
+                rows.push(row);
+                row = Vec::new();
+            }
+            row_width = indent_width + row.iter().map(|u: &Unit| u.width).sum::<usize>();
+            last_space = None;
         }
-        cur.push(Span::styled(sg.symbol.to_string(), sg.style));
-        cur_w += cw;
+        if unit.whitespace {
+            last_space = Some(row.len());
+        }
+        row_width += unit.width;
+        row.push(unit);
     }
-    if !cur.is_empty() {
-        out.push(Line::from(cur));
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
     }
-    if out.is_empty() {
-        out.push(Line::from(String::new()));
-    }
+
+    let mut out: Vec<Line<'static>> = rows
+        .into_iter()
+        .map(|row| {
+            let mut spans = Vec::new();
+            if output_indent {
+                spans.push(Span::raw(" ".repeat(indent_width)));
+            }
+            spans.extend(row.into_iter().map(|u| Span::styled(u.text, u.style)));
+            Line::from(spans)
+        })
+        .collect();
+
     // User-submitted lines carry a background style. Extend that style across
     // the transcript width so the padding reads as a deliberate highlighted
     // surface rather than a small patch behind the text.
@@ -1628,7 +1498,7 @@ fn submit(
 fn render_user_prompt(app: &mut App, line: &str) {
     // Keep submitted prompts on the same transcript grid as assistant output:
     // shared horizontal indentation and a single vertical gutter above/below.
-    let user_bg = Style::default().fg(Color::White).bg(Color::Rgb(20, 38, 54));
+    let user_bg = Style::default().fg(Color::White).bg(SUBMITTED_PROMPT_BG);
     let horizontal_pad = " ".repeat(TRANSCRIPT_INDENT);
     let edge_pad = Span::styled(" ", user_bg);
     app.transcript.push(Line::from(String::new()));
@@ -1706,8 +1576,13 @@ mod tests {
 
     #[test]
     fn shared_surface_dimensions_are_consistent() {
-        assert_eq!(input_content_width(80), 78);
+        assert_eq!(input_content_width(80), 77);
         assert_eq!(input_content_width(1), 0);
+        assert_eq!(input_content_width(3), 0);
+        assert_eq!(
+            input_content_width(80),
+            input_block().inner(Rect::new(0, 0, 80, 24)).width
+        );
         assert_eq!(activity_height(1), 3);
         assert_eq!(activity_height(3), 7);
         assert_eq!(status_height(), 3);
@@ -1717,8 +1592,8 @@ mod tests {
     fn minimum_view_height_accounts_for_all_gutters() {
         // transcript/activity gap + activity + input minimum + input/status gap
         // + status surface
-        assert_eq!(minimum_view_height(activity_height(1)), 11);
-        assert_eq!(minimum_view_height(activity_height(3)), 15);
+        assert_eq!(minimum_view_height(activity_height(1), 0), 10);
+        assert_eq!(minimum_view_height(activity_height(3), 0), 14);
     }
 
     #[test]
@@ -1736,10 +1611,13 @@ mod tests {
     #[test]
     fn layout_reserves_bottom_pane_before_transcript() {
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let layout = compute_layout(area, 1, 1).expect("terminal should fit layout");
+        let layout = compute_layout(area, 1, 1, false).expect("terminal should fit layout");
         assert_eq!(layout.transcript.y, 0);
         assert!(layout.transcript.height > 0);
-        assert_eq!(layout.input.y + layout.input.height + 1, layout.footer.y);
+        assert_eq!(
+            layout.input.y + layout.input.height + INPUT_STATUS_GUTTER,
+            layout.footer.y
+        );
         assert_eq!(layout.footer.height, status_height());
     }
 
@@ -1828,10 +1706,10 @@ mod tests {
         terminal
             .draw(|frame| view(frame, &mut app))
             .expect("render should succeed");
-        let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, 1).unwrap();
+        let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, 1, false).unwrap();
         assert!(layout.transcript.bottom() <= layout.activity.top());
         assert!(layout.activity.bottom() <= layout.input.top());
-        assert!(layout.input.bottom() < layout.footer.top());
+        assert!(layout.input.bottom() <= layout.footer.top());
         let symbols: String = terminal
             .backend()
             .buffer()
@@ -1883,6 +1761,28 @@ mod tests {
         append_sink_line(&mut app, SinkLine::ToolInput("read README.md".to_string()));
         let assistant = &app.transcript[0];
         assert_eq!(assistant.spans[1].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn input_box_height_matches_wrapped_rows() {
+        // The row count used to size the composer must be measured at the same
+        // width the composer actually renders at, otherwise the box is too
+        // short and the cursor pins to the first row once text wraps.
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            input_content_width(area.width),
+            input_block().inner(area).width,
+            "measurement width must equal the rendered inner width"
+        );
+        let mut app = test_app();
+        app.input = InputField::from_text(&"x".repeat(200));
+        let measured = render_input(&app.input, input_content_width(area.width))
+            .0
+            .len();
+        let rendered = render_input(&app.input, input_block().inner(area).width)
+            .0
+            .len();
+        assert_eq!(measured, rendered, "wrapped row counts must agree");
     }
 }
 

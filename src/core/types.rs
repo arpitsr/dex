@@ -1,16 +1,13 @@
-use std::env;
-use std::path::PathBuf;
-use std::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::llm::config::*;
+use std::path::PathBuf;
+use std::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Skill {
-    pub(crate)     name: String,
-    pub(crate)     description: String,
-    pub(crate)     path: PathBuf,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) path: PathBuf,
 }
 
 /// A single streamed line destined for the UI transcript. Plain text (no
@@ -41,39 +38,39 @@ pub(crate) struct ApprovalRequest {
 /// dividers, truncated to fit the terminal width.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct ChatMessage {
-    pub(crate)     role: String,
-    pub(crate)     content: Option<String>,
+    pub(crate) role: String,
+    pub(crate) content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate)     tool_calls: Option<Vec<LlmToolCall>>,
+    pub(crate) tool_calls: Option<Vec<LlmToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate)     tool_call_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate)     name: Option<String>,
+    pub(crate) name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct LlmToolCall {
-    pub(crate)     id: String,
+    pub(crate) id: String,
     #[serde(rename = "type")]
-    pub(crate)     call_type: String,
-    pub(crate)     function: FunctionCall,
+    pub(crate) call_type: String,
+    pub(crate) function: FunctionCall,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct FunctionCall {
-    pub(crate)     name: String,
-    pub(crate)     arguments: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 #[derive(Serialize)]
 pub(crate) struct ChatRequest {
-    pub(crate)     model: String,
-    pub(crate)     messages: Vec<ChatMessage>,
-    pub(crate)     tools: Vec<ToolDefinition>,
-    pub(crate)     stream: bool,
-    pub(crate)     stream_options: StreamOptions,
+    pub(crate) model: String,
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) tools: Vec<ToolDefinition>,
+    pub(crate) stream: bool,
+    pub(crate) stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate)     reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,57 +107,57 @@ impl Provider {
 
 #[derive(Serialize)]
 pub(crate) struct StreamOptions {
-    pub(crate)     include_usage: bool,
+    pub(crate) include_usage: bool,
 }
 
 #[derive(Deserialize, Default)]
 pub(crate) struct Usage {
-    pub(crate)     prompt_tokens: u64,
+    pub(crate) prompt_tokens: u64,
 }
 
 #[derive(Serialize)]
 pub(crate) struct ToolDefinition {
     #[serde(rename = "type")]
-    pub(crate)     tool_type: String,
-    pub(crate)     function: FunctionDef,
+    pub(crate) tool_type: String,
+    pub(crate) function: FunctionDef,
 }
 
 #[derive(Serialize)]
 pub(crate) struct FunctionDef {
-    pub(crate)     name: String,
-    pub(crate)     description: String,
-    pub(crate)     parameters: Value,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) parameters: Value,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct StreamChunk {
-    pub(crate)     choices: Vec<StreamChoice>,
+    pub(crate) choices: Vec<StreamChoice>,
     #[serde(default)]
-    pub(crate)     usage: Option<Usage>,
+    pub(crate) usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct StreamChoice {
-    pub(crate)     delta: StreamDelta,
+    pub(crate) delta: StreamDelta,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct StreamDelta {
-    pub(crate)     content: Option<String>,
-    pub(crate)     tool_calls: Option<Vec<StreamToolCall>>,
+    pub(crate) content: Option<String>,
+    pub(crate) tool_calls: Option<Vec<StreamToolCall>>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct StreamToolCall {
-    pub(crate)     index: usize,
-    pub(crate)     id: Option<String>,
-    pub(crate)     function: Option<StreamFunctionCall>,
+    pub(crate) index: usize,
+    pub(crate) id: Option<String>,
+    pub(crate) function: Option<StreamFunctionCall>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct StreamFunctionCall {
-    pub(crate)     name: Option<String>,
-    pub(crate)     arguments: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) arguments: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,13 +184,5 @@ impl PermissionMode {
                 other
             )),
         }
-    }
-
-    pub(crate) fn from_env_or_file(file: &FileConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let value = env::var("AK_PERMISSION")
-            .ok()
-            .or_else(|| file.permission.clone())
-            .unwrap_or_else(|| "ask-writes".to_string());
-        Self::parse(&value).map_err(Into::into)
     }
 }

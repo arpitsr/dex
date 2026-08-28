@@ -12,20 +12,20 @@ pub(crate) use agent::compaction::*;
 pub(crate) use agent::r#loop::*;
 pub(crate) use agent::state::*;
 pub(crate) use core::console::*;
+pub(crate) use core::types::*;
 pub(crate) use llm::client::*;
 pub(crate) use llm::config::*;
 pub(crate) use llm::prompt::*;
 pub(crate) use skills::*;
-pub(crate) use core::types::*;
 
 use cli::*;
 use session::*;
 use tools::*;
 
+use serde_json::{json, Map, Value};
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use serde_json::{json, Map, Value};
 
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let config = LlmConfig::from_env(args.base_url.clone(), args.model.clone(), args.permission)?;
@@ -107,7 +107,7 @@ fn run_interactive() {
     eprintln!("empty line quits");
 
     let permission = load_file_config()
-        .and_then(|file| PermissionMode::from_env_or_file(&file))
+        .and_then(|file| permission_from_env_or_file(&file))
         .unwrap_or(PermissionMode::ReadOnly);
 
     let stdin = io::stdin();
