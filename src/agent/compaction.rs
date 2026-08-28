@@ -68,7 +68,7 @@ pub(crate) fn summarize_old_messages(
             name: None,
         },
     ];
-    let (summary, _) = call_llm(config, &prompt, false)?;
+    let (summary, _) = call_llm(config, &prompt, false, None)?;
     Ok(summary.content.unwrap_or_default())
 }
 

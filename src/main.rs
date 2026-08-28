@@ -80,6 +80,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     }
     messages.push(user);
     let mut state = ToolState::load();
+    let console = crate::Console::none();
     let result = process_turn(
         &config,
         &mut messages,
@@ -89,6 +90,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         session.as_mut(),
         &config,
         &crate::agent::state::GlobalCancellation,
+        &console,
     );
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event(if result.is_ok() {
@@ -143,7 +145,7 @@ fn run_interactive() {
             None => Map::new(),
         };
         let input = serde_json::to_string(&args).unwrap_or_default();
-        let result = if !approve_tool(permission, name, &input) {
+        let result = if !approve_tool(permission, name, &input, &crate::Console::none()) {
             json!({"err": format!("permission denied for tool '{}'", name)})
         } else {
             match execute(name, &args) {

@@ -1,7 +1,7 @@
 // Ratatui-based interactive REPL — the sole interactive UI (the hand-rolled
 // TerminalEditor was removed). Immediate-mode full-buffer redraw; the agent
 // turn runs on a worker thread calling the real crate::process_turn, with its
-// streamed output routed through crate::set_console_sink into the loop.
+// streamed output routed through a `Console` (sinks) into the agent loop.
 //
 // Markdown in assistant output is rendered with ratatui-markdown: we split a
 // fragment into MarkdownBlocks (the crate's parser is private) and let the

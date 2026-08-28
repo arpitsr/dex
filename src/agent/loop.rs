@@ -1,5 +1,4 @@
 use serde_json::Value;
-use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc;
@@ -38,40 +37,38 @@ pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<Stri
     denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure AK_PERMISSION", name))
 }
 
-pub(crate) fn approve_tool(mode: PermissionMode, name: &str, input: &str) -> bool {
+pub(crate) fn approve_tool(
+    mode: PermissionMode,
+    name: &str,
+    input: &str,
+    console: &Console,
+) -> bool {
     if mode == PermissionMode::ReadOnly
         && crate::tools::metadata(name).is_some_and(|metadata| !metadata.read_only)
     {
-        if let Some(sink) = console_sink() {
+        if let Some(sink) = console.sink() {
             let _ = sink.send(SinkLine::System(format!(
                 "Denied {}: read-only permission mode",
                 name
             )));
         } else {
-            with_console(|| eprintln!("Denied {}: read-only permission mode", name));
+            with_console(console.sink().is_some(), || {
+                eprintln!("Denied {}: read-only permission mode", name)
+            });
         }
         return false;
     }
     if permission_denied(mode, name).is_none() {
         return true;
     }
-    if SESSION_APPROVALS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|approved| approved.contains(name))
-    {
+    if console.session_approved(name) {
         return true;
     }
     if !io::stdin().is_terminal() {
         return false;
     }
-    if console_sink().is_some() {
-        if let Some(approval_sink) = APPROVAL_SINK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+    if console.sink().is_some() {
+        if let Some(approval_sink) = console.approval() {
             let (response_tx, response_rx) = mpsc::channel();
             if approval_sink
                 .send(ApprovalRequest {
@@ -84,11 +81,7 @@ pub(crate) fn approve_tool(mode: PermissionMode, name: &str, input: &str) -> boo
                 return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
                     ApprovalDecision::Once => true,
                     ApprovalDecision::Session => {
-                        SESSION_APPROVALS
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get_or_insert_with(HashSet::new)
-                            .insert(name.to_string());
+                        console.record_session_approval(name);
                         true
                     }
                     ApprovalDecision::Deny => false,
@@ -96,7 +89,9 @@ pub(crate) fn approve_tool(mode: PermissionMode, name: &str, input: &str) -> boo
             }
         }
     } else {
-        with_console(|| eprint!("Approve {} {}? [y/N] ", name, terminal_preview(input)));
+        with_console(console.sink().is_some(), || {
+            eprint!("Approve {} {}? [y/N] ", name, terminal_preview(input))
+        });
     }
     let _ = io::stdout().flush();
     let mut answer = String::new();
@@ -107,6 +102,7 @@ pub(crate) fn approve_tool(mode: PermissionMode, name: &str, input: &str) -> boo
 pub(crate) fn execute_tool_call(
     call: &LlmToolCall,
     permission: PermissionMode,
+    console: &Console,
 ) -> (String, String, String) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
@@ -128,7 +124,7 @@ pub(crate) fn execute_tool_call(
         );
     };
     let input = serde_json::to_string(&args).unwrap_or_default();
-    if !approve_tool(permission, &name, &input) {
+    if !approve_tool(permission, &name, &input, console) {
         return (
             name.clone(),
             input,
@@ -174,13 +170,15 @@ fn call_client_cancellable(
     cancel: &(impl CancellationSource + ?Sized),
     messages: &[ChatMessage],
     with_tools: bool,
+    console: &Console,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let client = (*client).clone();
     let messages = messages.to_vec();
+    let sink = console.sink().cloned();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = client
-            .complete(&messages, with_tools)
+            .complete(&messages, with_tools, sink)
             .map_err(|error| error.to_string());
         let _ = tx.send(result);
     });
@@ -209,9 +207,10 @@ pub(crate) fn process_turn(
     mut session: Option<&mut Session>,
     client: &(impl ModelClient + Sync + Send + Clone + 'static),
     cancel: &(impl CancellationSource + ?Sized),
+    console: &Console,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Spins while the agent works; erased automatically on return.
-    let _working = SpinnerGuard::start("Working");
+    let _working = SpinnerGuard::start(console, "Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
     let cancellation = cancel;
@@ -273,13 +272,14 @@ pub(crate) fn process_turn(
             });
             persist_pending(&mut session, messages, &mut persisted_cursor);
         }
-        let (message, usage) = match call_client_cancellable(client, cancel, messages, true) {
-            Ok(result) => result,
-            Err(e) if e.to_string() == "interrupted" => {
-                return Err("interrupted by user (Ctrl+C)".into());
-            }
-            Err(e) => return Err(e),
-        };
+        let (message, usage) =
+            match call_client_cancellable(client, cancel, messages, true, console) {
+                Ok(result) => result,
+                Err(e) if e.to_string() == "interrupted" => {
+                    return Err("interrupted by user (Ctrl+C)".into());
+                }
+                Err(e) => return Err(e),
+            };
         if usage.is_some() {
             last_usage = usage;
         }
@@ -306,7 +306,7 @@ pub(crate) fn process_turn(
                 let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 calls
                     .iter()
-                    .map(|call| execute_tool_call(call, config.permission))
+                    .map(|call| execute_tool_call(call, config.permission, console))
                     .collect()
             } else {
                 calls
@@ -314,7 +314,8 @@ pub(crate) fn process_turn(
                     .map(|call| {
                         let call = call.clone();
                         let permission = config.permission;
-                        thread::spawn(move || execute_tool_call(&call, permission))
+                        let console = console.clone();
+                        thread::spawn(move || execute_tool_call(&call, permission, &console))
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
@@ -352,14 +353,14 @@ pub(crate) fn process_turn(
                     last_tools.push(cache_key.clone());
                 }
                 let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
-                if let Some(sink) = console_sink() {
+                if let Some(sink) = console.sink() {
                     let _ = sink.send(SinkLine::ToolInput(format!(
                         "{} {}",
                         call.function.name,
                         short_arg(&name, &input)
                     )));
                 } else {
-                    with_console(|| {
+                    with_console(console.sink().is_some(), || {
                         eprintln!(
                             "{}[tool input] {} {}{}",
                             TOOL_INPUT_COLOR,
@@ -378,8 +379,8 @@ pub(crate) fn process_turn(
                 } else if cacheable && succeeded {
                     if let Some(cached) = state.cache.get(&cache_key) {
                         cache_hit = true;
-                        if console_sink().is_none() {
-                            with_console(|| {
+                        if console.sink().is_none() {
+                            with_console(console.sink().is_some(), || {
                                 eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET)
                             });
                         }
@@ -394,7 +395,7 @@ pub(crate) fn process_turn(
                     }
                     result
                 };
-                if let Some(sink) = console_sink() {
+                if let Some(sink) = console.sink() {
                     let mut summary = tool_result_summary(&name, &result);
                     if cache_hit {
                         summary = format!("cached · {summary}");
@@ -404,7 +405,7 @@ pub(crate) fn process_turn(
                         summary,
                     });
                 } else {
-                    with_console(|| {
+                    with_console(console.sink().is_some(), || {
                         eprintln!(
                             "{}[tool output] {}:\n{}{}",
                             TOOL_OUTPUT_COLOR,
@@ -482,6 +483,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _with_tools: bool,
+            _sink: Option<mpsc::Sender<SinkLine>>,
         ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
             Ok((
                 ChatMessage {
@@ -546,6 +548,7 @@ mod tests {
             None,
             &MockModel,
             &NeverCancel,
+            &crate::Console::none(),
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "hello from mock");

@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
+use std::sync::mpsc;
 
 use crate::core::console::*;
 use crate::core::highlight::*;
@@ -15,23 +16,25 @@ pub(crate) struct StreamPrinter {
     in_code: bool,
     code_lang: String,
     code_body: String,
+    sink: Option<mpsc::Sender<SinkLine>>,
 }
 
 impl StreamPrinter {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(sink: Option<mpsc::Sender<SinkLine>>) -> Self {
         Self {
             in_code: false,
             code_lang: String::new(),
             code_body: String::new(),
+            sink,
         }
     }
 
     pub(crate) fn feed_line(&mut self, line: &str) {
-        if console_sink().is_some() {
+        if self.sink.is_some() {
             // Sink mode: no spinner to erase; stream directly.
             self.feed_line_inner(line);
         } else {
-            with_console(|| self.feed_line_inner(line));
+            with_console(self.sink.is_some(), || self.feed_line_inner(line));
         }
     }
 
@@ -39,7 +42,7 @@ impl StreamPrinter {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             if self.in_code {
-                if let Some(sink) = console_sink() {
+                if let Some(sink) = &self.sink {
                     sink.send(SinkLine::Assistant(format!(
                         "```{}:\n{}\n```",
                         self.code_lang, self.code_body
@@ -59,7 +62,7 @@ impl StreamPrinter {
             self.code_body.push_str(line);
             self.code_body.push('\n');
         } else {
-            if let Some(sink) = console_sink() {
+            if let Some(sink) = &self.sink {
                 sink.send(SinkLine::Assistant(line.to_string())).ok();
             } else {
                 termimad::print_text(&format!("{}\n", line));
@@ -69,14 +72,16 @@ impl StreamPrinter {
 
     pub(crate) fn finish(self) {
         if self.in_code && !self.code_body.is_empty() {
-            if let Some(sink) = console_sink() {
+            if let Some(sink) = &self.sink {
                 sink.send(SinkLine::Assistant(format!(
                     "```{}:\n{}\n```",
                     self.code_lang, self.code_body
                 )))
                 .ok();
             } else {
-                with_console(|| print_code_block(&self.code_lang, &self.code_body));
+                with_console(self.sink.is_some(), || {
+                    print_code_block(&self.code_lang, &self.code_body)
+                });
             }
         }
     }
@@ -84,12 +89,13 @@ impl StreamPrinter {
 
 pub(crate) fn read_stream(
     response: reqwest::blocking::Response,
+    sink: Option<mpsc::Sender<SinkLine>>,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut content = String::new();
     let mut pending = String::new(); // partial line not yet printed
-    let mut printer = StreamPrinter::new();
+    let mut printer = StreamPrinter::new(sink.clone());
     let mut tool_calls: Vec<LlmToolCall> = Vec::new();
     let mut usage_tokens: Option<u64> = None;
 
@@ -97,7 +103,7 @@ pub(crate) fn read_stream(
         if take_interrupt() || take_cancel_requested() {
             // Ctrl+C during generation: stop consuming the stream and
             // unwind so control returns to the prompt.
-            with_console(|| println!());
+            with_console(sink.is_some(), || println!());
             io::stdout().flush()?;
             return Err("interrupted".into());
         }
@@ -142,7 +148,7 @@ pub(crate) fn read_stream(
     io::stdout().flush()?;
 
     if !content.is_empty() {
-        with_console(|| println!());
+        with_console(sink.is_some(), || println!());
         io::stdout().flush()?;
     }
     Ok((
@@ -159,12 +165,13 @@ pub(crate) fn read_stream(
 
 pub(crate) fn read_responses_stream(
     response: reqwest::blocking::Response,
+    sink: Option<mpsc::Sender<SinkLine>>,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut content = String::new();
     let mut pending = String::new();
-    let mut printer = StreamPrinter::new();
+    let mut printer = StreamPrinter::new(sink.clone());
     let mut tool_calls = Vec::new();
     let mut response_items: HashMap<String, usize> = HashMap::new();
     let mut pending_arguments: HashMap<String, String> = HashMap::new();
@@ -172,7 +179,7 @@ pub(crate) fn read_responses_stream(
 
     loop {
         if take_interrupt() || take_cancel_requested() {
-            with_console(|| println!());
+            with_console(sink.is_some(), || println!());
             io::stdout().flush()?;
             return Err("interrupted".into());
         }
@@ -286,7 +293,7 @@ pub(crate) fn read_responses_stream(
     printer.finish();
     io::stdout().flush()?;
     if !content.is_empty() {
-        with_console(|| println!());
+        with_console(sink.is_some(), || println!());
         io::stdout().flush()?;
     }
     tool_calls.retain(|call| !call.id.is_empty() && !call.function.name.is_empty());

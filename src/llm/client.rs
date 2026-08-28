@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ pub(crate) trait ModelClient {
         &self,
         messages: &[ChatMessage],
         with_tools: bool,
+        sink: Option<mpsc::Sender<SinkLine>>,
     ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>>;
 }
 
@@ -41,8 +43,9 @@ impl ModelClient for LlmConfig {
         &self,
         messages: &[ChatMessage],
         with_tools: bool,
+        sink: Option<mpsc::Sender<SinkLine>>,
     ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
-        call_llm(self, messages, with_tools)
+        call_llm(self, messages, with_tools, sink)
     }
 }
 
@@ -89,6 +92,7 @@ fn post_with_retry(
     config: &LlmConfig,
     url: &str,
     body: &impl serde::Serialize,
+    sink: Option<&mpsc::Sender<SinkLine>>,
 ) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
     const MAX_RETRIES: u32 = 3;
     let mut active_config = config.clone();
@@ -101,7 +105,9 @@ fn post_with_retry(
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-                with_console(|| eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay));
+                with_console(sink.is_some(), || {
+                    eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay)
+                });
                 thread::sleep(delay);
                 continue;
             }
@@ -127,7 +133,9 @@ fn post_with_retry(
             let retryable = retryable_status(status);
             if retryable && attempt < MAX_RETRIES {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-                with_console(|| eprintln!("[llm] API error {}: retrying in {:?}", status, delay));
+                with_console(sink.is_some(), || {
+                    eprintln!("[llm] API error {}: retrying in {:?}", status, delay)
+                });
                 thread::sleep(delay);
                 continue;
             }
@@ -145,6 +153,7 @@ pub(crate) fn call_chat_completions(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
+    sink: Option<mpsc::Sender<SinkLine>>,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let req = ChatRequest {
         model: config.model.clone(),
@@ -164,14 +173,16 @@ pub(crate) fn call_chat_completions(
         config,
         &format!("{}/chat/completions", config.base_url),
         &req,
+        sink.as_ref(),
     )?;
-    read_stream(resp)
+    read_stream(resp, sink)
 }
 
 pub(crate) fn call_responses(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
+    sink: Option<mpsc::Sender<SinkLine>>,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let (instructions, input) = responses_input(messages);
     let mut body = json!({
@@ -189,20 +200,26 @@ pub(crate) fn call_responses(
     if let Some(effort) = &config.thinking_effort {
         body["reasoning"] = json!({ "effort": effort });
     }
-    let resp = post_with_retry(config, &format!("{}/responses", config.base_url), &body)?;
-    read_responses_stream(resp)
+    let resp = post_with_retry(
+        config,
+        &format!("{}/responses", config.base_url),
+        &body,
+        sink.as_ref(),
+    )?;
+    read_responses_stream(resp, sink)
 }
 
 pub(crate) fn call_llm(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
+    sink: Option<mpsc::Sender<SinkLine>>,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let capabilities = crate::llm::discover_capabilities(config);
     if with_tools && !capabilities.tools {
         return Err("configured model does not support tools".into());
     }
-    crate::llm::streaming::complete(config, messages, with_tools)
+    crate::llm::streaming::complete(config, messages, with_tools, sink)
 }
 
 #[cfg(test)]
@@ -216,6 +233,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _with_tools: bool,
+            _sink: Option<mpsc::Sender<SinkLine>>,
         ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
             Ok((
                 ChatMessage {
@@ -232,7 +250,7 @@ mod tests {
 
     #[test]
     fn model_boundary_supports_deterministic_mock() {
-        let (message, usage) = MockModel.complete(&[], false).unwrap();
+        let (message, usage) = MockModel.complete(&[], false, None).unwrap();
         assert_eq!(message.content.as_deref(), Some("mock response"));
         assert_eq!(usage, Some(3));
     }
