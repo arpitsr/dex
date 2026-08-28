@@ -929,12 +929,8 @@ struct FileConfig {
     http_request_timeout_secs: Option<u64>,
 }
 
-fn config_path() -> Option<PathBuf> {
-    config::path()
-}
-
 fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
-    let Some(path) = config_path() else {
+    let Some(path) = config::path() else {
         return Ok(FileConfig::default());
     };
     let contents = match fs::read_to_string(&path) {
@@ -2126,13 +2122,11 @@ fn process_turn(
     let mut persisted_cursor = messages.len();
 
     let limits = agent::state::TurnLimits {
-        tool_iterations: config.max_tool_iterations,
-        prompt_tokens: config.max_prompt_tokens,
         elapsed_seconds: config.max_turn_seconds,
     };
     let turn_deadline = agent::r#loop::deadline(limits);
     for iteration in 0..config.max_tool_iterations {
-        if !agent::r#loop::within_budget(iteration, limits, turn_deadline) {
+        if !agent::r#loop::within_budget(turn_deadline) {
             return Err("turn exceeded configured budget".into());
         }
         persist_pending(&mut session, messages, &mut persisted_cursor);

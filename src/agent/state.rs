@@ -1,7 +1,5 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TurnLimits {
-    pub tool_iterations: usize,
-    pub prompt_tokens: u64,
     pub elapsed_seconds: u64,
 }
 
