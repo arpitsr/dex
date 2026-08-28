@@ -8,13 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[path = "tools/executor.rs"]
-pub(crate) mod executor;
-#[path = "tools/permissions.rs"]
-pub(crate) mod permissions;
-#[path = "tools/registry.rs"]
-pub(crate) mod registry;
-
 unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
@@ -94,16 +87,10 @@ pub(crate) enum PermissionRequirement {
     Shell,
 }
 
-pub(crate) trait ToolExecutor {
-    fn execute(&self, name: &str, args: &Map<String, Value>) -> Result<String, ToolError>;
-}
-
-pub(crate) struct WorkspaceToolExecutor;
-
-impl ToolExecutor for WorkspaceToolExecutor {
-    fn execute(&self, name: &str, args: &Map<String, Value>) -> Result<String, ToolError> {
-        executor::execute(name, args)
-    }
+pub(crate) fn is_mutating(name: &str) -> bool {
+    metadata(name)
+        .map(|metadata| metadata.mutating)
+        .unwrap_or(true)
 }
 
 pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
@@ -370,7 +357,7 @@ fn shell_escape(s: &str) -> String {
 
 /// Execute a tool using paths confined to the current workspace.
 pub(crate) fn execute(name: &str, args: &Map<String, Value>) -> Result<String, ToolError> {
-    if registry::metadata(name).is_none() {
+    if metadata(name).is_none() {
         let error = ToolError::Unknown(name.to_string());
         audit(name, args, &error.to_string());
         return Err(error);
@@ -394,7 +381,7 @@ pub(crate) fn execute(name: &str, args: &Map<String, Value>) -> Result<String, T
 }
 
 pub(crate) fn execute_to_string(name: &str, args: &Map<String, Value>) -> String {
-    match WorkspaceToolExecutor.execute(name, args) {
+    match execute(name, args) {
         Ok(out) => out,
         Err(e) => format!("Error: {}", e),
     }

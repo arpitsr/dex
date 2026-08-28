@@ -82,35 +82,20 @@ pub(crate) fn provider_log(event: &str, detail: &str) {
         let _ = writeln!(file, "{}", record);
     }
 }
-
-pub(crate) fn call_chat_completions(
+/// Send a provider request with shared retry/backoff, 401 credential refresh
+/// (OpenAI Codex), and provider logging. The protocol-specific request body
+/// and post-success reader are supplied by the caller.
+fn post_with_retry(
     config: &LlmConfig,
-    messages: &[ChatMessage],
-    with_tools: bool,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    url: &str,
+    body: &impl serde::Serialize,
+) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
     const MAX_RETRIES: u32 = 3;
-    let req = ChatRequest {
-        model: config.model.clone(),
-        messages: messages.to_vec(),
-        tools: if with_tools {
-            tools_schema()
-        } else {
-            Vec::new()
-        },
-        stream: true,
-        stream_options: StreamOptions {
-            include_usage: true,
-        },
-        reasoning_effort: config.thinking_effort.clone(),
-    };
-
     let mut active_config = config.clone();
     for attempt in 0..=MAX_RETRIES {
-        let request = config
-            .client
-            .post(format!("{}/chat/completions", config.base_url));
+        let request = config.client.post(url);
         let resp = match authenticated_request(request, &active_config)
-            .json(&req)
+            .json(body)
             .send()
         {
             Ok(resp) => resp,
@@ -128,7 +113,7 @@ pub(crate) fn call_chat_completions(
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text()?;
+            let body_text = resp.text()?;
             if status == reqwest::StatusCode::UNAUTHORIZED
                 && active_config.provider == Provider::OpenAiCodex
                 && attempt < MAX_RETRIES
@@ -146,14 +131,41 @@ pub(crate) fn call_chat_completions(
                 thread::sleep(delay);
                 continue;
             }
-            provider_log("api_error", &format!("{}: {}", status, body));
-            return Err(format!("API error: {}", body).into());
+            provider_log("api_error", &format!("{}: {}", status, body_text));
+            return Err(format!("API error: {}", body_text).into());
         }
 
-        return read_stream(resp);
+        return Ok(resp);
     }
 
     unreachable!()
+}
+
+pub(crate) fn call_chat_completions(
+    config: &LlmConfig,
+    messages: &[ChatMessage],
+    with_tools: bool,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    let req = ChatRequest {
+        model: config.model.clone(),
+        messages: messages.to_vec(),
+        tools: if with_tools {
+            tools_schema()
+        } else {
+            Vec::new()
+        },
+        stream: true,
+        stream_options: StreamOptions {
+            include_usage: true,
+        },
+        reasoning_effort: config.thinking_effort.clone(),
+    };
+    let resp = post_with_retry(
+        config,
+        &format!("{}/chat/completions", config.base_url),
+        &req,
+    )?;
+    read_stream(resp)
 }
 
 pub(crate) fn call_responses(
@@ -177,52 +189,8 @@ pub(crate) fn call_responses(
     if let Some(effort) = &config.thinking_effort {
         body["reasoning"] = json!({ "effort": effort });
     }
-    const MAX_RETRIES: u32 = 3;
-    let mut active_config = config.clone();
-    for attempt in 0..=MAX_RETRIES {
-        let request = config.client.post(format!("{}/responses", config.base_url));
-        let resp = match authenticated_request(request, &active_config)
-            .json(&body)
-            .send()
-        {
-            Ok(resp) => resp,
-            Err(e) if attempt < MAX_RETRIES => {
-                let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-                with_console(|| eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay));
-                thread::sleep(delay);
-                continue;
-            }
-            Err(e) => {
-                provider_log("request_failed", &e.to_string());
-                return Err(e.into());
-            }
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_body = resp.text()?;
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                && active_config.provider == Provider::OpenAiCodex
-                && attempt < MAX_RETRIES
-            {
-                if let Ok((token, account)) = load_codex_credentials() {
-                    active_config.api_key = token;
-                    active_config.account_id = account;
-                    continue;
-                }
-            }
-            let retryable = retryable_status(status);
-            if retryable && attempt < MAX_RETRIES {
-                let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-                with_console(|| eprintln!("[llm] API error {}: retrying in {:?}", status, delay));
-                thread::sleep(delay);
-                continue;
-            }
-            provider_log("api_error", &format!("{}: {}", status, error_body));
-            return Err(format!("API error: {}", error_body).into());
-        }
-        return read_responses_stream(resp);
-    }
-    unreachable!()
+    let resp = post_with_retry(config, &format!("{}/responses", config.base_url), &body)?;
+    read_responses_stream(resp)
 }
 
 pub(crate) fn call_llm(
