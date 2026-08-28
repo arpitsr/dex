@@ -1,5 +1,20 @@
-use crate::agent::state::TurnLimits;
+use std::collections::HashSet;
+use std::env;
+use std::io::{self, IsTerminal, Write};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
+use serde_json::Value;
+
+use crate::agent::compaction::*;
+use crate::agent::state::*;
+use crate::core::console::*;
+use crate::core::format::*;
+use crate::llm::client::*;
+use crate::llm::config::*;
+use crate::session::*;
+use crate::tools::*;
+use crate::core::types::*;
 
 pub(crate) fn deadline(limits: TurnLimits) -> Instant {
     Instant::now() + Duration::from_secs(limits.elapsed_seconds)
@@ -7,4 +22,403 @@ pub(crate) fn deadline(limits: TurnLimits) -> Instant {
 
 pub(crate) fn within_budget(deadline: Instant) -> bool {
     Instant::now() < deadline
+}
+
+/// Maximum number of model round-trips within a single turn.
+/// When this many iterations remain, nudge the model to wrap up.
+pub(crate) const WRAP_UP_THRESHOLD: usize = 5;
+
+pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<String> {
+    let denied = match mode {
+        PermissionMode::ReadOnly => !matches!(name, "read" | "grep" | "find" | "git"),
+        PermissionMode::AskWrites => matches!(name, "write" | "edit" | "bash"),
+        PermissionMode::AskShell => name == "bash",
+        PermissionMode::Trusted => false,
+    };
+    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure AK_PERMISSION", name))
+}
+
+pub(crate) fn approve_tool(mode: PermissionMode, name: &str, input: &str) -> bool {
+    if mode == PermissionMode::ReadOnly
+        && crate::tools::metadata(name).is_some_and(|metadata| !metadata.read_only)
+    {
+        if let Some(sink) = console_sink() {
+            let _ = sink.send(SinkLine::System(format!(
+                "Denied {}: read-only permission mode",
+                name
+            )));
+        } else {
+            with_console(|| eprintln!("Denied {}: read-only permission mode", name));
+        }
+        return false;
+    }
+    if permission_denied(mode, name).is_none() {
+        return true;
+    }
+    if SESSION_APPROVALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|approved| approved.contains(name))
+    {
+        return true;
+    }
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    if console_sink().is_some() {
+        if let Some(approval_sink) = APPROVAL_SINK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            let (response_tx, response_rx) = mpsc::channel();
+            if approval_sink
+                .send(ApprovalRequest {
+                    name: name.to_string(),
+                    input: input.to_string(),
+                    response: response_tx,
+                })
+                .is_ok()
+            {
+                return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
+                    ApprovalDecision::Once => true,
+                    ApprovalDecision::Session => {
+                        SESSION_APPROVALS
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert_with(HashSet::new)
+                            .insert(name.to_string());
+                        true
+                    }
+                    ApprovalDecision::Deny => false,
+                };
+            }
+        }
+    } else {
+        with_console(|| eprint!("Approve {} {}? [y/N] ", name, terminal_preview(input)));
+    }
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+pub(crate) fn execute_tool_call(call: &LlmToolCall, permission: PermissionMode) -> (String, String, String) {
+    let name = call.function.name.clone();
+    let raw_args = call.function.arguments.clone();
+    let value: Value = match serde_json::from_str(&raw_args) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                name,
+                raw_args,
+                format!("Error: invalid tool arguments: {}", error),
+            )
+        }
+    };
+    let Some(args) = value.as_object().cloned() else {
+        return (
+            name,
+            raw_args,
+            "Error: tool arguments must be a JSON object".into(),
+        );
+    };
+    let input = serde_json::to_string(&args).unwrap_or_default();
+    if !approve_tool(permission, &name, &input) {
+        return (
+            name.clone(),
+            input,
+            format!("Error: permission denied for tool '{}'", name),
+        );
+    }
+    (name.clone(), input, execute_to_string(&name, &args))
+}
+
+pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
+    let mut paths = std::collections::HashSet::new();
+    calls.iter().any(|call| {
+        let Ok(value) = serde_json::from_str::<Value>(&call.function.arguments) else {
+            return false;
+        };
+        let Some(path) = value.get("path").and_then(Value::as_str) else {
+            return false;
+        };
+        !paths.insert(path.to_string())
+    })
+}
+
+pub(crate) fn persist_pending(
+    session: &mut Option<&mut Session>,
+    messages: &[ChatMessage],
+    cursor: &mut usize,
+) {
+    if let Some(session) = session.as_deref_mut() {
+        for message in messages.get(*cursor..).unwrap_or_default() {
+            let _ = crate::session::SessionStore::append_message(session, message.clone());
+        }
+        *cursor = messages.len();
+    }
+}
+
+pub(crate) fn process_turn(
+    config: &LlmConfig,
+    messages: &mut Vec<ChatMessage>,
+    state: &mut ToolState,
+    steering_rx: Option<&mpsc::Receiver<String>>,
+    steering_accepted_tx: Option<&mpsc::Sender<String>>,
+    mut session: Option<&mut Session>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Spins while the agent works; erased automatically on return.
+    let _working = SpinnerGuard::start("Working");
+    let mut last_tools: Vec<String> = Vec::new();
+    let mut last_usage: Option<u64> = state.last_usage;
+    let cancellation = crate::agent::state::GlobalCancellation;
+    let mut persisted_cursor = messages.len();
+
+    let limits = crate::agent::state::TurnLimits {
+        elapsed_seconds: config.max_turn_seconds,
+    };
+    let turn_deadline = crate::agent::r#loop::deadline(limits);
+    for iteration in 0..config.max_tool_iterations {
+        if !crate::agent::r#loop::within_budget(turn_deadline) {
+            return Err("turn exceeded configured budget".into());
+        }
+        persist_pending(&mut session, messages, &mut persisted_cursor);
+        if cancellation.is_cancelled() {
+            let _ = cancellation.take_cancelled();
+            return Err("cancelled by user".into());
+        }
+        if std::time::Instant::now() >= turn_deadline {
+            return Err("turn exceeded configured time limit".into());
+        }
+        if estimate_tokens(messages) > config.max_prompt_tokens {
+            return Err("prompt exceeded configured token limit".into());
+        }
+        // Steering is consumed between turns/tool batches, while the worker
+        // still owns the conversation state. This avoids concurrent mutation
+        // of `messages` while allowing the UI to accept input immediately.
+        if let Some(rx) = steering_rx {
+            while let Ok(steering) = rx.try_recv() {
+                if let Some(accepted) = &steering_accepted_tx {
+                    let _ = accepted.send(steering.clone());
+                }
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(steering),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("steering".to_string()),
+                });
+            }
+        }
+        // Nudge the model to finish as we approach the iteration budget.
+        let remaining = config.max_tool_iterations.saturating_sub(iteration);
+        if remaining == WRAP_UP_THRESHOLD {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(
+                    "[System] You are approaching the tool-call limit for this turn. \
+                     Before continuing, briefly re-evaluate: (1) why so many tool \
+                     calls were needed — e.g. repeated reads, failed edits, or \
+                     exploring the wrong paths; (2) what the user's actual task goal \
+                     is and the shortest path remaining to reach it. Then recover \
+                     toward that goal: avoid repeating failed approaches, prefer \
+                     batched/broader tool calls over many small ones, and if the goal \
+                     is already (partially) met, state what was accomplished, what \
+                     remains, and produce your final answer now."
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                name: Some("system-nudge".to_string()),
+            });
+            persist_pending(&mut session, messages, &mut persisted_cursor);
+        }
+        let (message, usage) = match call_llm_cancellable(config, messages, true) {
+            Ok(result) => result,
+            Err(e) if e.to_string() == "interrupted" => {
+                return Err("interrupted by user (Ctrl+C)".into());
+            }
+            Err(e) => return Err(e),
+        };
+        if usage.is_some() {
+            last_usage = usage;
+        }
+        // Compact when either the message count or an estimated token
+        // budget is exceeded (API-reported usage takes precedence).
+        let est = last_usage.unwrap_or_else(|| estimate_tokens(messages));
+        if messages.len() > 1 + KEEP_RECENT_MESSAGES || est > config.context_window / 2 {
+            compact_history(config, messages)?;
+        }
+        if let Some(calls) = message.tool_calls.clone() {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: message.content,
+                tool_calls: Some(calls.clone()),
+                tool_call_id: None,
+                name: None,
+            });
+            // Execute all tool calls in this assistant message in parallel.
+            let batch_has_mutation = calls
+                .iter()
+                .any(|call| crate::tools::permissions::is_mutating(&call.function.name));
+            let serialize_batch = batch_has_mutation || tool_calls_conflict(&calls);
+            let results: Vec<_> = if serialize_batch {
+                let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                calls
+                    .iter()
+                    .map(|call| execute_tool_call(call, config.permission))
+                    .collect()
+            } else {
+                calls
+                    .iter()
+                    .map(|call| {
+                        let call = call.clone();
+                        let permission = config.permission;
+                        thread::spawn(move || execute_tool_call(&call, permission))
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            (
+                                String::new(),
+                                String::new(),
+                                "Error: tool worker panicked".into(),
+                            )
+                        })
+                    })
+                    .collect()
+            };
+
+            for (call, (name, input, result)) in calls.iter().zip(results) {
+                let cache_key = format!(
+                    "{}:{}:{}{}",
+                    env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    name,
+                    input,
+                    cache_fingerprint(&name, &input)
+                );
+                if last_tools.len() >= 6 {
+                    last_tools.remove(0);
+                }
+                last_tools.push(cache_key.clone());
+                let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
+                if let Some(sink) = console_sink() {
+                    let _ = sink.send(SinkLine::ToolInput(format!(
+                        "{} {}",
+                        call.function.name,
+                        short_arg(&name, &input)
+                    )));
+                } else {
+                    with_console(|| {
+                        eprintln!(
+                            "{}[tool input] {} {}{}",
+                            TOOL_INPUT_COLOR,
+                            call.function.name,
+                            terminal_preview(&input),
+                            RESET
+                        );
+                    });
+                }
+
+                let cacheable = matches!(name.as_str(), "read" | "grep" | "find");
+                let mut cache_hit = false;
+                let result = if repeated_count >= 3 {
+                    "Error: repeated identical tool call; choose a different action or finish."
+                        .to_string()
+                } else if cacheable {
+                    if let Some(cached) = state.cache.get(&cache_key) {
+                        cache_hit = true;
+                        if console_sink().is_none() {
+                            with_console(|| {
+                                eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET)
+                            });
+                        }
+                        cached.clone()
+                    } else {
+                        state.insert(cache_key, result.clone());
+                        result
+                    }
+                } else {
+                    if matches!(name.as_str(), "write" | "edit") {
+                        state.clear();
+                    }
+                    result
+                };
+                if let Some(sink) = console_sink() {
+                    let mut summary = tool_result_summary(&name, &result);
+                    if cache_hit {
+                        summary = format!("cached · {summary}");
+                    }
+                    let _ = sink.send(SinkLine::ToolOutput {
+                        name: name.clone(),
+                        summary,
+                    });
+                } else {
+                    with_console(|| {
+                        eprintln!(
+                            "{}[tool output] {}:\n{}{}",
+                            TOOL_OUTPUT_COLOR,
+                            name,
+                            terminal_preview(&result),
+                            RESET
+                        );
+                    });
+                }
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(model_tool_result(&result)),
+                    tool_calls: None,
+                    tool_call_id: Some(call.id.clone()),
+                    name: None,
+                });
+                persist_pending(&mut session, messages, &mut persisted_cursor);
+            }
+            state.save();
+        } else {
+            let text = message.content.unwrap_or_default();
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(text.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+            if let Some(rx) = steering_rx {
+                let steering: Vec<String> = rx.try_iter().collect();
+                if !steering.is_empty() {
+                    for content in steering {
+                        if let Some(accepted) = &steering_accepted_tx {
+                            let _ = accepted.send(content.clone());
+                        }
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: Some(content),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: Some("steering".to_string()),
+                        });
+                    }
+                    state.last_usage = last_usage;
+                    continue;
+                }
+            }
+            state.last_usage = last_usage;
+            persist_pending(&mut session, messages, &mut persisted_cursor);
+            return Ok(text);
+        }
+    }
+    Err(
+        "too many tool iterations: the task did not complete within the per-turn \
+         tool-call budget. Partial progress (if any) is preserved in the conversation. \
+         To continue, you can ask me to resume the task — optionally on a new path or \
+         with a different approach — e.g. \"continue from where you left off\" or \
+         \"try a different approach\"."
+            .into(),
+    )
 }
