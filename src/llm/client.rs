@@ -3,7 +3,6 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -236,37 +235,6 @@ pub(crate) fn call_llm(
         return Err("configured model does not support tools".into());
     }
     crate::llm::streaming::complete(config, messages, with_tools)
-}
-
-/// Run a blocking provider call behind a small polling boundary. This lets
-/// the UI return immediately when cancellation is requested; the stream
-/// reader also observes the same flag and exits at its next readable event.
-pub(crate) fn call_llm_cancellable(
-    config: &LlmConfig,
-    messages: &[ChatMessage],
-    with_tools: bool,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
-    let config = config.clone();
-    let messages = messages.to_vec();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = crate::llm::ModelClient::complete(&config, &messages, with_tools)
-            .map_err(|error| error.to_string());
-        let _ = tx.send(result);
-    });
-    loop {
-        if cancel_requested() {
-            return Err("cancelled by user".into());
-        }
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(Ok(result)) => return Ok(result),
-            Ok(Err(error)) => return Err(error.into()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("provider worker disconnected".into())
-            }
-        }
-    }
 }
 
 #[cfg(test)]

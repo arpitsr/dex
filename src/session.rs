@@ -80,16 +80,6 @@ pub(crate) struct Session {
     counter: u64,
 }
 
-pub(crate) trait SessionStore {
-    fn append_message(&mut self, message: ChatMessage) -> io::Result<()>;
-}
-
-impl SessionStore for Session {
-    fn append_message(&mut self, message: ChatMessage) -> io::Result<()> {
-        Session::append_message(self, message)
-    }
-}
-
 impl Session {
     fn session_dir() -> PathBuf {
         if let Some(dir) = env::var_os("XDG_DATA_HOME") {

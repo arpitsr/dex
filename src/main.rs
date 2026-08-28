@@ -25,7 +25,6 @@ use tools::*;
 use serde_json::{json, Map, Value};
 use std::env;
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let config = LlmConfig::from_env(args.base_url.clone(), args.model.clone(), args.permission)?;
@@ -88,6 +87,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         None,
         None,
         session.as_mut(),
+        &config,
+        &crate::agent::state::GlobalCancellation,
     );
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event(if result.is_ok() {
@@ -152,103 +153,6 @@ fn run_interactive() {
         };
         println!("{}", result);
         let _ = stdout.flush();
-    }
-}
-
-#[allow(dead_code)]
-struct LegacyArgs {
-    base_url: Option<String>,
-    model: Option<String>,
-    session_path: Option<PathBuf>,
-    no_session: bool,
-    new_session: bool,
-    session_name: Option<String>,
-    skill_dirs: Vec<PathBuf>,
-    permission: Option<PermissionMode>,
-    rest: Vec<String>,
-}
-
-#[allow(dead_code)]
-fn parse_args_from<I: Iterator<Item = String>>(input: I) -> LegacyArgs {
-    let mut base_url: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut session_path: Option<PathBuf> = None;
-    let mut no_session = false;
-    let mut new_session = false;
-    let mut session_name: Option<String> = None;
-    let mut skill_dirs: Vec<PathBuf> = Vec::new();
-    let mut permission: Option<PermissionMode> = None;
-    let mut rest: Vec<String> = Vec::new();
-    let mut args = input;
-    while let Some(arg) = args.next() {
-        if arg == "--base-url" {
-            match args.next() {
-                Some(url) => base_url = Some(url),
-                None => {
-                    eprintln!("error: --base-url requires a value");
-                    std::process::exit(1);
-                }
-            }
-        } else if arg == "--model" {
-            match args.next() {
-                Some(m) => model = Some(m),
-                None => {
-                    eprintln!("error: --model requires a value");
-                    std::process::exit(1);
-                }
-            }
-        } else if arg == "--session" || arg == "-s" {
-            match args.next() {
-                Some(p) => session_path = Some(PathBuf::from(p)),
-                None => {
-                    eprintln!("error: --session requires a value");
-                    std::process::exit(1);
-                }
-            }
-        } else if arg == "--no-session" {
-            no_session = true;
-        } else if arg == "--new" || arg == "-n" {
-            new_session = true;
-        } else if arg == "--name" {
-            match args.next() {
-                Some(n) => session_name = Some(n),
-                None => {
-                    eprintln!("error: --name requires a value");
-                    std::process::exit(1);
-                }
-            }
-        } else if arg == "--permission" {
-            match args.next().and_then(|v| PermissionMode::parse(&v).ok()) {
-                Some(mode) => permission = Some(mode),
-                None => {
-                    eprintln!(
-                        "error: --permission requires read-only, ask-writes, ask-shell, or trusted"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else if arg == "--skill" {
-            match args.next() {
-                Some(p) => skill_dirs.push(PathBuf::from(p)),
-                None => {
-                    eprintln!("error: --skill requires a value");
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            rest.push(arg);
-        }
-    }
-    LegacyArgs {
-        base_url,
-        model,
-        session_path,
-        no_session,
-        new_session,
-        session_name,
-        skill_dirs,
-        permission,
-        rest,
     }
 }
 

@@ -1452,6 +1452,8 @@ fn submit(
                 steering_rx.as_ref(),
                 Some(&steering_accepted_tx),
                 Some(&mut persist_session),
+                &config,
+                &crate::agent::state::GlobalCancellation,
             );
             if result.is_err() {
                 break result;
