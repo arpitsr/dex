@@ -1,22 +1,30 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
-mod ui;
+mod agent;
+mod cli;
+mod config;
+mod llm;
 mod session;
 mod tools;
+mod ui;
 
-pub(crate) use session::{load_messages_from_session, Session};
+use agent::estimate_tokens;
+use agent::state::CancellationSource;
+use cli::Args;
+
+pub(crate) use session::{load_messages_from_session, load_session_state, Session};
 pub(crate) use tools::{execute, execute_to_string};
 
 // --- Skills ---
@@ -52,8 +60,21 @@ fn parse_skill(path: &Path) -> Option<Skill> {
             description = Some(unquote(val.trim()));
         }
     }
+    let name = name?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        eprintln!(
+            "[skills] ignoring invalid skill name '{}' in {}",
+            name,
+            path.display()
+        );
+        return None;
+    }
     Some(Skill {
-        name: name?,
+        name,
         description: description.unwrap_or_default(),
         path: path.to_path_buf(),
     })
@@ -75,17 +96,31 @@ fn unquote(s: &str) -> String {
 
 fn discover_skills(dirs: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for dir in dirs {
-        let Ok(entries) = fs::read_dir(dir) else { continue };
-        for entry in entries.flatten() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
             let path = entry.path();
             if path.is_dir() && path.join("SKILL.md").exists() {
                 if let Some(skill) = parse_skill(&path.join("SKILL.md")) {
-                    skills.push(skill);
+                    if seen.insert(skill.name.clone()) {
+                        skills.push(skill);
+                    } else {
+                        eprintln!(
+                            "[skills] ignoring duplicate skill '{}' at {}",
+                            skill.name,
+                            path.display()
+                        );
+                    }
                 }
             }
         }
     }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
 }
 
@@ -124,6 +159,10 @@ pub(crate) fn request_cancel() {
 
 fn take_cancel_requested() -> bool {
     CANCEL_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+fn cancel_requested() -> bool {
+    CANCEL_REQUESTED.load(Ordering::SeqCst)
 }
 
 extern "C" fn handle_sigint(_: i32) {
@@ -175,6 +214,10 @@ const AGENT_COLOR: &str = "\x1b[1;32m";
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 static CONSOLE_LOCK: Mutex<()> = Mutex::new(());
+// A tool batch containing a mutation is executed under this lock. Entire
+// read-only batches remain parallel, while mixed/write batches preserve call
+// order and cannot race on the same workspace.
+static TOOL_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static SPINNER_RUNNING: AtomicBool = AtomicBool::new(false);
 static SPINNER_DRAWN: AtomicBool = AtomicBool::new(false);
 
@@ -189,9 +232,24 @@ pub enum SinkLine {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalDecision {
+    Once,
+    Session,
+    Deny,
+}
+
+pub(crate) struct ApprovalRequest {
+    pub name: String,
+    pub input: String,
+    pub response: mpsc::Sender<ApprovalDecision>,
+}
+
 /// When set (ratatui UI mode), the agent routes streamed output here instead
 /// of printing to the console.
 static CONSOLE_SINK: Mutex<Option<mpsc::Sender<SinkLine>>> = Mutex::new(None);
+static APPROVAL_SINK: Mutex<Option<mpsc::Sender<ApprovalRequest>>> = Mutex::new(None);
+static SESSION_APPROVALS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Enable/disable the console sink (used by the ratatui UI path).
 pub fn set_console_sink(sink: Option<mpsc::Sender<SinkLine>>) {
@@ -200,7 +258,14 @@ pub fn set_console_sink(sink: Option<mpsc::Sender<SinkLine>>) {
 
 /// Clone of the active sink sender, if any.
 pub fn console_sink() -> Option<mpsc::Sender<SinkLine>> {
-    CONSOLE_SINK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    CONSOLE_SINK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub(crate) fn set_approval_sink(sink: Option<mpsc::Sender<ApprovalRequest>>) {
+    *APPROVAL_SINK.lock().unwrap_or_else(|e| e.into_inner()) = sink;
 }
 
 /// Erase the drawn spinner frame, if any. Caller holds CONSOLE_LOCK.
@@ -256,7 +321,9 @@ impl SpinnerGuard {
                 thread::sleep(Duration::from_millis(80));
             }
         });
-        Self { worker: Some(worker) }
+        Self {
+            worker: Some(worker),
+        }
     }
 }
 
@@ -339,7 +406,11 @@ fn short_arg(name: &str, input: &str) -> String {
 fn one_line_summary(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let line = line.trim();
-    let limit = line.char_indices().nth(120).map(|(i, _)| i).unwrap_or(line.len());
+    let limit = line
+        .char_indices()
+        .nth(120)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
     line[..limit].to_string()
 }
 
@@ -369,9 +440,9 @@ fn tool_result_summary(name: &str, text: &str) -> String {
 /// fenced code blocks highlighted via `bat` when available.
 fn print_code_block(lang: &str, body: &str) {
     // Try `bat` first (supports language tags + line numbers + theme).
-    let bat = ["bat", "batcat"].iter().find_map(|b| {
-        which(b).ok().map(|p| (b.to_string(), p))
-    });
+    let bat = ["bat", "batcat"]
+        .iter()
+        .find_map(|b| which(b).ok().map(|p| (b.to_string(), p)));
     if let Some((bin, path)) = bat {
         let mut cmd = Command::new(&path);
         cmd.args([
@@ -408,7 +479,10 @@ fn print_ansi_highlighted_code(lang: &str, body: &str) {
     const COMMENT: &str = "\x1b[2;37m";
     const PUNCT: &str = "\x1b[0;36m";
     let lang = lang.to_ascii_lowercase();
-    let hash_comments = matches!(lang.as_str(), "python" | "py" | "ruby" | "rb" | "bash" | "sh" | "yaml" | "yml" | "toml" | "perl");
+    let hash_comments = matches!(
+        lang.as_str(),
+        "python" | "py" | "ruby" | "rb" | "bash" | "sh" | "yaml" | "yml" | "toml" | "perl"
+    );
     let keywords = match lang.as_str() {
         "rust" | "rs" => "as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while async await dyn",
         "python" | "py" => "and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None not or pass raise return True try while with yield",
@@ -425,32 +499,67 @@ fn print_ansi_highlighted_code(lang: &str, body: &str) {
             let c = chars[i];
             if (c == '/' && i + 1 < chars.len() && chars[i + 1] == '/')
                 || (c == '#' && hash_comments)
-                || (c == '-' && i + 1 < chars.len() && chars[i + 1] == '-') {
-                print!("{}{}{}", COMMENT, chars[i..].iter().collect::<String>(), RESET);
+                || (c == '-' && i + 1 < chars.len() && chars[i + 1] == '-')
+            {
+                print!(
+                    "{}{}{}",
+                    COMMENT,
+                    chars[i..].iter().collect::<String>(),
+                    RESET
+                );
                 break;
             } else if matches!(c, '\"' | '\'' | '`') {
                 let quote = c;
                 let start = i;
                 i += 1;
                 while i < chars.len() {
-                    if chars[i] == '\\' { i += 2; continue; }
+                    if chars[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
                     let closed = chars[i] == quote;
                     i += 1;
-                    if closed { break; }
+                    if closed {
+                        break;
+                    }
                 }
-                print!("{}{}{}", STRING, chars[start..i.min(chars.len())].iter().collect::<String>(), RESET);
+                print!(
+                    "{}{}{}",
+                    STRING,
+                    chars[start..i.min(chars.len())].iter().collect::<String>(),
+                    RESET
+                );
             } else if c.is_ascii_digit() {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '.' | '_')) { i += 1; }
-                print!("{}{}{}", NUMBER, chars[start..i].iter().collect::<String>(), RESET);
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '.' | '_'))
+                {
+                    i += 1;
+                }
+                print!(
+                    "{}{}{}",
+                    NUMBER,
+                    chars[start..i].iter().collect::<String>(),
+                    RESET
+                );
             } else if c.is_ascii_alphabetic() || c == '_' {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') { i += 1; }
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
                 let word: String = chars[start..i].iter().collect();
-                if is_keyword(&word) { print!("{}{}{}", KEYWORD, word, RESET); } else { print!("{}", word); }
+                if is_keyword(&word) {
+                    print!("{}{}{}", KEYWORD, word, RESET);
+                } else {
+                    print!("{}", word);
+                }
             } else {
                 i += 1;
-                if "{}[]()<>;:,.=+-*/%!&|?".contains(c) { print!("{}{}{}", PUNCT, c, RESET); } else { print!("{}", c); }
+                if "{}[]()<>;:,.=+-*/%!&|?".contains(c) {
+                    print!("{}{}{}", PUNCT, c, RESET);
+                } else {
+                    print!("{}", c);
+                }
             }
         }
     }
@@ -464,7 +573,10 @@ fn which(bin: &str) -> Result<PathBuf, io::Error> {
             return Ok(candidate);
         }
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, format!("{} not found", bin)))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{} not found", bin),
+    ))
 }
 
 fn model_tool_result(text: &str) -> String {
@@ -530,6 +642,26 @@ enum Provider {
     OpenAiCodex,
 }
 
+impl Provider {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "opencode" => Ok(Self::OpenCode),
+            "openai-codex" | "codex" => Ok(Self::OpenAiCodex),
+            other => Err(format!(
+                "unsupported provider '{}'; use opencode or openai-codex",
+                other
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::OpenCode => "opencode",
+            Self::OpenAiCodex => "openai-codex",
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct StreamOptions {
     include_usage: bool,
@@ -585,6 +717,31 @@ struct StreamFunctionCall {
     arguments: Option<String>,
 }
 
+fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) {
+    while calls.len() <= delta.index {
+        calls.push(LlmToolCall {
+            id: String::new(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: String::new(),
+                arguments: String::new(),
+            },
+        });
+    }
+    let call = &mut calls[delta.index];
+    if let Some(id) = delta.id {
+        call.id = id;
+    }
+    if let Some(function) = delta.function {
+        if let Some(name) = function.name {
+            call.function.name.push_str(&name);
+        }
+        if let Some(arguments) = function.arguments {
+            call.function.arguments.push_str(&arguments);
+        }
+    }
+}
+
 fn tools_schema() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -630,7 +787,8 @@ fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit".to_string(),
-                description: "Replace exactly one occurrence of old text with new text in a file.".to_string(),
+                description: "Replace exactly one occurrence of old text with new text in a file."
+                    .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -661,24 +819,38 @@ fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "find".to_string(),
-                description: "Find file paths matching a pattern.".to_string(),
+                description: "Find targeted file paths; do not use an empty path or the pattern `*` (use `git` or a narrow path/pattern instead).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string" },
-                        "path": { "type": "string", "description": "directory to search (default: current directory)" }
+                        "pattern": { "type": "string", "description": "Targeted filename/path substring such as `.rs` or `src/main`; never `*` alone." },
+                        "path": { "type": "string", "description": "workspace-relative directory or file; use a narrow directory such as `src`" }
                     },
                     "required": ["pattern"]
                 }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "git".to_string(),
+                description: "Inspect repository status or diff (read-only).".to_string(),
+                parameters: json!({"type":"object","properties":{"mode":{"type":"string","enum":["status","diff"]}}}),
             },
         },
     ]
 }
 
 fn project_context() -> Option<String> {
-    for name in &["AGENTS.md", "CLAUDE.md"] {
-        if let Ok(content) = fs::read_to_string(name) {
-            return Some(content);
+    let mut dir = env::current_dir().ok()?;
+    loop {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            if let Ok(content) = fs::read_to_string(dir.join(name)) {
+                return Some(content);
+            }
+        }
+        if !dir.pop() {
+            break;
         }
     }
     None
@@ -689,7 +861,10 @@ fn system_prompt(skills: &[Skill]) -> String {
      Prefer reading files before editing. \
      When editing, oldText must match exactly one occurrence in the file. \
      Stop using tools once the requested work is complete. \
-     Be concise.".to_string();
+     Run relevant tests/checks, inspect the resulting diff, and report validation results. \
+     Be concise."
+        .to_string();
+    prompt.push_str("\n\nTool workflow: use `read` for known files, `grep` for known text, and `git` for repository state/diffs. Use `find` only for targeted filename discovery. Never begin with a repository-wide find using an empty path or pattern `*`; it is noisy and commonly includes build artifacts. If the user names a file, read it directly. For an unfamiliar repository, start with targeted discovery and then read only relevant files. Do not call tools merely to explore when the request can be answered from the conversation; after each result, make progress and avoid repeating identical calls.");
     if let Some(ctx) = project_context() {
         prompt.push_str("\n\n--- Project instructions ---\n");
         prompt.push_str(&ctx);
@@ -700,25 +875,62 @@ fn system_prompt(skills: &[Skill]) -> String {
     prompt
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionMode {
+    /// Permit reads, but reject all mutations and shell commands.
+    ReadOnly,
+    /// Prompt before writes and edits; reads are always permitted.
+    AskWrites,
+    /// Prompt before shell commands; reads and file mutations are permitted.
+    AskShell,
+    /// Permit every tool without prompting (useful for automation).
+    Trusted,
+}
+
+impl PermissionMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().replace('_', "-").as_str() {
+            "read-only" | "readonly" => Ok(Self::ReadOnly),
+            "ask-writes" | "ask-write" => Ok(Self::AskWrites),
+            "ask-shell" | "ask-commands" => Ok(Self::AskShell),
+            "trusted" | "non-interactive" => Ok(Self::Trusted),
+            other => Err(format!(
+                "invalid permission mode '{}'; use read-only, ask-writes, ask-shell, or trusted",
+                other
+            )),
+        }
+    }
+
+    fn from_env_or_file(file: &FileConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let value = env::var("AK_PERMISSION")
+            .ok()
+            .or_else(|| file.permission.clone())
+            .unwrap_or_else(|| "ask-writes".to_string());
+        Self::parse(&value).map_err(Into::into)
+    }
+}
+
 #[derive(Default, Deserialize)]
 struct FileConfig {
     provider: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    models: Option<Vec<String>>,
     api: Option<String>,
     thinking_effort: Option<String>,
     context_window: Option<u64>,
+    permission: Option<String>,
+    max_tool_iterations: Option<usize>,
+    max_prompt_tokens: Option<u64>,
+    max_tool_output_bytes: Option<usize>,
+    max_turn_seconds: Option<u64>,
+    http_connect_timeout_secs: Option<u64>,
+    http_request_timeout_secs: Option<u64>,
 }
 
 fn config_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("RUSTY_PI_CONFIG") {
-        return Some(PathBuf::from(path));
-    }
-    if let Some(dir) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(dir).join("ak/config.json"));
-    }
-    env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/ak/config.json"))
+    config::path()
 }
 
 fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
@@ -740,11 +952,16 @@ struct LlmConfig {
     api_key: String,
     base_url: String,
     model: String,
+    available_models: Vec<String>,
     api: ApiProtocol,
     account_id: Option<String>,
     thinking_effort: Option<String>,
     /// Model context window size in tokens (used for compaction + status bar).
     context_window: u64,
+    permission: PermissionMode,
+    max_tool_iterations: usize,
+    max_prompt_tokens: u64,
+    max_turn_seconds: u64,
     client: reqwest::blocking::Client,
 }
 
@@ -752,20 +969,25 @@ impl LlmConfig {
     fn from_env(
         base_url_override: Option<String>,
         model_override: Option<String>,
+        permission_override: Option<PermissionMode>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let file = load_file_config()?;
+        tools::set_output_limit(
+            env::var("AK_TOOL_OUTPUT_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(file.max_tool_output_bytes)
+                .unwrap_or(1_048_576),
+        );
+        let permission = match permission_override {
+            Some(mode) => mode,
+            None => PermissionMode::from_env_or_file(&file)?,
+        };
         let provider_name = env::var("AK_PROVIDER")
             .ok()
             .or(file.provider)
             .unwrap_or_else(|| "opencode".to_string());
-        let provider = match provider_name.as_str() {
-            "opencode" => Provider::OpenCode,
-            "openai-codex" | "codex" => Provider::OpenAiCodex,
-            other => return Err(format!(
-                "unsupported provider '{}'; use opencode or openai-codex",
-                other
-            ).into()),
-        };
+        let provider = Provider::parse(&provider_name)?;
         let model = model_override
             .or_else(|| env::var("OPENAI_MODEL").ok())
             .or(file.model)
@@ -773,6 +995,21 @@ impl LlmConfig {
                 Provider::OpenCode => "gpt-5.6-luna".to_string(),
                 Provider::OpenAiCodex => "gpt-5.6-luna".to_string(),
             });
+        let mut available_models = env::var("AK_MODELS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .or(file.models.clone())
+            .unwrap_or_default();
+        if !available_models.iter().any(|candidate| candidate == &model) {
+            available_models.insert(0, model.clone());
+        }
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
         let base_url = match provider {
             Provider::OpenCode => base_url_override
@@ -793,13 +1030,14 @@ impl LlmConfig {
             });
         let api = match api_name.as_str() {
             "responses" | "openai-responses" => ApiProtocol::Responses,
-            "chat" | "chat-completions" | "openai-completions" => {
-                ApiProtocol::ChatCompletions
+            "chat" | "chat-completions" | "openai-completions" => ApiProtocol::ChatCompletions,
+            other => {
+                return Err(format!(
+                    "unsupported api '{}'; use openai-completions or openai-responses",
+                    other
+                )
+                .into())
             }
-            other => return Err(format!(
-                "unsupported api '{}'; use openai-completions or openai-responses",
-                other
-            ).into()),
         };
         let (api_key, account_id) = match provider {
             Provider::OpenCode => (
@@ -816,6 +1054,7 @@ impl LlmConfig {
             api_key,
             base_url,
             model,
+            available_models,
             api,
             account_id,
             thinking_effort: file.thinking_effort,
@@ -826,8 +1065,71 @@ impl LlmConfig {
                 .and_then(|v| v.parse().ok())
                 .or(file.context_window)
                 .unwrap_or(128_000),
-            client: reqwest::blocking::Client::new(),
+            permission,
+            max_tool_iterations: env::var("AK_MAX_TOOL_ITERATIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(file.max_tool_iterations)
+                .unwrap_or(60),
+            max_prompt_tokens: env::var("AK_MAX_PROMPT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(file.max_prompt_tokens)
+                .unwrap_or(128_000),
+            max_turn_seconds: env::var("AK_MAX_TURN_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(file.max_turn_seconds)
+                .unwrap_or(900),
+            client: reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(
+                    env::var("AK_HTTP_CONNECT_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .or(file.http_connect_timeout_secs)
+                        .unwrap_or(10),
+                ))
+                .timeout(Duration::from_secs(
+                    env::var("AK_HTTP_REQUEST_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .or(file.http_request_timeout_secs)
+                        .unwrap_or(300),
+                ))
+                .build()?,
         })
+    }
+
+    fn switch_provider(&mut self, provider: Provider) -> Result<(), Box<dyn std::error::Error>> {
+        let file = load_file_config()?;
+        let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
+        let (api_key, account_id) = match provider {
+            Provider::OpenCode => (
+                env::var("OPENAI_API_KEY")
+                    .ok()
+                    .or(file.api_key)
+                    .ok_or("OPENAI_API_KEY not set and no api_key in config file")?,
+                None,
+            ),
+            Provider::OpenAiCodex => load_codex_credentials()?,
+        };
+        self.provider = provider;
+        self.api_key = api_key;
+        self.account_id = account_id;
+        self.base_url = match provider {
+            Provider::OpenCode => env_base_url
+                .or(file.base_url)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            Provider::OpenAiCodex => "https://chatgpt.com/backend-api/codex".to_string(),
+        };
+        self.api = match env::var("OPENAI_API").ok().or(file.api).as_deref() {
+            Some("chat" | "chat-completions" | "openai-completions") => {
+                ApiProtocol::ChatCompletions
+            }
+            _ => ApiProtocol::Responses,
+        };
+        Ok(())
     }
 }
 
@@ -848,7 +1150,9 @@ fn load_codex_credentials() -> Result<(String, Option<String>), Box<dyn std::err
         if !access_token.is_empty() {
             return Ok((
                 access_token,
-                env::var("CODEX_ACCOUNT_ID").ok().filter(|id| !id.is_empty()),
+                env::var("CODEX_ACCOUNT_ID")
+                    .ok()
+                    .filter(|id| !id.is_empty()),
             ));
         }
     }
@@ -857,12 +1161,13 @@ fn load_codex_credentials() -> Result<(String, Option<String>), Box<dyn std::err
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .ok_or("HOME is not set; cannot locate Codex credentials")?
         .join("auth.json");
-    let contents = fs::read_to_string(&path).map_err(|e| {
-        format!("could not read Codex credentials {}: {}", path.display(), e)
-    })?;
+    let contents = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read Codex credentials {}: {}", path.display(), e))?;
     let auth: CodexAuthFile = serde_json::from_str(&contents)
         .map_err(|e| format!("invalid Codex credentials {}: {}", path.display(), e))?;
-    let tokens = auth.tokens.ok_or("Codex auth.json has no OAuth tokens; run `codex --login`")?;
+    let tokens = auth
+        .tokens
+        .ok_or("Codex auth.json has no OAuth tokens; run `codex --login`")?;
     if tokens.access_token.trim().is_empty() {
         return Err("Codex auth.json contains an empty access token".into());
     }
@@ -884,6 +1189,28 @@ fn authenticated_request(
     request
 }
 
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
+}
+
+fn provider_log(event: &str, detail: &str) {
+    let Some(base) = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    else {
+        return;
+    };
+    let path = base.join("ak/provider.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let record =
+            json!({"timestamp": chrono::Utc::now().to_rfc3339(), "event": event, "detail": detail});
+        let _ = writeln!(file, "{}", record);
+    }
+}
+
 /// Incremental markdown printer: prose is flushed as soon as a full line
 /// arrives; code fences are buffered until closed so they can be highlighted
 /// as one block. If a fence is still open when the stream ends, it is
@@ -896,7 +1223,11 @@ struct StreamPrinter {
 
 impl StreamPrinter {
     fn new() -> Self {
-        Self { in_code: false, code_lang: String::new(), code_body: String::new() }
+        Self {
+            in_code: false,
+            code_lang: String::new(),
+            code_body: String::new(),
+        }
     }
 
     fn feed_line(&mut self, line: &str) {
@@ -916,7 +1247,8 @@ impl StreamPrinter {
                     sink.send(SinkLine::Assistant(format!(
                         "```{}:\n{}\n```",
                         self.code_lang, self.code_body
-                    ))).ok();
+                    )))
+                    .ok();
                 } else {
                     print_code_block(&self.code_lang, &self.code_body);
                 }
@@ -925,8 +1257,7 @@ impl StreamPrinter {
                 self.in_code = false;
             } else {
                 self.in_code = true;
-                self.code_lang =
-                    trimmed.trim_start_matches('`').trim().to_string();
+                self.code_lang = trimmed.trim_start_matches('`').trim().to_string();
             }
         } else if self.in_code {
             self.code_body.push_str(line);
@@ -946,7 +1277,8 @@ impl StreamPrinter {
                 sink.send(SinkLine::Assistant(format!(
                     "```{}:\n{}\n```",
                     self.code_lang, self.code_body
-                ))).ok();
+                )))
+                .ok();
             } else {
                 with_console(|| print_code_block(&self.code_lang, &self.code_body));
             }
@@ -954,7 +1286,9 @@ impl StreamPrinter {
     }
 }
 
-fn read_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+fn read_stream(
+    response: reqwest::blocking::Response,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut content = String::new();
@@ -964,7 +1298,7 @@ fn read_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Op
     let mut usage_tokens: Option<u64> = None;
 
     loop {
-        if take_interrupt() {
+        if take_interrupt() || take_cancel_requested() {
             // Ctrl+C during generation: stop consuming the stream and
             // unwind so control returns to the prompt.
             with_console(|| println!());
@@ -998,28 +1332,7 @@ fn read_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Op
                 io::stdout().flush()?;
             }
             for delta in choice.delta.tool_calls.unwrap_or_default() {
-                while tool_calls.len() <= delta.index {
-                    tool_calls.push(LlmToolCall {
-                        id: String::new(),
-                        call_type: "function".to_string(),
-                        function: FunctionCall {
-                            name: String::new(),
-                            arguments: String::new(),
-                        },
-                    });
-                }
-                let call = &mut tool_calls[delta.index];
-                if let Some(id) = delta.id {
-                    call.id = id;
-                }
-                if let Some(function) = delta.function {
-                    if let Some(name) = function.name {
-                        call.function.name.push_str(&name);
-                    }
-                    if let Some(arguments) = function.arguments {
-                        call.function.arguments.push_str(&arguments);
-                    }
-                }
+                merge_chat_tool_call(&mut tool_calls, delta);
             }
         }
     }
@@ -1057,17 +1370,27 @@ fn call_chat_completions(
     let req = ChatRequest {
         model: config.model.clone(),
         messages: messages.to_vec(),
-        tools: if with_tools { tools_schema() } else { Vec::new() },
+        tools: if with_tools {
+            tools_schema()
+        } else {
+            Vec::new()
+        },
         stream: true,
-        stream_options: StreamOptions { include_usage: true },
+        stream_options: StreamOptions {
+            include_usage: true,
+        },
         reasoning_effort: config.thinking_effort.clone(),
     };
 
+    let mut active_config = config.clone();
     for attempt in 0..=MAX_RETRIES {
         let request = config
             .client
             .post(format!("{}/chat/completions", config.base_url));
-        let resp = match authenticated_request(request, config).json(&req).send() {
+        let resp = match authenticated_request(request, &active_config)
+            .json(&req)
+            .send()
+        {
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
@@ -1075,21 +1398,33 @@ fn call_chat_completions(
                 thread::sleep(delay);
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                provider_log("request_failed", &e.to_string());
+                return Err(e.into());
+            }
         };
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text()?;
-            let retryable = status.as_u16() == 408
-                || status.as_u16() == 429
-                || status.is_server_error();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && active_config.provider == Provider::OpenAiCodex
+                && attempt < MAX_RETRIES
+            {
+                if let Ok((token, account)) = load_codex_credentials() {
+                    active_config.api_key = token;
+                    active_config.account_id = account;
+                    continue;
+                }
+            }
+            let retryable = retryable_status(status);
             if retryable && attempt < MAX_RETRIES {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
                 with_console(|| eprintln!("[llm] API error {}: retrying in {:?}", status, delay));
                 thread::sleep(delay);
                 continue;
             }
+            provider_log("api_error", &format!("{}: {}", status, body));
             return Err(format!("API error: {}", body).into());
         }
 
@@ -1138,7 +1473,14 @@ fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
             "content": message.content.clone().unwrap_or_default(),
         }));
     }
-    (if instructions.is_empty() { None } else { Some(instructions.join("\n\n")) }, input)
+    (
+        if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions.join("\n\n"))
+        },
+        input,
+    )
 }
 
 fn responses_tools() -> Vec<Value> {
@@ -1160,11 +1502,18 @@ fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) 
         calls.push(LlmToolCall {
             id: String::new(),
             call_type: "function".to_string(),
-            function: FunctionCall { name: String::new(), arguments: String::new() },
+            function: FunctionCall {
+                name: String::new(),
+                arguments: String::new(),
+            },
         });
     }
     let call = &mut calls[index];
-    if let Some(id) = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str) {
+    if let Some(id) = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+    {
         call.id = id.to_string();
     }
     if let Some(name) = item.get("name").and_then(Value::as_str) {
@@ -1183,7 +1532,9 @@ fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Value) -> usi
         .unwrap_or(index)
 }
 
-fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+fn read_responses_stream(
+    response: reqwest::blocking::Response,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut content = String::new();
@@ -1195,7 +1546,7 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
     let mut usage_tokens = None;
 
     loop {
-        if take_interrupt() {
+        if take_interrupt() || take_cancel_requested() {
             with_console(|| println!());
             io::stdout().flush()?;
             return Err("interrupted".into());
@@ -1204,11 +1555,18 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
         if reader.read_line(&mut line)? == 0 {
             break;
         }
-        let Some(data) = line.strip_prefix("data:") else { continue };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
         let data = data.trim();
-        if data == "[DONE]" || data.is_empty() { continue; }
+        if data == "[DONE]" || data.is_empty() {
+            continue;
+        }
         let event: Value = serde_json::from_str(data)?;
-        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -1226,7 +1584,10 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
                     let item = event.get("item").unwrap_or(&Value::Null);
                     let index = response_call_index(
                         &tool_calls,
-                        event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize,
+                        event
+                            .get("output_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(tool_calls.len() as u64) as usize,
                         item,
                     );
                     response_tool_call(&mut tool_calls, index, item);
@@ -1247,7 +1608,10 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
                         .unwrap_or_else(|| {
                             format!(
                                 "output:{}",
-                                event.get("output_index").and_then(Value::as_u64).unwrap_or(0)
+                                event
+                                    .get("output_index")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0)
                             )
                         });
                     if let Some(index) = event
@@ -1266,7 +1630,10 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
                     let item = event.get("item").unwrap_or(&Value::Null);
                     let index = response_call_index(
                         &tool_calls,
-                        event.get("output_index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize,
+                        event
+                            .get("output_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(tool_calls.len() as u64) as usize,
                         item,
                     );
                     response_tool_call(&mut tool_calls, index, item);
@@ -1298,13 +1665,16 @@ fn read_responses_stream(response: reqwest::blocking::Response) -> Result<(ChatM
         io::stdout().flush()?;
     }
     tool_calls.retain(|call| !call.id.is_empty() && !call.function.name.is_empty());
-    Ok((ChatMessage {
-        role: "assistant".to_string(),
-        content: (!content.is_empty()).then_some(content),
-        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-        tool_call_id: None,
-        name: None,
-    }, usage_tokens))
+    Ok((
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: (!content.is_empty()).then_some(content),
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+            name: None,
+        },
+        usage_tokens,
+    ))
 }
 
 fn call_responses(
@@ -1329,9 +1699,13 @@ fn call_responses(
         body["reasoning"] = json!({ "effort": effort });
     }
     const MAX_RETRIES: u32 = 3;
+    let mut active_config = config.clone();
     for attempt in 0..=MAX_RETRIES {
         let request = config.client.post(format!("{}/responses", config.base_url));
-        let resp = match authenticated_request(request, config).json(&body).send() {
+        let resp = match authenticated_request(request, &active_config)
+            .json(&body)
+            .send()
+        {
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
@@ -1339,18 +1713,32 @@ fn call_responses(
                 thread::sleep(delay);
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                provider_log("request_failed", &e.to_string());
+                return Err(e.into());
+            }
         };
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text()?;
-            let retryable = status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && active_config.provider == Provider::OpenAiCodex
+                && attempt < MAX_RETRIES
+            {
+                if let Ok((token, account)) = load_codex_credentials() {
+                    active_config.api_key = token;
+                    active_config.account_id = account;
+                    continue;
+                }
+            }
+            let retryable = retryable_status(status);
             if retryable && attempt < MAX_RETRIES {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
                 with_console(|| eprintln!("[llm] API error {}: retrying in {:?}", status, delay));
                 thread::sleep(delay);
                 continue;
             }
+            provider_log("api_error", &format!("{}: {}", status, error_body));
             return Err(format!("API error: {}", error_body).into());
         }
         return read_responses_stream(resp);
@@ -1363,9 +1751,41 @@ fn call_llm(
     messages: &[ChatMessage],
     with_tools: bool,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
-    match config.api {
-        ApiProtocol::ChatCompletions => call_chat_completions(config, messages, with_tools),
-        ApiProtocol::Responses => call_responses(config, messages, with_tools),
+    let capabilities = llm::discover_capabilities(config);
+    if with_tools && !capabilities.tools {
+        return Err("configured model does not support tools".into());
+    }
+    llm::streaming::complete(config, messages, with_tools)
+}
+
+/// Run a blocking provider call behind a small polling boundary. This lets
+/// the UI return immediately when cancellation is requested; the stream
+/// reader also observes the same flag and exits at its next readable event.
+fn call_llm_cancellable(
+    config: &LlmConfig,
+    messages: &[ChatMessage],
+    with_tools: bool,
+) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    let config = config.clone();
+    let messages = messages.to_vec();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = llm::ModelClient::complete(&config, &messages, with_tools)
+            .map_err(|error| error.to_string());
+        let _ = tx.send(result);
+    });
+    loop {
+        if cancel_requested() {
+            return Err("cancelled by user".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Ok(result)) => return Ok(result),
+            Ok(Err(error)) => return Err(error.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("provider worker disconnected".into())
+            }
+        }
     }
 }
 
@@ -1375,8 +1795,29 @@ fn cache_file_path() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
         return Some(PathBuf::from(dir).join(CACHE_FILE_NAME));
     }
-    env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".cache").join(CACHE_FILE_NAME))
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join(CACHE_FILE_NAME))
+}
+
+fn cache_fingerprint(name: &str, input: &str) -> String {
+    let mut fingerprint = String::new();
+    if matches!(name, "read" | "grep" | "find") {
+        if let Ok(args) = serde_json::from_str::<Value>(input) {
+            if let Some(path) = args.get("path").and_then(Value::as_str) {
+                if let Ok(meta) = fs::metadata(path) {
+                    fingerprint = format!(
+                        ":{}:{}",
+                        meta.len(),
+                        meta.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos())
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+    fingerprint
 }
 
 #[derive(Default)]
@@ -1390,6 +1831,11 @@ struct ToolState {
 impl ToolState {
     fn load() -> Self {
         let mut state = Self::default();
+        // Cached tool output can contain source code or secrets. Keep caching
+        // opt-in until a caller explicitly requests it.
+        if env::var("AK_TOOL_CACHE").as_deref() != Ok("1") {
+            return state;
+        }
         if let Some(path) = cache_file_path() {
             if let Ok(contents) = fs::read_to_string(&path) {
                 if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&contents) {
@@ -1414,7 +1860,7 @@ impl ToolState {
 
     /// Persist the cache to disk (best-effort; failures are ignored).
     fn save(&self) {
-        if !self.dirty {
+        if !self.dirty || env::var("AK_TOOL_CACHE").as_deref() != Ok("1") {
             return;
         }
         if let Some(path) = cache_file_path() {
@@ -1480,36 +1926,22 @@ fn summarize_old_messages(
     Ok(summary.content.unwrap_or_default())
 }
 
-/// Rough token estimate for a message: ~4 chars per token.
-fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
-    let chars: usize = messages
-        .iter()
-        .map(|m| {
-            m.content.as_deref().map_or(0, str::len)
-                + m.tool_calls
-                    .as_ref()
-                    .map_or(0, |c| c.iter().map(|t| t.function.arguments.len() + t.function.name.len()).sum())
-        })
-        .sum();
-    (chars as u64) / 4
-}
-
-fn compact_history(config: &LlmConfig, messages: &mut Vec<ChatMessage>) {
+fn compact_history(config: &LlmConfig, messages: &mut Vec<ChatMessage>) -> Result<(), String> {
     // Find where the protected recent window begins (never split a
     // tool_call/tool pairing, so back up to the last non-tool message).
     let total = messages.len();
     if total <= 1 + KEEP_RECENT_MESSAGES {
-        return;
+        return Ok(());
     }
     let mut cutoff = total - KEEP_RECENT_MESSAGES;
     while cutoff > 1 && matches!(messages[cutoff].role.as_str(), "tool") {
         cutoff -= 1;
     }
     if cutoff <= 1 + MIN_MESSAGES_TO_SUMMARIZE {
-        return; // too little to summarize
+        return Ok(()); // too little to summarize
     }
     if messages[cutoff].role == "assistant" && messages[cutoff].tool_calls.is_some() {
-        return; // would orphan tool calls; skip compaction this round
+        return Ok(()); // would orphan tool calls; skip compaction this round
     }
 
     // Summarize the old segment (between the first user message and cutoff).
@@ -1517,10 +1949,10 @@ fn compact_history(config: &LlmConfig, messages: &mut Vec<ChatMessage>) {
     let summarized = match summarize_old_messages(config, &old) {
         Ok(s) => s,
         Err(e) => {
-            with_console(|| eprintln!("[history] summarization failed ({}); truncating instead", e));
-            // Fall back to plain truncation: drop the old segment entirely.
-            messages.drain(1..cutoff);
-            return;
+            return Err(format!(
+                "history compaction failed: {}; no context was discarded",
+                e
+            ))
         }
     };
 
@@ -1538,12 +1970,145 @@ fn compact_history(config: &LlmConfig, messages: &mut Vec<ChatMessage>) {
         name: Some("summary".to_string()),
     };
     messages.splice(1..cutoff, std::iter::once(summary_msg));
+    Ok(())
 }
 
 /// Maximum number of model round-trips within a single turn.
-const MAX_TOOL_ITERATIONS: usize = 60;
 /// When this many iterations remain, nudge the model to wrap up.
 const WRAP_UP_THRESHOLD: usize = 5;
+
+fn permission_denied(mode: PermissionMode, name: &str) -> Option<String> {
+    let denied = match mode {
+        PermissionMode::ReadOnly => !matches!(name, "read" | "grep" | "find" | "git"),
+        PermissionMode::AskWrites => matches!(name, "write" | "edit" | "bash"),
+        PermissionMode::AskShell => name == "bash",
+        PermissionMode::Trusted => false,
+    };
+    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure AK_PERMISSION", name))
+}
+
+fn approve_tool(mode: PermissionMode, name: &str, input: &str) -> bool {
+    if mode == PermissionMode::ReadOnly
+        && crate::tools::metadata(name).is_some_and(|metadata| !metadata.read_only)
+    {
+        if let Some(sink) = console_sink() {
+            let _ = sink.send(SinkLine::System(format!(
+                "Denied {}: read-only permission mode",
+                name
+            )));
+        } else {
+            with_console(|| eprintln!("Denied {}: read-only permission mode", name));
+        }
+        return false;
+    }
+    if permission_denied(mode, name).is_none() {
+        return true;
+    }
+    if SESSION_APPROVALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|approved| approved.contains(name))
+    {
+        return true;
+    }
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    if console_sink().is_some() {
+        if let Some(approval_sink) = APPROVAL_SINK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            let (response_tx, response_rx) = mpsc::channel();
+            if approval_sink
+                .send(ApprovalRequest {
+                    name: name.to_string(),
+                    input: input.to_string(),
+                    response: response_tx,
+                })
+                .is_ok()
+            {
+                return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
+                    ApprovalDecision::Once => true,
+                    ApprovalDecision::Session => {
+                        SESSION_APPROVALS
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert_with(HashSet::new)
+                            .insert(name.to_string());
+                        true
+                    }
+                    ApprovalDecision::Deny => false,
+                };
+            }
+        }
+    } else {
+        with_console(|| eprint!("Approve {} {}? [y/N] ", name, terminal_preview(input)));
+    }
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn execute_tool_call(call: &LlmToolCall, permission: PermissionMode) -> (String, String, String) {
+    let name = call.function.name.clone();
+    let raw_args = call.function.arguments.clone();
+    let value: Value = match serde_json::from_str(&raw_args) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                name,
+                raw_args,
+                format!("Error: invalid tool arguments: {}", error),
+            )
+        }
+    };
+    let Some(args) = value.as_object().cloned() else {
+        return (
+            name,
+            raw_args,
+            "Error: tool arguments must be a JSON object".into(),
+        );
+    };
+    let input = serde_json::to_string(&args).unwrap_or_default();
+    if !approve_tool(permission, &name, &input) {
+        return (
+            name.clone(),
+            input,
+            format!("Error: permission denied for tool '{}'", name),
+        );
+    }
+    (name.clone(), input, execute_to_string(&name, &args))
+}
+
+fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
+    let mut paths = std::collections::HashSet::new();
+    calls.iter().any(|call| {
+        let Ok(value) = serde_json::from_str::<Value>(&call.function.arguments) else {
+            return false;
+        };
+        let Some(path) = value.get("path").and_then(Value::as_str) else {
+            return false;
+        };
+        !paths.insert(path.to_string())
+    })
+}
+
+fn persist_pending(
+    session: &mut Option<&mut Session>,
+    messages: &[ChatMessage],
+    cursor: &mut usize,
+) {
+    if let Some(session) = session.as_deref_mut() {
+        for message in messages.get(*cursor..).unwrap_or_default() {
+            let _ = session::SessionStore::append_message(session, message.clone());
+        }
+        *cursor = messages.len();
+    }
+}
 
 fn process_turn(
     config: &LlmConfig,
@@ -1551,15 +2116,35 @@ fn process_turn(
     state: &mut ToolState,
     steering_rx: Option<&mpsc::Receiver<String>>,
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
+    mut session: Option<&mut Session>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Spins while the agent works; erased automatically on return.
     let _working = SpinnerGuard::start("Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
+    let cancellation = agent::state::GlobalCancellation;
+    let mut persisted_cursor = messages.len();
 
-    for iteration in 0..MAX_TOOL_ITERATIONS {
-        if take_cancel_requested() {
+    let limits = agent::state::TurnLimits {
+        tool_iterations: config.max_tool_iterations,
+        prompt_tokens: config.max_prompt_tokens,
+        elapsed_seconds: config.max_turn_seconds,
+    };
+    let turn_deadline = agent::r#loop::deadline(limits);
+    for iteration in 0..config.max_tool_iterations {
+        if !agent::r#loop::within_budget(iteration, limits, turn_deadline) {
+            return Err("turn exceeded configured budget".into());
+        }
+        persist_pending(&mut session, messages, &mut persisted_cursor);
+        if cancellation.is_cancelled() {
+            let _ = cancellation.take_cancelled();
             return Err("cancelled by user".into());
+        }
+        if std::time::Instant::now() >= turn_deadline {
+            return Err("turn exceeded configured time limit".into());
+        }
+        if estimate_tokens(messages) > config.max_prompt_tokens {
+            return Err("prompt exceeded configured token limit".into());
         }
         // Steering is consumed between turns/tool batches, while the worker
         // still owns the conversation state. This avoids concurrent mutation
@@ -1579,7 +2164,7 @@ fn process_turn(
             }
         }
         // Nudge the model to finish as we approach the iteration budget.
-        let remaining = MAX_TOOL_ITERATIONS - iteration;
+        let remaining = config.max_tool_iterations.saturating_sub(iteration);
         if remaining == WRAP_UP_THRESHOLD {
             messages.push(ChatMessage {
                 role: "user".to_string(),
@@ -1599,8 +2184,9 @@ fn process_turn(
                 tool_call_id: None,
                 name: Some("system-nudge".to_string()),
             });
+            persist_pending(&mut session, messages, &mut persisted_cursor);
         }
-        let (message, usage) = match call_llm(config, messages, true) {
+        let (message, usage) = match call_llm_cancellable(config, messages, true) {
             Ok(result) => result,
             Err(e) if e.to_string() == "interrupted" => {
                 return Err("interrupted by user (Ctrl+C)".into());
@@ -1614,9 +2200,8 @@ fn process_turn(
         // budget is exceeded (API-reported usage takes precedence).
         let est = last_usage.unwrap_or_else(|| estimate_tokens(messages));
         if messages.len() > 1 + KEEP_RECENT_MESSAGES || est > config.context_window / 2 {
-            compact_history(config, messages);
+            compact_history(config, messages)?;
         }
-        compact_history(config, messages);
         if let Some(calls) = message.tool_calls.clone() {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
@@ -1626,45 +2211,59 @@ fn process_turn(
                 name: None,
             });
             // Execute all tool calls in this assistant message in parallel.
-            let handles: Vec<_> = calls
+            let batch_has_mutation = calls
                 .iter()
-                .map(|call| {
-                    let name = call.function.name.clone();
-                    let raw_args = call.function.arguments.clone();
-                    thread::spawn(move || {
-                        let args: Value = match serde_json::from_str(&raw_args) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return (name, raw_args, format!("Error: invalid tool arguments: {}", e))
-                            }
-                        };
-                        let args = args.as_object().cloned().unwrap_or_default();
-                        let input = serde_json::to_string(&args).unwrap_or_default();
-                        let result = execute_to_string(&name, &args);
-                        (name, input, result)
+                .any(|call| crate::tools::permissions::is_mutating(&call.function.name));
+            let serialize_batch = batch_has_mutation || tool_calls_conflict(&calls);
+            let results: Vec<_> = if serialize_batch {
+                let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                calls
+                    .iter()
+                    .map(|call| execute_tool_call(call, config.permission))
+                    .collect()
+            } else {
+                calls
+                    .iter()
+                    .map(|call| {
+                        let call = call.clone();
+                        let permission = config.permission;
+                        thread::spawn(move || execute_tool_call(&call, permission))
                     })
-                })
-                .collect();
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            (
+                                String::new(),
+                                String::new(),
+                                "Error: tool worker panicked".into(),
+                            )
+                        })
+                    })
+                    .collect()
+            };
 
-            for (call, handle) in calls.iter().zip(handles) {
-                let (name, input, result) = handle.join().unwrap_or_else(|_| {
-                    (
-                        call.function.name.clone(),
-                        String::new(),
-                        "Error: tool worker panicked".to_string(),
-                    )
-                });
-                let cache_key = format!("{}:{}", name, input);
+            for (call, (name, input, result)) in calls.iter().zip(results) {
+                let cache_key = format!(
+                    "{}:{}:{}{}",
+                    env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    name,
+                    input,
+                    cache_fingerprint(&name, &input)
+                );
                 if last_tools.len() >= 6 {
                     last_tools.remove(0);
                 }
                 last_tools.push(cache_key.clone());
-                let repeated_count =
-                    last_tools.iter().filter(|k| **k == cache_key).count();
+                let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
                 if let Some(sink) = console_sink() {
                     let _ = sink.send(SinkLine::ToolInput(format!(
                         "{} {}",
-                        call.function.name, short_arg(&name, &input)
+                        call.function.name,
+                        short_arg(&name, &input)
                     )));
                 } else {
                     with_console(|| {
@@ -1687,7 +2286,9 @@ fn process_turn(
                     if let Some(cached) = state.cache.get(&cache_key) {
                         cache_hit = true;
                         if console_sink().is_none() {
-                            with_console(|| eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET));
+                            with_console(|| {
+                                eprintln!("{}[tool cache hit]{}", TOOL_OUTPUT_COLOR, RESET)
+                            });
                         }
                         cached.clone()
                     } else {
@@ -1705,7 +2306,10 @@ fn process_turn(
                     if cache_hit {
                         summary = format!("cached · {summary}");
                     }
-                    let _ = sink.send(SinkLine::ToolOutput { name: name.clone(), summary });
+                    let _ = sink.send(SinkLine::ToolOutput {
+                        name: name.clone(),
+                        summary,
+                    });
                 } else {
                     with_console(|| {
                         eprintln!(
@@ -1724,6 +2328,7 @@ fn process_turn(
                     tool_call_id: Some(call.id.clone()),
                     name: None,
                 });
+                persist_pending(&mut session, messages, &mut persisted_cursor);
             }
             state.save();
         } else {
@@ -1755,6 +2360,7 @@ fn process_turn(
                 }
             }
             state.last_usage = last_usage;
+            persist_pending(&mut session, messages, &mut persisted_cursor);
             return Ok(text);
         }
     }
@@ -1768,58 +2374,74 @@ fn process_turn(
     )
 }
 
-fn run_one_shot(
-    prompt: &str,
-    args: &Args,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = LlmConfig::from_env(args.base_url.clone(), args.model.clone())?;
+fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let config = LlmConfig::from_env(args.base_url.clone(), args.model.clone(), args.permission)?;
     let mut skill_dirs = skill_dirs();
     skill_dirs.extend(args.skill_dirs.iter().cloned());
     let skills = discover_skills(&skill_dirs);
-    let mut messages = vec![
-        ChatMessage { role: "system".to_string(), content: Some(system_prompt(&skills)), tool_calls: None, tool_call_id: None, name: None },
-        ChatMessage { role: "user".to_string(), content: Some(prompt.to_string()), tool_calls: None, tool_call_id: None, name: None },
-    ];
-    let mut state = ToolState::load();
-    let result = process_turn(&config, &mut messages, &mut state, None, None);
-    if !args.no_session {
-        let cwd = env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        // A corrupt/truncated resume target must not abort the prompt — fall
-        // back to a fresh session instead of propagating the error with `?`.
-        let mut session = match if args.new_session {
+    let cwd = env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut session = if args.no_session {
+        None
+    } else {
+        match if args.new_session {
             Session::new(cwd.clone(), args.session_name.clone())
         } else {
             Session::open_or_continue(cwd.clone(), args.session_path.as_deref(), false)
         } {
-            Ok(mut s) => {
+            Ok(mut session) => {
                 if let Some(name) = &args.session_name {
-                    s.set_name(name.clone()).ok();
+                    let _ = session.set_name(name.clone());
                 }
-                s
+                Some(session)
             }
-            Err(e) => {
-                eprintln!("[session] could not open session ({}); starting fresh", e);
-                match Session::new(cwd, args.session_name.clone()) {
-                    Ok(mut s) => {
-                        if let Some(name) = &args.session_name {
-                            s.set_name(name.clone()).ok();
-                        }
-                        s
-                    }
-                    Err(e2) => {
-                        eprintln!("[session] could not create session ({}); skipping save", e2);
-                        // Continue without persistence — the prompt still ran.
-                        for msg in &messages[1..] {
-                            let _ = msg;
-                        }
-                        return result.map(|_| ());
-                    }
-                }
+            Err(error) => {
+                eprintln!(
+                    "[session] could not open session ({}); continuing without persistence",
+                    error
+                );
+                None
             }
-        };
-        for msg in &messages[1..] { // skip system
-            session.append_message(msg.clone()).ok();
         }
+    };
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: Some(system_prompt(&skills)),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }];
+    if let Some(existing) = session.as_ref().and_then(|s| s.path()) {
+        messages.extend(load_messages_from_session(existing).unwrap_or_default());
+    }
+    let user = ChatMessage {
+        role: "user".into(),
+        content: Some(prompt.into()),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    };
+    if let Some(session) = session.as_mut() {
+        let _ = session.turn_event("turn_start");
+        let _ = session.append_message(user.clone());
+    }
+    messages.push(user);
+    let mut state = ToolState::load();
+    let result = process_turn(
+        &config,
+        &mut messages,
+        &mut state,
+        None,
+        None,
+        session.as_mut(),
+    );
+    if let Some(session) = session.as_mut() {
+        let _ = session.turn_event(if result.is_ok() {
+            "turn_complete"
+        } else {
+            "turn_failed"
+        });
     }
     println!();
     result.map(|_| ())
@@ -1827,9 +2449,13 @@ fn run_one_shot(
 
 fn run_interactive() {
     eprintln!("ak raw tool mode");
-    eprintln!("tools: read, bash, write, edit, grep, find");
+    eprintln!("tools: read, bash, write, edit, grep, find, git");
     eprintln!("send JSON lines like: {{\"name\":\"read\",\"args\":{{\"path\":\"Cargo.toml\"}}}}");
     eprintln!("empty line quits");
+
+    let permission = load_file_config()
+        .and_then(|file| PermissionMode::from_env_or_file(&file))
+        .unwrap_or(PermissionMode::ReadOnly);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -1862,16 +2488,22 @@ fn run_interactive() {
             Some(a) => a.clone(),
             None => Map::new(),
         };
-        let result = match execute(name, &args) {
-            Ok(out) => json!({"ok": out}),
-            Err(e) => json!({"err": e.to_string()}),
+        let input = serde_json::to_string(&args).unwrap_or_default();
+        let result = if !approve_tool(permission, name, &input) {
+            json!({"err": format!("permission denied for tool '{}'", name)})
+        } else {
+            match execute(name, &args) {
+                Ok(out) => json!({"ok": out}),
+                Err(e) => json!({"err": e.to_string()}),
+            }
         };
         println!("{}", result);
         let _ = stdout.flush();
     }
 }
 
-struct Args {
+#[allow(dead_code)]
+struct LegacyArgs {
     base_url: Option<String>,
     model: Option<String>,
     session_path: Option<PathBuf>,
@@ -1879,10 +2511,12 @@ struct Args {
     new_session: bool,
     session_name: Option<String>,
     skill_dirs: Vec<PathBuf>,
+    permission: Option<PermissionMode>,
     rest: Vec<String>,
 }
 
-fn parse_args() -> Args {
+#[allow(dead_code)]
+fn parse_args_from<I: Iterator<Item = String>>(input: I) -> LegacyArgs {
     let mut base_url: Option<String> = None;
     let mut model: Option<String> = None;
     let mut session_path: Option<PathBuf> = None;
@@ -1890,8 +2524,9 @@ fn parse_args() -> Args {
     let mut new_session = false;
     let mut session_name: Option<String> = None;
     let mut skill_dirs: Vec<PathBuf> = Vec::new();
+    let mut permission: Option<PermissionMode> = None;
     let mut rest: Vec<String> = Vec::new();
-    let mut args = env::args().skip(1);
+    let mut args = input;
     while let Some(arg) = args.next() {
         if arg == "--base-url" {
             match args.next() {
@@ -1929,6 +2564,16 @@ fn parse_args() -> Args {
                     std::process::exit(1);
                 }
             }
+        } else if arg == "--permission" {
+            match args.next().and_then(|v| PermissionMode::parse(&v).ok()) {
+                Some(mode) => permission = Some(mode),
+                None => {
+                    eprintln!(
+                        "error: --permission requires read-only, ask-writes, ask-shell, or trusted"
+                    );
+                    std::process::exit(1);
+                }
+            }
         } else if arg == "--skill" {
             match args.next() {
                 Some(p) => skill_dirs.push(PathBuf::from(p)),
@@ -1941,7 +2586,7 @@ fn parse_args() -> Args {
             rest.push(arg);
         }
     }
-    Args {
+    LegacyArgs {
         base_url,
         model,
         session_path,
@@ -1949,13 +2594,14 @@ fn parse_args() -> Args {
         new_session,
         session_name,
         skill_dirs,
+        permission,
         rest,
     }
 }
 
 fn main() {
     install_sigint_handler();
-    let args = parse_args();
+    let args = cli::parse_args();
     if args.rest.len() == 1 && args.rest[0] == "--tool" {
         run_interactive();
     } else if !args.rest.is_empty() {
@@ -1967,5 +2613,237 @@ fn main() {
     } else if let Err(e) = ui::run_ratatui_repl(&args) {
         eprintln!("ui error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_names_are_validated() {
+        let root = std::env::temp_dir().join(format!("ak-skill-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let valid = root.join("SKILL.md");
+        fs::write(&valid, "---\nname: rust-test\ndescription: demo\n---\nbody").unwrap();
+        assert_eq!(parse_skill(&valid).unwrap().name, "rust-test");
+        fs::write(&valid, "---\nname: bad/name\n---\n").unwrap();
+        assert!(parse_skill(&valid).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn token_estimate_accounts_for_tool_arguments() {
+        let message = ChatMessage {
+            role: "assistant".into(),
+            content: Some("1234".into()),
+            tool_calls: Some(vec![LlmToolCall {
+                id: "1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "1234".into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        assert_eq!(estimate_tokens(&[message]), 3);
+    }
+
+    #[test]
+    fn cache_fingerprint_changes_when_file_changes() {
+        let path = std::env::temp_dir().join(format!("ak-cache-test-{}", std::process::id()));
+        fs::write(&path, "one").unwrap();
+        let input = serde_json::to_string(&json!({"path": path})).unwrap();
+        let first = cache_fingerprint("read", &input);
+        std::thread::sleep(Duration::from_millis(2));
+        fs::write(&path, "two with more bytes").unwrap();
+        let second = cache_fingerprint("read", &input);
+        assert_ne!(first, second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn chat_stream_fixture_aggregates_split_tool_calls() {
+        let first: StreamChunk = serde_json::from_str(r#"{"choices":[{"delta":{"content":null,"tool_calls":[{"index":0,"id":"call-1","function":{"name":"rea","arguments":"{\"path\":"}}]}}]}"#).unwrap();
+        let second: StreamChunk = serde_json::from_str(r#"{"choices":[{"delta":{"content":null,"tool_calls":[{"index":0,"function":{"name":"d","arguments":"\"Cargo.toml\"}"}}]}}]}"#).unwrap();
+        let mut calls = Vec::new();
+        for delta in first
+            .choices
+            .into_iter()
+            .flat_map(|choice| choice.delta.tool_calls.unwrap_or_default())
+        {
+            merge_chat_tool_call(&mut calls, delta);
+        }
+        for delta in second
+            .choices
+            .into_iter()
+            .flat_map(|choice| choice.delta.tool_calls.unwrap_or_default())
+        {
+            merge_chat_tool_call(&mut calls, delta);
+        }
+        assert_eq!(calls[0].id, "call-1");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"Cargo.toml"}"#);
+        assert!(serde_json::from_str::<StreamChunk>("not json").is_err());
+    }
+
+    #[test]
+    fn responses_stream_fixture_reconciles_added_and_done_items() {
+        let item = json!({"id":"item-1","call_id":"call-1","type":"function_call","name":"read","arguments":"{\"path\":\"x\"}"});
+        let mut calls = Vec::new();
+        response_tool_call(&mut calls, 0, &item);
+        response_tool_call(&mut calls, 0, &item);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"x"}"#);
+    }
+
+    #[test]
+    fn cli_parser_handles_flags_and_prompt() {
+        let args = parse_args_from(
+            [
+                "--model".into(),
+                "test-model".into(),
+                "--permission".into(),
+                "trusted".into(),
+                "finish".into(),
+                "the".into(),
+                "task".into(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(args.model.as_deref(), Some("test-model"));
+        assert_eq!(args.permission, Some(PermissionMode::Trusted));
+        assert_eq!(args.rest, vec!["finish", "the", "task"]);
+    }
+
+    #[test]
+    fn compaction_boundary_keeps_short_history_unchanged() {
+        let config = LlmConfig {
+            provider: Provider::OpenCode,
+            api_key: "test".into(),
+            base_url: "http://127.0.0.1".into(),
+            model: "test".into(),
+            available_models: vec!["test".into()],
+            api: ApiProtocol::ChatCompletions,
+            account_id: None,
+            thinking_effort: None,
+            context_window: 128_000,
+            permission: PermissionMode::Trusted,
+            max_tool_iterations: 60,
+            max_prompt_tokens: 128_000,
+            max_turn_seconds: 60,
+            client: reqwest::blocking::Client::new(),
+        };
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        for _ in 0..KEEP_RECENT_MESSAGES {
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: Some("x".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        let before = messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>();
+        compact_history(&config, &mut messages).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "network-tests"),
+        ignore = "requires local socket support; run with --features network-tests"
+    )]
+    fn retry_fixture_recovers_from_transient_http_error() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let body = if attempt == 0 {
+                    "temporary failure"
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n"
+                };
+                let status = if attempt == 0 {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                };
+                write!(stream, "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\n\r\n{}", status, body.len(), body).unwrap();
+            }
+        });
+        let config = LlmConfig {
+            provider: Provider::OpenCode,
+            api_key: "test".into(),
+            base_url: format!("http://{}", address),
+            model: "test".into(),
+            available_models: vec!["test".into()],
+            api: ApiProtocol::ChatCompletions,
+            account_id: None,
+            thinking_effort: None,
+            context_window: 128_000,
+            permission: PermissionMode::Trusted,
+            max_tool_iterations: 2,
+            max_prompt_tokens: 128_000,
+            max_turn_seconds: 60,
+            client: reqwest::blocking::Client::new(),
+        };
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        assert_eq!(
+            call_chat_completions(&config, &messages, false)
+                .unwrap()
+                .0
+                .content
+                .as_deref(),
+            Some("ok")
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn retry_policy_accepts_transient_statuses_only() {
+        assert!(retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
+        assert!(retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!retryable_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!retryable_status(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn cancellation_source_is_observable_and_consumable() {
+        CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+        request_cancel();
+        assert!(cancel_requested());
+        assert!(take_cancel_requested());
+        assert!(!cancel_requested());
     }
 }

@@ -1,0 +1,5 @@
+/target/
+ak-tool-cache.json
+*.log
+.ak/sessions/
+.ak/skills/*/runtime/

@@ -12,8 +12,8 @@ sessions and can be resumed.
   endpoints (OpenAI, OpenCode Zen, Moonshot/Kimi, etc.). Streaming responses,
   automatic retries with exponential backoff, and configurable reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write
-  and edit files, and search the filesystem. Multiple tool calls in a single
-  assistant turn run in parallel.
+  and edit files, search the filesystem, and inspect git status/diffs. Tool
+  output caching is disabled by default; set `AK_TOOL_CACHE=1` to opt in.
 - **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript
   (via `ratatui-markdown`), a custom multi-line input editor with an inline
   block cursor and soft-wrapping (no `tui-textarea` underline / horizontal
@@ -61,12 +61,14 @@ cp config.sample.json ~/.config/ak/config.json
 | `api_key`        | string   | Default API key (overridable by `OPENAI_API_KEY`).                 |
 | `base_url`       | string   | Default API base URL (overridable by `OPENAI_BASE_URL`).           |
 | `model`          | string   | Default model (overridable by `OPENAI_MODEL`).                     |
+| `models`         | string[] | Models shown by `/model` autocomplete (also configurable via `AK_MODELS`, comma-separated). |
 | `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
 | `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
 | `context_window` | integer  | Token context window used for compaction/status (overridable by `AK_CONTEXT_WINDOW`). |
+| `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits. |
+| `http_connect_timeout_secs` / `http_request_timeout_secs` | integer | HTTP connection and request limits. |
 
-The `api` field follows the provider/model API distinction used by Pi and Codex.
-It defaults to `openai-completions` for existing configurations.
+The `api` field follows the provider/model API distinction used by Pi and Codex. It defaults to `openai-responses`.
 
 For OpenCode, use its API key and endpoint. For ChatGPT-backed Codex, first run
 `codex --login`, then select the Codex provider:
@@ -138,10 +140,22 @@ An empty line quits raw tool mode.
 | `-s`, `--session <path>` | Open/continue a specific session file.             |
 | `--no-session`     | Disable session persistence for this run.                |
 | `-n`, `--new`      | Start a new session (the default).                       |
-| `--name <name>`    | Name the session.                                        |
+| `--permission <mode>` | Tool permissions: `read-only`, `ask-writes`, `ask-shell`, or `trusted`. |
 | `--skill <dir>`    | Add an extra skill directory to discover skills from.    |
 | `--tool`           | Run raw JSON tool mode (read JSON lines from stdin).     |
-| `--tool`           | Run raw JSON tool mode (read JSON lines from stdin).     |
+
+Tool safety defaults to `ask-writes`. Paths are confined to the current
+workspace; `bash` can execute arbitrary commands in that workspace and should
+only be enabled in trusted environments. Shell commands default to 120
+seconds and 1 MiB per output stream. HTTP requests default to 10 seconds to
+connect and 300 seconds overall. Tool calls are recorded in
+`$XDG_DATA_HOME/ak/audit.jsonl` (or the equivalent path under
+`~/.local/share`). Configure limits with `AK_TOOL_*`, `AK_HTTP_*`, and
+`AK_MAX_*` environment variables or the corresponding JSON config fields.
+
+In the interactive TUI, actions requiring approval open a dedicated overlay.
+Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`,
+or `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 Any other arguments are treated as a one-shot prompt.
 
@@ -153,16 +167,19 @@ Any other arguments are treated as a one-shot prompt.
 | `/clear`            | Clear the conversation history (keeps the system prompt). |
 | `/new`              | Start a new session and clear history.               |
 | `/session`          | Show the current session id, path, and turn count.   |
-| `/resume`           | List saved sessions for this directory.              |
+| `/resume [index|path]` | List sessions, or resume one by index/path.       |
 | `/name <name>`      | Rename the current session.                          |
 | `/skill:<name>`     | Load a skill's full content into the conversation.    |
 | `/model`           | Show the current model.                               |
 | `/model <name>`     | Switch the model for the rest of the session.         |
+| `/provider`        | Show the current and available providers.             |
+| `/provider <name>` | Switch provider for the rest of the session.          |
 | `/help` (unknown)   | Unknown commands print a hint.                        |
 
 ### Keyboard controls
 
 - **Enter** — submit the current input.
+- **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓** navigate suggestions.
 - **Shift+Enter** — insert a newline (multi-line input).
 - **Enter while working** — queue a steering message for the next model boundary.
 - **Alt+Enter while working** — queue a follow-up for after the current task.
@@ -242,7 +259,9 @@ cache (`ak-tool-cache.json`) is kept across runs to reduce redundant work.
 | `AK_PROVIDER`        | Provider override (`opencode` or `openai-codex`).          |
 | `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |
 | `CODEX_ACCOUNT_ID`   | Account ID paired with `CODEX_ACCESS_TOKEN`.               |
-| `AK_CONTEXT_WINDOW`  | Token context window for compaction/status (overrides `config.json`). |
+| `AK_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
+| `AK_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
+| `AK_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
 | `RUSTY_PI_CONFIG`    | Explicit path to `config.json`.                          |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
