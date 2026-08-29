@@ -54,6 +54,15 @@ This repository has a solid prototype foundation, but it needs the following wor
   - [x] `tools/permissions.rs`
   - [x] `config/`
   - [x] `cli/`
+  - [x] `ui/render.rs`
+  - [x] `ui/event.rs`
+  - [x] `ui/slash.rs`
+  - [x] `ui/input.rs`
+  - [x] `ui/wrapping.rs`
+- [x] Remove `pub(crate) use` fan-out in `main.rs`
+- [x] Replace console globals with a threaded `Console` struct
+- [x] Collapse tool-execution indirection
+- [x] Deduplicate LLM client retry via `post_with_retry`
 - [x] Introduce traits/interfaces for mockable components:
   - [x] Model client.
   - [x] Tool executor.
