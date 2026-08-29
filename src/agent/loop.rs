@@ -548,7 +548,7 @@ mod tests {
             None,
             &MockModel,
             &NeverCancel,
-            &crate::Console::none(),
+            &crate::core::console::Console::none(),
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "hello from mock");

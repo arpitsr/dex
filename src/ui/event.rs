@@ -17,10 +17,12 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 
-use crate::{
-    ApprovalDecision, ApprovalRequest, Args, ChatMessage, Console, LlmConfig, Provider, Session,
-    SinkLine, ToolState,
-};
+use crate::agent::state::ToolState;
+use crate::cli::Args;
+use crate::core::console::Console;
+use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, Provider, SinkLine};
+use crate::llm::config::LlmConfig;
+use crate::session::Session;
 
 use super::slash::{complete_slash, handle_slash, slash_suggestions};
 use super::{
@@ -99,7 +101,7 @@ fn submit(
     let console = console.clone();
     thread::spawn(move || {
         let result = loop {
-            let result = crate::process_turn(
+            let result = crate::agent::r#loop::process_turn(
                 &config,
                 &mut messages,
                 &mut tool_state,
@@ -237,7 +239,7 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
         .unwrap_or_default();
     let session = resolve_session(args, &cwd);
     if let Some(path) = session.path() {
-        if let Ok(state) = crate::load_session_state(path) {
+        if let Ok(state) = crate::session::load_session_state(path) {
             if let Some(provider_name) = state.get("provider") {
                 match Provider::parse(provider_name) {
                     Ok(provider) => {
@@ -254,13 +256,13 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
         }
     }
 
-    let mut skill_dirs = crate::skill_dirs();
+    let mut skill_dirs = crate::skills::skill_dirs();
     skill_dirs.extend(args.skill_dirs.iter().cloned());
-    let skills = crate::discover_skills(&skill_dirs);
+    let skills = crate::skills::discover_skills(&skill_dirs);
 
     let mut messages = if session.count() > 0 {
         if let Some(path) = session.path() {
-            crate::load_messages_from_session(path).unwrap_or_default()
+            crate::session::load_messages_from_session(path).unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -271,7 +273,7 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
         0,
         ChatMessage {
             role: "system".to_string(),
-            content: Some(crate::system_prompt(&skills)),
+            content: Some(crate::llm::prompt::system_prompt(&skills)),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -396,13 +398,13 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
                         {
                             if app.busy {
                                 app.cancel_requested = true;
-                                crate::request_cancel();
+                                crate::core::console::request_cancel();
                             } else {
                                 app.quit = true;
                             }
                         } else if key.code == KeyCode::Esc && app.busy {
                             app.cancel_requested = true;
-                            crate::request_cancel();
+                            crate::core::console::request_cancel();
                         } else if !app.busy && !slash_suggestions(&app).is_empty() {
                             match key.code {
                                 KeyCode::Up => {
@@ -534,10 +536,9 @@ pub(crate) fn run_ratatui_repl(args: &Args) -> std::io::Result<()> {
                         app.busy = false;
                         app.active_tool = None;
                         if let Some(started) = app.turn_started {
-                            let tokens = app
-                                .tool_state
-                                .last_usage
-                                .unwrap_or_else(|| crate::estimate_tokens(&app.messages));
+                            let tokens = app.tool_state.last_usage.unwrap_or_else(|| {
+                                crate::agent::compaction::estimate_tokens(&app.messages)
+                            });
                             app.last_activity = Some(format!(
                                 "worked for {:.1}s · {} tokens",
                                 started.elapsed().as_secs_f64(),

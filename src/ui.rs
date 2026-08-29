@@ -24,7 +24,10 @@ use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 use ratatui_markdown::ThemeConfig;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{ChatMessage, LlmConfig, Session, SinkLine, Skill, ToolState};
+use crate::agent::state::ToolState;
+use crate::core::types::{ChatMessage, SinkLine, Skill};
+use crate::llm::config::LlmConfig;
+use crate::session::Session;
 
 mod event;
 mod input;
@@ -69,7 +72,7 @@ struct App {
     pending_steering: Vec<String>,
     pending_followups: Vec<String>,
     cancel_requested: bool,
-    approval_rx: Option<mpsc::Receiver<crate::ApprovalRequest>>,
+    approval_rx: Option<mpsc::Receiver<crate::core::types::ApprovalRequest>>,
     pending_approval: Option<PendingApproval>,
     busy: bool,
     autoscroll: bool,
@@ -87,7 +90,7 @@ struct App {
 struct PendingApproval {
     name: String,
     input: String,
-    response: mpsc::Sender<crate::ApprovalDecision>,
+    response: mpsc::Sender<crate::core::types::ApprovalDecision>,
     selected: usize,
 }
 
@@ -303,7 +306,7 @@ fn ui_status(app: &App) -> String {
     let tokens = app
         .tool_state
         .last_usage
-        .unwrap_or_else(|| crate::estimate_tokens(&app.messages));
+        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
     let context_pct = if app.config.context_window == 0 {
         0
     } else {
@@ -621,7 +624,7 @@ fn push_info(app: &mut App, text: String) {
         ))));
 }
 
-fn resolve_approval(app: &mut App, decision: crate::ApprovalDecision) {
+fn resolve_approval(app: &mut App, decision: crate::core::types::ApprovalDecision) {
     if let Some(approval) = app.pending_approval.take() {
         let _ = approval.response.send(decision);
     }
@@ -1121,7 +1124,7 @@ fn render_input(input: &InputField, width: u16) -> (Vec<Line<'static>>, (u16, u1
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::{ApiProtocol, PermissionMode, Provider};
+    use crate::core::types::{ApiProtocol, PermissionMode, Provider};
     use ratatui::backend::TestBackend;
 
     fn test_app() -> App {
