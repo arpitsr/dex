@@ -1,10 +1,12 @@
+#![allow(dead_code)]
+
 use std::env;
 use std::fs;
 
 use crate::core::types::{ChatMessage, Provider};
 use crate::session::Session;
 
-use super::{push_info, push_transcript_gap, App, InputField};
+use super::{push_info, push_transcript_gap_app as push_transcript_gap, App, InputField};
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "Exit the REPL"),

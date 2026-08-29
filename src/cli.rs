@@ -16,6 +16,21 @@ pub(crate) struct Args {
     pub rest: Vec<String>,
 }
 
+/// The mode in which the binary was invoked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Start a headless HTTP server (`ak serve`).
+    Serve { port: u16 },
+    /// Start the TUI connected to a remote daemon (`ak connect <url>`).
+    Connect { url: String },
+    /// Start both server + TUI in the same process (default `ak`).
+    Default,
+    /// One-shot prompt (`ak "prompt"`).
+    OneShot { prompt: String },
+    /// Raw tool mode (`ak --tool`).
+    Tool,
+}
+
 pub(crate) fn parse_args() -> Args {
     let mut base_url = None;
     let mut model = None;
@@ -57,6 +72,39 @@ pub(crate) fn parse_args() -> Args {
         skill_dirs,
         permission,
         rest,
+    }
+}
+
+/// Determine the invocation mode from parsed args.
+pub(crate) fn resolve_mode(args: &Args) -> Mode {
+    match args.rest.first().map(|s| s.as_str()) {
+        Some("serve") => {
+            let port = args
+                .rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8420);
+            Mode::Serve { port }
+        }
+        Some("connect") => {
+            let url = args
+                .rest
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "http://127.0.0.1:8420".to_string());
+            Mode::Connect { url }
+        }
+        Some("--tool") => Mode::Tool,
+        Some(prompt) if !prompt.starts_with('-') => Mode::OneShot {
+            prompt: args.rest.join(" "),
+        },
+        None => Mode::Default,
+        Some(_unknown) => {
+            // Treat unknown flags as part of the prompt for backwards compat.
+            Mode::OneShot {
+                prompt: args.rest.join(" "),
+            }
+        }
     }
 }
 

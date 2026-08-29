@@ -371,6 +371,7 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
     Ok(messages)
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_session_state(
     path: &Path,
 ) -> io::Result<std::collections::HashMap<String, String>> {

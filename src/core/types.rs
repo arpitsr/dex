@@ -13,6 +13,7 @@ pub(crate) struct Skill {
 /// A single streamed line destined for the UI transcript. Plain text (no
 /// ANSI) so the UI applies its own styling. Ratatui-agnostic.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SinkLine {
     Assistant(String),
     ToolInput(String),

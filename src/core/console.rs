@@ -12,6 +12,7 @@ pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+#[allow(dead_code)]
 pub(crate) fn request_cancel() {
     CANCEL_REQUESTED.store(true, Ordering::SeqCst);
 }
@@ -20,6 +21,7 @@ pub(crate) fn take_cancel_requested() -> bool {
     CANCEL_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
+#[allow(dead_code)]
 pub(crate) fn cancel_requested() -> bool {
     CANCEL_REQUESTED.load(Ordering::SeqCst)
 }
@@ -108,6 +110,7 @@ impl Clone for Console {
 }
 
 impl Console {
+    #[allow(dead_code)]
     pub(crate) fn new(
         sink: mpsc::Sender<SinkLine>,
         approval: mpsc::Sender<ApprovalRequest>,
