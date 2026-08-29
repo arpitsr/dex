@@ -85,6 +85,10 @@ pub(crate) struct Console {
     sink: Option<mpsc::Sender<SinkLine>>,
     approval: Option<mpsc::Sender<ApprovalRequest>>,
     session_approvals: Mutex<Option<HashSet<String>>>,
+    /// When true, the daemon handles approvals remotely via SSE instead of
+    /// prompting on stdin. The approval channel is still used to send requests;
+    /// a separate mechanism resolves them when the client POSTs back.
+    pub(crate) remote_approval: bool,
 }
 
 impl Clone for Console {
@@ -98,6 +102,7 @@ impl Clone for Console {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
             ),
+            remote_approval: self.remote_approval,
         }
     }
 }
@@ -111,6 +116,7 @@ impl Console {
             sink: Some(sink),
             approval: Some(approval),
             session_approvals: Mutex::new(None),
+            remote_approval: false,
         }
     }
 
@@ -121,6 +127,20 @@ impl Console {
             sink: None,
             approval: None,
             session_approvals: Mutex::new(None),
+            remote_approval: false,
+        }
+    }
+
+    /// Create a console for the daemon that handles approvals remotely.
+    pub(crate) fn daemon(
+        sink: mpsc::Sender<SinkLine>,
+        approval: mpsc::Sender<ApprovalRequest>,
+    ) -> Self {
+        Self {
+            sink: Some(sink),
+            approval: Some(approval),
+            session_approvals: Mutex::new(None),
+            remote_approval: true,
         }
     }
 

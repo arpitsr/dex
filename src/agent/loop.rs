@@ -64,6 +64,31 @@ pub(crate) fn approve_tool(
     if console.session_approved(name) {
         return true;
     }
+    // Remote approval: daemon sends the request via SSE and blocks for the
+    // client's POST response. We skip the stdin terminal check entirely.
+    if console.remote_approval {
+        if let Some(approval_sink) = console.approval() {
+            let (response_tx, response_rx) = mpsc::channel();
+            if approval_sink
+                .send(ApprovalRequest {
+                    name: name.to_string(),
+                    input: input.to_string(),
+                    response: response_tx,
+                })
+                .is_ok()
+            {
+                return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
+                    ApprovalDecision::Once => true,
+                    ApprovalDecision::Session => {
+                        console.record_session_approval(name);
+                        true
+                    }
+                    ApprovalDecision::Deny => false,
+                };
+            }
+        }
+        return false;
+    }
     if !io::stdin().is_terminal() {
         return false;
     }
