@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 /// A small UTF-8-aware multiline editor used by the terminal UI.
-pub(super) struct InputField {
+pub(crate) struct InputField {
     pub(super) lines: Vec<String>,
     pub(super) row: usize,
     pub(super) col: usize,

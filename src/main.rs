@@ -164,54 +164,66 @@ fn run_interactive() {
     }
 }
 
-fn main() {
-    install_sigint_handler();
-    let args = cli::parse_args();
+/// Start the daemon server on a background thread, returns the address.
+fn start_daemon_background() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind random port");
+    let addr = listener.local_addr().expect("failed to get local addr");
+    drop(listener); // free the port for axum
 
-    // Check for --daemon flag.
-    if args.rest.first().map(|s| s.as_str()) == Some("--daemon") {
-        let addr: std::net::SocketAddr = args
-            .rest
-            .get(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(([127, 0, 0, 1], 8420).into());
+    std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         rt.block_on(async {
             if let Err(e) = daemon::run_daemon(addr).await {
                 eprintln!("daemon error: {e}");
-                std::process::exit(1);
             }
         });
-        return;
-    }
+    });
 
-    // Check for --connect flag.
-    if args.rest.first().map(|s| s.as_str()) == Some("--connect") {
-        let daemon_url = args
-            .rest
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| "http://127.0.0.1:8420".to_string());
-        // Re-parse args without the --connect and url from rest.
-        let mut client_args = args.clone();
-        client_args.rest = args.rest[2..].to_vec();
-        if let Err(e) = client::run_client(&daemon_url, &client_args) {
-            eprintln!("client error: {e}");
-            std::process::exit(1);
-        }
-        return;
-    }
+    // Give the server a moment to start.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    addr
+}
 
-    if args.rest.len() == 1 && args.rest[0] == "--tool" {
-        run_interactive();
-    } else if !args.rest.is_empty() {
-        let prompt = args.rest.join(" ");
-        if let Err(e) = run_one_shot(&prompt, &args) {
-            eprintln!("agent error: {}", e);
-            std::process::exit(1);
+fn main() {
+    install_sigint_handler();
+    let args = cli::parse_args();
+    let mode = cli::resolve_mode(&args);
+
+    match mode {
+        Mode::Serve { port } => {
+            let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(async {
+                if let Err(e) = daemon::run_daemon(addr).await {
+                    eprintln!("daemon error: {e}");
+                    std::process::exit(1);
+                }
+            });
         }
-    } else if let Err(e) = ui::run_ratatui_repl(&args) {
-        eprintln!("ui error: {}", e);
-        std::process::exit(1);
+        Mode::Connect { url } => {
+            // TUI connected to a remote daemon.
+            if let Err(e) = ui::run_ratatui_repl_with_remote(&args, &url) {
+                eprintln!("ui error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::Default => {
+            // Start server in background, then launch TUI connected to it.
+            let addr = start_daemon_background();
+            let url = format!("http://{addr}");
+            if let Err(e) = ui::run_ratatui_repl_with_remote(&args, &url) {
+                eprintln!("ui error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::OneShot { prompt } => {
+            if let Err(e) = run_one_shot(&prompt, &args) {
+                eprintln!("agent error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::Tool => {
+            run_interactive();
+        }
     }
 }
