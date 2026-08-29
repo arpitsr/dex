@@ -1,8 +1,11 @@
 mod agent;
 mod cli;
+mod client;
 mod config;
 mod core;
+mod daemon;
 mod llm;
+mod protocol;
 mod session;
 mod skills;
 mod tools;
@@ -164,6 +167,41 @@ fn run_interactive() {
 fn main() {
     install_sigint_handler();
     let args = cli::parse_args();
+
+    // Check for --daemon flag.
+    if args.rest.first().map(|s| s.as_str()) == Some("--daemon") {
+        let addr: std::net::SocketAddr = args
+            .rest
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(([127, 0, 0, 1], 8420).into());
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(async {
+            if let Err(e) = daemon::run_daemon(addr).await {
+                eprintln!("daemon error: {e}");
+                std::process::exit(1);
+            }
+        });
+        return;
+    }
+
+    // Check for --connect flag.
+    if args.rest.first().map(|s| s.as_str()) == Some("--connect") {
+        let daemon_url = args
+            .rest
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "http://127.0.0.1:8420".to_string());
+        // Re-parse args without the --connect and url from rest.
+        let mut client_args = args.clone();
+        client_args.rest = args.rest[2..].to_vec();
+        if let Err(e) = client::run_client(&daemon_url, &client_args) {
+            eprintln!("client error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if args.rest.len() == 1 && args.rest[0] == "--tool" {
         run_interactive();
     } else if !args.rest.is_empty() {
