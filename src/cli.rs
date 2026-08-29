@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::core::types::PermissionMode;
 
+#[derive(Clone)]
 pub(crate) struct Args {
     pub base_url: Option<String>,
     pub model: Option<String>,
