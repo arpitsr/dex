@@ -1,3 +1,5 @@
+use std::io::{self, BufRead};
+
 use crate::protocol::*;
 
 /// HTTP client for communicating with the ak daemon.
@@ -53,11 +55,16 @@ impl DaemonClient {
         Ok(sessions)
     }
 
-    /// Submit a chat prompt and collect all streamed events.
-    pub fn chat(
+    /// Submit a chat prompt and process events as they arrive.
+    ///
+    /// When an `ApprovalRequired` event is received, `on_approval` is called
+    /// with the request details. The callback should return the user's decision.
+    /// This allows interactive approval during a streaming turn.
+    pub fn chat_with_approval(
         &self,
         session_id: &str,
         prompt: &str,
+        mut on_approval: impl FnMut(&str, &str) -> ApprovalDecision,
     ) -> Result<Vec<StreamEvent>, Box<dyn std::error::Error>> {
         let url = format!("{}/api/sessions/{}/chat", self.base_url, session_id);
 
@@ -70,32 +77,56 @@ impl DaemonClient {
             })
             .send()?;
 
-        let text = response.text()?;
         let mut events = Vec::new();
+        let mut reader = io::BufReader::new(response);
+        let mut line = String::new();
 
-        // Parse SSE events from the response body.
-        for block in text.split("\n\n") {
-            let data: String = block
-                .lines()
-                .filter(|line| line.starts_with("data: "))
-                .map(|line| &line[6..])
-                .collect::<Vec<_>>()
-                .join("\n");
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
+                Err(e) => return Err(e.into()),
+            }
 
-            if data.is_empty() || data == "ping" {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
 
-            if let Ok(event) = serde_json::from_str::<StreamEvent>(&data) {
-                events.push(event);
+            let data = if let Some(rest) = trimmed.strip_prefix("data: ") {
+                rest
+            } else {
+                continue;
+            };
+
+            if data == "ping" {
+                continue;
             }
+
+            let event: StreamEvent = match serde_json::from_str(data) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            // Handle approval requests interactively.
+            if let StreamEvent::ApprovalRequired {
+                request_id: _,
+                ref name,
+                ref input,
+            } = event
+            {
+                let decision = on_approval(name, input);
+                self.approve(session_id, decision)?;
+            }
+
+            events.push(event);
         }
 
         Ok(events)
     }
 
     /// Send an approval decision for a pending tool execution.
-    #[allow(dead_code)]
     pub fn approve(
         &self,
         session_id: &str,
@@ -112,7 +143,6 @@ impl DaemonClient {
     }
 
     /// Cancel the active turn for a session.
-    #[allow(dead_code)]
     pub fn cancel(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.http
             .post(format!(

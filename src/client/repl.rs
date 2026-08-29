@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use crate::protocol::StreamEvent;
+use crate::protocol::{ApprovalDecision, StreamEvent};
 
 use super::http::DaemonClient;
 
@@ -9,7 +9,6 @@ pub(crate) fn one_shot(
     client: &DaemonClient,
     prompt: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Create a session.
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -17,8 +16,18 @@ pub(crate) fn one_shot(
 
     eprintln!("session: {}", session.session_id);
 
-    // Get the response.
-    let events = client.chat(&session.session_id, prompt)?;
+    let events = client.chat_with_approval(&session.session_id, prompt, |name, input| {
+        eprintln!("\n  Approve {name}? ({input})");
+        eprint!("  [y/N/s(session)] ");
+        io::stderr().flush().ok();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok();
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => ApprovalDecision::AllowOnce,
+            "s" | "session" => ApprovalDecision::AllowSession,
+            _ => ApprovalDecision::Deny,
+        }
+    })?;
 
     for event in &events {
         match event {
@@ -56,7 +65,6 @@ pub(crate) fn one_shot(
 
 /// Interactive REPL mode.
 pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::Error>> {
-    // Create a session.
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -73,7 +81,7 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
 
         let mut input = String::new();
         match stdin.read_line(&mut input) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
                 eprintln!("read error: {e}");
@@ -104,9 +112,27 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
             }
             continue;
         }
+        if input == "/cancel" {
+            if let Err(e) = client.cancel(&session.session_id) {
+                eprintln!("error cancelling: {e}");
+            } else {
+                println!("cancel sent");
+            }
+            continue;
+        }
 
-        // Get the response.
-        let events = match client.chat(&session.session_id, input) {
+        let events = match client.chat_with_approval(&session.session_id, input, |name, input| {
+            eprintln!("\n  Approve {name}? ({input})");
+            eprint!("  [y/N/s(session)] ");
+            io::stderr().flush().ok();
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer).ok();
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => ApprovalDecision::AllowOnce,
+                "s" | "session" => ApprovalDecision::AllowSession,
+                _ => ApprovalDecision::Deny,
+            }
+        }) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -135,10 +161,10 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
                     eprintln!("\nerror: {error}");
                 }
                 StreamEvent::System(msg) => {
-                    eprintln!("\n[system] {msg}");
+                    eprintln!("[system] {msg}");
                 }
                 StreamEvent::Error(msg) => {
-                    eprintln!("\n[error] {msg}");
+                    eprintln!("[error] {msg}");
                 }
                 _ => {}
             }
