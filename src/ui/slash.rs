@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
 
-use crate::{ChatMessage, Provider, Session};
+use crate::core::types::{ChatMessage, Provider};
+use crate::session::Session;
 
 use super::{push_info, push_transcript_gap, App, InputField};
 
@@ -147,7 +148,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 Ok(session) => {
                     let loaded = session
                         .path()
-                        .and_then(|p| crate::load_messages_from_session(p).ok())
+                        .and_then(|p| crate::session::load_messages_from_session(p).ok())
                         .unwrap_or_default();
                     let system = app.messages.first().cloned();
                     app.messages = loaded;

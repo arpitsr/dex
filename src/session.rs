@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ChatMessage;
+use crate::core::types::ChatMessage;
 
 const SESSION_VERSION: u32 = 1;
 

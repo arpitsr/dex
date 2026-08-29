@@ -18,10 +18,10 @@ pub(crate) struct GlobalCancellation;
 
 impl CancellationSource for GlobalCancellation {
     fn is_cancelled(&self) -> bool {
-        crate::cancel_requested()
+        crate::core::console::cancel_requested()
     }
     fn take_cancelled(&self) -> bool {
-        crate::take_cancel_requested()
+        crate::core::console::take_cancel_requested()
     }
 }
 

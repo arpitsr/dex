@@ -25,7 +25,7 @@ pub(crate) fn discover_capabilities(config: &LlmConfig) -> ModelCapabilities {
     ModelCapabilities {
         streaming: true,
         tools: true,
-        responses_api: matches!(config.api, crate::ApiProtocol::Responses),
+        responses_api: matches!(config.api, crate::core::types::ApiProtocol::Responses),
     }
 }
 

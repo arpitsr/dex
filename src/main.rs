@@ -8,19 +8,17 @@ mod skills;
 mod tools;
 mod ui;
 
-pub(crate) use agent::compaction::*;
-pub(crate) use agent::r#loop::*;
-pub(crate) use agent::state::*;
-pub(crate) use core::console::*;
-pub(crate) use core::types::*;
-pub(crate) use llm::client::*;
-pub(crate) use llm::config::*;
-pub(crate) use llm::prompt::*;
-pub(crate) use skills::*;
-
 use cli::*;
 use session::*;
 use tools::*;
+
+use crate::agent::r#loop::{approve_tool, process_turn};
+use crate::agent::state::ToolState;
+use crate::core::console::install_sigint_handler;
+use crate::core::types::{ChatMessage, PermissionMode};
+use crate::llm::config::{load_file_config, permission_from_env_or_file, LlmConfig};
+use crate::llm::prompt::system_prompt;
+use crate::skills::{discover_skills, skill_dirs};
 
 use serde_json::{json, Map, Value};
 use std::env;
@@ -80,7 +78,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     }
     messages.push(user);
     let mut state = ToolState::load();
-    let console = crate::Console::none();
+    let console = crate::core::console::Console::none();
     let result = process_turn(
         &config,
         &mut messages,
@@ -145,7 +143,12 @@ fn run_interactive() {
             None => Map::new(),
         };
         let input = serde_json::to_string(&args).unwrap_or_default();
-        let result = if !approve_tool(permission, name, &input, &crate::Console::none()) {
+        let result = if !approve_tool(
+            permission,
+            name,
+            &input,
+            &crate::core::console::Console::none(),
+        ) {
             json!({"err": format!("permission denied for tool '{}'", name)})
         } else {
             match execute(name, &args) {

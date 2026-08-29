@@ -199,7 +199,7 @@ fn read_limited<R: Read>(mut reader: R, limit: usize) -> Vec<u8> {
 }
 
 pub(crate) fn cancellation_requested() -> bool {
-    crate::take_cancel_requested()
+    crate::core::console::take_cancel_requested()
 }
 
 fn run_bash(command: &str) -> Result<String, ToolError> {

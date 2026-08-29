@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use crate::PermissionMode;
+use crate::core::types::PermissionMode;
 
 pub(crate) struct Args {
     pub base_url: Option<String>,
