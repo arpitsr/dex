@@ -16,14 +16,15 @@ pub struct CreateSessionResponse {
 
 /// Summary of a session for listing. Constructed via serde from the
 /// daemon's `GET /api/sessions` response.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
     pub path: String,
     pub name: Option<String>,
     pub cwd: String,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub message_count: usize,
 }
 

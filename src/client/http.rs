@@ -163,11 +163,12 @@ impl DaemonClient {
                 continue;
             };
 
-            if let StreamEvent::ApprovalRequired { ref request_id, .. } = event {
-                // The callback decides (it may block waiting for the user);
-                // a `None` default denies the tool.
-                let decision = on_event(event.clone()).unwrap_or(ApprovalDecision::Deny);
-                if let Err(e) = self.approve(session_id, request_id, decision) {
+            if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
+                // Extract request_id before moving event into the callback to
+                // avoid cloning the whole event.
+                let request_id = request_id.clone();
+                let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
+                if let Err(e) = self.approve(session_id, &request_id, decision) {
                     // Surface but do not kill the stream: the daemon denies
                     // pending approvals on turn teardown anyway.
                     eprintln!("[approval] failed to deliver decision: {e}");
