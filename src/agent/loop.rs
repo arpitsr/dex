@@ -336,8 +336,15 @@ pub(crate) fn process_turn(
                 }
                 Err(e) => return Err(e),
             };
-        if usage.is_some() {
-            last_usage = usage;
+        if let Some(tokens) = usage {
+            last_usage = Some(tokens);
+            // Persist promptly so a cancelled turn still keeps an accurate
+            // context figure, and push it to the UI: the status bar tracks
+            // usage after every LLM call, not once per turn.
+            state.last_usage = last_usage;
+            if let Some(sink) = console.sink() {
+                let _ = sink.send(SinkLine::Usage(tokens));
+            }
         }
         // Compact when either the message count or an estimated token
         // budget is exceeded (API-reported usage takes precedence).
@@ -362,7 +369,12 @@ pub(crate) fn process_turn(
                 let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 calls
                     .iter()
-                    .map(|call| execute_tool_call(call, config.permission, cancel, console))
+                    .map(|call| {
+                        let started = Instant::now();
+                        let (name, input, outcome) =
+                            execute_tool_call(call, config.permission, cancel, console);
+                        (name, input, outcome, started.elapsed())
+                    })
                     .collect()
             } else {
                 calls
@@ -373,7 +385,10 @@ pub(crate) fn process_turn(
                         let console = console.clone();
                         let cancel = cancel.clone();
                         thread::spawn(move || {
-                            execute_tool_call(&call, permission, &cancel, &console)
+                            let started = Instant::now();
+                            let (name, input, outcome) =
+                                execute_tool_call(&call, permission, &cancel, &console);
+                            (name, input, outcome, started.elapsed())
                         })
                     })
                     .collect::<Vec<_>>()
@@ -387,13 +402,14 @@ pub(crate) fn process_turn(
                                     text: "Error: tool worker panicked".into(),
                                     ok: false,
                                 },
+                                Duration::ZERO,
                             )
                         })
                     })
                     .collect()
             };
 
-            for (call, (name, input, outcome)) in calls.iter().zip(results) {
+            for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
                 let cache_key = format!(
                     "{}:{}:{}{}",
                     env::current_dir()
@@ -460,7 +476,7 @@ pub(crate) fn process_turn(
                     outcome.text
                 };
                 if let Some(sink) = console.sink() {
-                    let mut summary = tool_result_summary(&name, &result, ok);
+                    let mut summary = tool_result_summary(&name, &input, &result, ok);
                     if cache_hit {
                         summary = format!("cached · {summary}");
                     }
@@ -469,13 +485,14 @@ pub(crate) fn process_turn(
                     // already shows the first line, so preview continues
                     // after it. Failed calls always continue past the first
                     // line to expose the actual error detail.
-                    let counts_only = matches!(name.as_str(), "read" | "grep" | "find");
+                    let counts_only = matches!(name.as_str(), "read" | "grep" | "find" | "chain");
                     let skip_first = !counts_only || !ok;
                     let _ = sink.send(SinkLine::ToolOutput {
                         name: name.clone(),
                         summary,
                         success: ok,
                         preview: tool_result_preview(&result, 3, skip_first),
+                        duration: elapsed.as_secs_f64(),
                     });
                 } else {
                     with_console(console.sink().is_some(), || {
@@ -712,8 +729,9 @@ mod tests {
         );
         assert_eq!(result.unwrap(), "done");
 
-        let outputs: Vec<SinkLine> = sink_rx
-            .try_iter()
+        let lines: Vec<SinkLine> = sink_rx.try_iter().collect();
+        let outputs: Vec<&SinkLine> = lines
+            .iter()
             .filter(|line| matches!(line, SinkLine::ToolOutput { .. }))
             .collect();
         let [SinkLine::ToolOutput {
@@ -721,6 +739,7 @@ mod tests {
             summary,
             success,
             preview,
+            ..
         }] = outputs.as_slice()
         else {
             panic!("expected exactly one tool output, got {outputs:?}");
@@ -729,7 +748,7 @@ mod tests {
         assert!(success);
         // Summary carries the first output line; the preview continues after
         // it instead of repeating it.
-        assert_eq!(summary, "ok · line-one");
+        assert_eq!(summary, "line-one");
         assert_eq!(
             preview,
             &[
@@ -738,5 +757,16 @@ mod tests {
                 "line-four".to_string()
             ]
         );
+
+        // The mock makes two LLM calls (tool round, then answer), each
+        // reporting usage: the status bar must get a Usage event per call.
+        let usage_events: Vec<u64> = lines
+            .iter()
+            .filter_map(|line| match line {
+                SinkLine::Usage(tokens) => Some(*tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage_events, vec![1, 1]);
     }
 }

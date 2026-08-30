@@ -303,8 +303,18 @@ impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let visible = area.height as usize;
         let mut display: Vec<Line<'static>> = Vec::new();
-        for line in &app.transcript {
-            display.extend(wrap_line_display(line, area.width));
+        for (idx, block) in app.transcript.iter().enumerate() {
+            if idx > 0 {
+                // Single canonical gutter between any two semantic blocks.
+                display.push(Line::default());
+            }
+            for line in block.lines() {
+                display.extend(wrap_line_display(line, area.width));
+                // User block lines carry a background; the wrapping routine
+                // fills the remainder of the row with that background. As
+                // with the pre-block transcript (`Line::from(edge_pad)`), the
+                // visual result is one row per logical line, no extra wraps.
+            }
         }
         let total = display.len();
         let max_scroll = (total.saturating_sub(visible)) as u16;
@@ -764,9 +774,11 @@ mod tests {
     fn test_app() -> super::super::App {
         let cwd = "/tmp/oye-ui-test".to_string();
         super::super::App {
-            transcript: vec![super::super::indent_transcript_line(Line::from(
-                "hello from the transcript — this line is intentionally long enough to wrap",
-            ))],
+            transcript: vec![super::super::TranscriptBlock::Assistant(vec![
+                super::super::indent_transcript_line(Line::from(
+                    "hello from the transcript — this line is intentionally long enough to wrap",
+                )),
+            ])],
             input: InputField::new(),
             config: super::super::LlmConfig {
                 provider: Provider::OpenCode,
@@ -811,6 +823,7 @@ mod tests {
             history_index: None,
             history_draft: String::new(),
             slash_selected: 0,
+            assistant_open: false,
         }
     }
 
@@ -942,6 +955,172 @@ mod tests {
     }
 
     #[test]
+    fn probe_gutter_dump() {
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut app = test_app();
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput(
+                "bash grep -rn \"mod tests\" src | head".into(),
+            ),
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "bash".into(),
+                summary: "v src/agent/loop.rs:556:mod tests {".into(),
+                success: true,
+                preview: vec!["src/tools/mod.rs:1117:mod tests {".into()],
+                duration: 0.0,
+            },
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant(
+                "Looked at src/skills.rs and every place it's wired in.\n\n## What's correct\n\n- **Discovery** ( src/skills.rs:61 ): deterministic entries sorted per dir".into(),
+            ),
+        );
+        for (bidx, block) in app.transcript.iter().enumerate() {
+            for (lidx, line) in block.lines().iter().enumerate() {
+                let spans: Vec<String> = line
+                    .spans
+                    .iter()
+                    .map(|s| format!("'{}/bg={:?}'", s.content, s.style.bg))
+                    .collect();
+                println!("T{bidx}.{lidx}: {}", spans.join(" + "));
+            }
+        }
+        for (bidx, block) in app.transcript.iter().enumerate() {
+            for (lidx, line) in block.lines().iter().enumerate() {
+                let wrapped = wrap_line_display(line, 100);
+                for (r, row) in wrapped.iter().enumerate() {
+                    let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+                    println!("W{bidx}.{lidx}.{r}: '{text}'");
+                }
+            }
+        }
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let mut row = String::new();
+            for x in 0..buffer.area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}|{row}|", y);
+        }
+
+        let mut display: Vec<Line<'static>> = Vec::new();
+        for (idx, block) in app.transcript.iter().enumerate() {
+            if idx > 0 {
+                display.push(Line::default());
+            }
+            for line in block.lines() {
+                display.extend(wrap_line_display(line, 100));
+            }
+        }
+        for (idx, line) in display.iter().enumerate() {
+            let first = line.spans.first().map(|s| format!("'{}'", s.content));
+            let count = line.spans.len();
+            println!("D{idx}: spans={count} first={first:?}");
+        }
+        for pass in 0..3 {
+            let mut t = ratatui::Terminal::new(TestBackend::new(100, 12)).expect("t2");
+            t.draw(|f| {
+                let p = Paragraph::new(display.clone())
+                    .style(Style::default().fg(Color::Gray))
+                    .scroll((0, 0));
+                f.render_widget(p, f.area());
+            })
+            .expect("draw2");
+            let b2 = t.backend().buffer();
+            for y in [4u16, 5] {
+                let mut row = String::new();
+                for x in 0..6u16 {
+                    row.push_str(b2[(x, y)].symbol());
+                }
+                println!("PASS{pass} row{y} first6: '{row}'");
+            }
+        }
+        for (idx, line) in display.iter().enumerate() {
+            let heads: Vec<String> = line
+                .spans
+                .iter()
+                .take(4)
+                .map(|s| {
+                    format!(
+                        "'{}'/fg={:?}/bg={:?}/mod={:?}/u={:?}",
+                        s.content,
+                        s.style.fg,
+                        s.style.bg,
+                        s.style.add_modifier,
+                        s.style.underline_color
+                    )
+                })
+                .collect();
+            println!("S{idx}: {}", heads.join("+"));
+        }
+
+        let cases: Vec<(&str, Vec<Line<'static>>, bool)> = vec![
+            ("s3alone", vec![display[3].clone()], false),
+            ("s5alone", vec![display[5].clone()], false),
+            ("s3s5", vec![display[3].clone(), display[5].clone()], false),
+            ("plain", vec![Line::from(" plain")], false),
+            (
+                "whitespan",
+                vec![Line::from(vec![Span::raw(" "), Span::raw("abc")])],
+                false,
+            ),
+            (
+                "graysecond",
+                vec![Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled("abc", Style::default().fg(Color::White)),
+                ])],
+                false,
+            ),
+            (
+                "s4s5_sc",
+                vec![display[4].clone(), display[5].clone()],
+                true,
+            ),
+            (
+                "s4s5_nosc",
+                vec![display[4].clone(), display[5].clone()],
+                false,
+            ),
+            ("s5_sc", vec![display[5].clone()], true),
+            ("prefix5_sc", display[..5].to_vec(), true),
+            ("full_nosc", display.clone(), false),
+            ("full_sc", display.clone(), true),
+        ];
+        for (name, lines, use_scroll) in &cases {
+            let backend3 = TestBackend::new(100, 12);
+            let mut terminal3 = ratatui::Terminal::new(backend3).expect("t3");
+            terminal3
+                .draw(|f| {
+                    let mut p =
+                        Paragraph::new(lines.clone()).style(Style::default().fg(Color::Gray));
+                    if *use_scroll {
+                        p = p.scroll((0, 0));
+                    }
+                    f.render_widget(p, f.area());
+                })
+                .expect("draw3");
+            let b3 = terminal3.backend().buffer();
+            for y in 0..b3.area.height.min(6) {
+                let mut row = String::new();
+                for x in 0..b3.area.width.min(60) {
+                    row.push_str(b3[(x, y)].symbol());
+                }
+                println!("C{name} y{y}: '{row}'");
+            }
+        }
+    }
+
+    #[test]
     fn input_box_height_matches_wrapped_rows() {
         let area = Rect::new(0, 0, 80, 24);
         assert_eq!(
@@ -958,5 +1137,104 @@ mod tests {
             .0
             .len();
         assert_eq!(measured, rendered, "wrapped row counts must agree");
+    }
+
+    #[test]
+    fn assistant_text_is_gapped_after_tool_preview() {
+        // Gaps are now rendered between TranscriptBlocks, not stored as
+        // empty Lines. Verify the Tool and final Assistant are separate blocks
+        // and the rendered display (block gaps) contains a blank line between
+        // them – the exact bug that was missing before.
+        let mut app = test_app();
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash grep foo src".into()),
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "bash".into(),
+                summary: "v 1 match".into(),
+                success: true,
+                preview: vec!["src/main.rs:1:foo".into()],
+                duration: 0.0,
+            },
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("Looked at src/main.rs.".into()),
+        );
+
+        // Transcript: [Assistant(hello), Tool, Assistant(Looked at)]
+        assert_eq!(app.transcript.len(), 3);
+        assert!(matches!(
+            app.transcript[1],
+            super::super::TranscriptBlock::Tool { .. }
+        ));
+        assert!(matches!(
+            app.transcript[2],
+            super::super::TranscriptBlock::Assistant(_)
+        ));
+
+        // Build the same flattened display TranscriptView uses and assert a
+        // single blank Line between the tool and assistant blocks.
+        let mut display: Vec<Line<'static>> = Vec::new();
+        for (idx, block) in app.transcript.iter().enumerate() {
+            if idx > 0 {
+                display.push(Line::default());
+            }
+            for line in block.lines() {
+                display.extend(wrap_line_display(line, 100));
+            }
+        }
+        let assistant_display_idx = display
+            .iter()
+            .position(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("Looked at")
+            })
+            .expect("assistant in display");
+        assert!(
+            display[assistant_display_idx - 1].spans.is_empty(),
+            "expected a blank gap line before assistant text in rendered display, got {:?}",
+            display[assistant_display_idx - 1]
+        );
+    }
+
+    #[test]
+    fn consecutive_assistant_chunks_do_not_add_gaps() {
+        // Streaming coalesces consecutive Assistant SinkLines into the tail
+        // Assistant block; no inter-block gap must appear inside that block.
+        let mut app = test_app();
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("first".into()),
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("second".into()),
+        );
+        // [Assistant(hello)] + streamed Assistant => two blocks, tail holds both.
+        assert_eq!(app.transcript.len(), 2);
+        let tail = match &app.transcript[1] {
+            super::super::TranscriptBlock::Assistant(lines) => lines,
+            other => panic!("expected tail Assistant block, got {other:?}"),
+        };
+        let first_pos = tail
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("first")))
+            .expect("first");
+        let second_pos = tail
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("second")))
+            .expect("second");
+        assert_eq!(
+            second_pos,
+            first_pos + 1,
+            "streamed assistant chunks must stay flush inside one block"
+        );
     }
 }

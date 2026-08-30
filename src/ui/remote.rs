@@ -152,6 +152,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         history_index: None,
         history_draft: String::new(),
         slash_selected: 0,
+        assistant_open: false,
     };
     push_info(
         &mut app,
@@ -267,6 +268,7 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             summary,
             success,
             preview,
+            duration,
         } => {
             append_sink_line(
                 &mut remote.app,
@@ -275,6 +277,7 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                     summary,
                     success,
                     preview,
+                    duration,
                 },
             );
         }
@@ -293,6 +296,11 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);
             }
+        }
+        StreamEvent::Usage { tokens } => {
+            // Live context usage: emitted by the daemon after every LLM call
+            // so the status bar updates mid-turn, not just at completion.
+            remote.app.tool_state.last_usage = Some(tokens);
         }
         StreamEvent::TurnFailed { error } => {
             append_sink_line(&mut remote.app, SinkLine::Error(error));
@@ -325,7 +333,6 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
             started.elapsed().as_secs_f64(),
             super::format_tokens(tokens)
         ));
-        super::push_transcript_gap(app);
     }
 }
 
@@ -605,9 +612,6 @@ impl RemoteApp {
 /// when the app should quit.
 fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
     let app = &mut remote.app;
-    if app.transcript.len() > 1 {
-        super::push_transcript_gap(app);
-    }
     match line {
         "/quit" => return true,
         "/clear" | "/new" => {
