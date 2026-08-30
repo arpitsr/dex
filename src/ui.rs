@@ -247,8 +247,12 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 Span::styled(format!(" {arg}"), Style::default().fg(Color::DarkGray)),
             ])));
         }
-        SinkLine::ToolOutput { name, summary } => {
-            let failed = summary.starts_with("failed ·");
+        SinkLine::ToolOutput {
+            name,
+            summary,
+            success,
+        } => {
+            let failed = !success;
             let color = if failed {
                 Color::LightRed
             } else {
