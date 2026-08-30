@@ -24,9 +24,14 @@ pub enum SinkLine {
         success: bool,
         /// A few informational output lines shown dim under the summary.
         preview: Vec<String>,
+        /// Wall-clock seconds the tool took; 0 when unknown.
+        duration: f64,
     },
     System(String),
     Error(String),
+    /// Prompt tokens reported by the provider after each LLM call, so the
+    /// status bar can track context usage live instead of once per turn.
+    Usage(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

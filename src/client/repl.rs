@@ -31,9 +31,15 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
             summary,
             success,
             preview,
+            duration,
         } => {
             let icon = if success { "✓" } else { "✗" };
-            eprintln!("  {icon} {name}: {summary}");
+            let timing = if duration > 0.0 {
+                format!(" ({})", crate::core::format::format_duration(duration))
+            } else {
+                String::new()
+            };
+            eprintln!("  {icon} {name}: {summary}{timing}");
             for line in preview {
                 eprintln!("      {line}");
             }
@@ -51,6 +57,7 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
             eprintln!("[error] {msg}");
         }
         StreamEvent::TurnComplete { .. } => {}
+        StreamEvent::Usage { .. } => {}
     }
     None
 }

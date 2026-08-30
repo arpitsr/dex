@@ -6,7 +6,7 @@ use std::fs;
 use crate::core::types::{ChatMessage, Provider};
 use crate::session::Session;
 
-use super::{push_info, push_transcript_gap, App, InputField};
+use super::{push_info, App, InputField};
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "Exit the REPL"),
@@ -98,10 +98,6 @@ pub(super) fn complete_slash(app: &mut App) -> bool {
 }
 
 pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
-    // Gap before command output so it reads as its own turn (pi-style).
-    if app.transcript.len() > 1 {
-        push_transcript_gap(app);
-    }
     match line {
         "/quit" => return true,
         "/clear" => {

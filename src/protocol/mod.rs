@@ -84,6 +84,9 @@ pub enum StreamEvent {
         /// A few informational output lines to show under the summary.
         #[serde(default)]
         preview: Vec<String>,
+        /// Wall-clock seconds the tool took; 0 when unknown.
+        #[serde(default)]
+        duration: f64,
     },
 
     /// The agent needs user approval for a tool.
@@ -106,6 +109,11 @@ pub enum StreamEvent {
     /// The turn failed.
     #[serde(rename = "turn_failed")]
     TurnFailed { error: String },
+
+    /// Prompt tokens reported by the provider after each LLM call within a
+    /// turn, letting the client render live context usage in its status bar.
+    #[serde(rename = "usage")]
+    Usage { tokens: u64 },
 
     /// A system message (e.g. compaction notice).
     #[serde(rename = "system")]

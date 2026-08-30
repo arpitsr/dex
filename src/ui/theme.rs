@@ -1,10 +1,11 @@
 //! Theme-aware surface colors for the TUI.
 //!
-//! Fixed RGB backgrounds bypass the terminal palette, so they clash the
-//! moment the user changes their terminal theme. Surface colors here instead
-//! come from the terminal palette (`Color::Indexed`) and, as a fallback for
-//! terminals that don't map the palette to the active theme, from a one-time
-//! query of the terminal's real background color (OSC 11) at startup.
+//! Fixed palette slots bypass the terminal's theme (the 256-color gray ramp
+//! is never remapped), so neutral grays clash with tinted backgrounds. Surface
+//! colors here are instead derived from the terminal's real background and
+//! foreground colors, queried once at startup (OSC 11): a surface is the
+//! background blended a step toward the foreground, so it keeps the theme's
+//! hue and always contrasts with text on it.
 
 use std::sync::OnceLock;
 
@@ -20,28 +21,68 @@ pub(crate) enum Background {
     Unknown,
 }
 
-/// BG for the composer, submitted prompts, and overlays: a "raised" surface.
-/// The palette slot is theme-mapped by the terminal; when the palette isn't
-/// theme-aware we derive a color one step away from the real background.
-pub(crate) fn surface_bg() -> Color {
-    static SURFACE: OnceLock<Color> = OnceLock::new();
-    *SURFACE.get_or_init(|| match background() {
-        Background::Light => Color::Indexed(254),
-        Background::Dark => Color::Indexed(236),
+/// The terminal's real colors, queried once via OSC 11 and memoized.
+struct Palette {
+    mode: ThemeMode,
+    background: (u8, u8, u8),
+    foreground: (u8, u8, u8),
+}
+
+fn palette() -> Option<&'static Palette> {
+    static PALETTE: OnceLock<Option<Palette>> = OnceLock::new();
+    PALETTE
+        .get_or_init(|| {
+            let p = color_palette(QueryOptions::default()).ok()?;
+            Some(Palette {
+                mode: p.theme_mode(),
+                background: p.background.scale_to_8bit(),
+                foreground: p.foreground.scale_to_8bit(),
+            })
+        })
+        .as_ref()
+}
+
+/// Blend `base` toward `toward` by `amount` (0.0 = base, 1.0 = toward).
+fn blend(base: (u8, u8, u8), toward: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
+    let mix = |b: u8, t: u8| (f32::from(b) + (f32::from(t) - f32::from(b)) * amount).round() as u8;
+    (
+        mix(base.0, toward.0),
+        mix(base.1, toward.1),
+        mix(base.2, toward.2),
+    )
+}
+
+/// A raised surface: the terminal's actual background lifted a step toward
+/// its foreground, so the hue matches the active theme. `amount` controls how
+/// far the surface sits above the background (larger = more prominent).
+fn raised(amount: f32) -> Color {
+    match palette() {
+        Some(p) => {
+            let (r, g, b) = blend(p.background, p.foreground, amount);
+            Color::Rgb(r, g, b)
+        }
         // No theme information at all: leave the background untouched so the
         // surface always blends with whatever the terminal paints.
+        None => Color::Reset,
+    }
+}
+
+/// BG for the composer, submitted prompts, and overlays: a "raised" surface.
+pub(crate) fn surface_bg() -> Color {
+    match background() {
+        Background::Dark => raised(0.10),
+        Background::Light => raised(0.06),
         Background::Unknown => Color::Reset,
-    })
+    }
 }
 
 /// Slightly stronger surface for popups so they read as floating above the UI.
 pub(crate) fn popup_bg() -> Color {
-    static POPUP: OnceLock<Color> = OnceLock::new();
-    *POPUP.get_or_init(|| match background() {
-        Background::Light => Color::Indexed(253),
-        Background::Dark => Color::Indexed(235),
+    match background() {
+        Background::Dark => raised(0.18),
+        Background::Light => raised(0.12),
         Background::Unknown => Color::Reset,
-    })
+    }
 }
 
 /// Foreground for prominent text on the composer/surface. For light themes
@@ -73,20 +114,19 @@ pub(crate) fn muted_fg() -> Color {
 }
 
 fn background() -> Background {
-    static BACKGROUND: OnceLock<Background> = OnceLock::new();
-    *BACKGROUND.get_or_init(detect_background)
-}
-
-/// One-time OSC 11 query of the terminal's actual background color. Called
-/// eagerly at TUI startup (before raw mode) and memoized for the process.
-pub(super) fn detect_background() -> Background {
-    match color_palette(QueryOptions::default()) {
-        Ok(palette) => match palette.theme_mode() {
+    match palette() {
+        Some(p) => match p.mode {
             ThemeMode::Dark => Background::Dark,
             ThemeMode::Light => Background::Light,
         },
-        Err(_) => Background::Unknown,
+        None => Background::Unknown,
     }
+}
+
+/// Warm the one-time OSC 11 query. Called eagerly at TUI startup (before raw
+/// mode) so later color lookups are pure memo hits.
+pub(super) fn detect_background() -> Background {
+    background()
 }
 
 #[cfg(test)]
@@ -96,11 +136,13 @@ mod tests {
     #[test]
     fn surfaces_are_consistent_with_background() {
         // Whatever the detected background, surfaces must resolve without
-        // panicking and stay on-theme (Reset/Indexed, never fixed RGB).
+        // panicking and stay on-theme: Reset when the theme is unknown, or
+        // RGB derived from the queried palette.
         for color in [surface_bg(), popup_bg()] {
             match color {
-                Color::Reset | Color::Indexed(_) => {}
-                other => panic!("fixed color leaks theme: {other:?}"),
+                Color::Reset => {}
+                Color::Rgb(..) if background() != Background::Unknown => {}
+                other => panic!("color leaks theme: {other:?}"),
             }
         }
         if background() == Background::Light {

@@ -40,11 +40,56 @@ const APPROVAL_HEIGHT: u16 = 11;
 /// Braille spinner frames, matching the headless console spinner.
 const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// A semantic transcript block. Gaps between blocks are **not** stored;
+/// they are inserted by `TranscriptView::render` (`ui/render.rs`) as a
+/// single blank `Line` between any two blocks. This makes gutter handling
+/// canonical and removes the need for ad-hoc `push_transcript_gap` /
+/// `in_assistant_stream` bookkeeping at every call site.
+#[derive(Debug)]
+pub(crate) enum TranscriptBlock {
+    User(Vec<Line<'static>>),
+    Assistant(Vec<Line<'static>>),
+    Tool {
+        input: Line<'static>,
+        output: Option<Line<'static>>,
+        preview: Vec<Line<'static>>,
+    },
+    System(Line<'static>),
+    Error(Line<'static>),
+    Info(Line<'static>),
+}
+
+impl TranscriptBlock {
+    /// Lines that belong to this block, in display order.
+    pub(crate) fn lines(&self) -> Vec<&Line<'static>> {
+        match self {
+            TranscriptBlock::User(lines) => lines.iter().collect(),
+            TranscriptBlock::Assistant(lines) => lines.iter().collect(),
+            TranscriptBlock::Tool {
+                input,
+                output,
+                preview,
+            } => {
+                let mut out = Vec::with_capacity(1 + output.is_some() as usize + preview.len());
+                out.push(input);
+                if let Some(o) = output {
+                    out.push(o);
+                }
+                out.extend(preview.iter());
+                out
+            }
+            TranscriptBlock::System(line) => vec![line],
+            TranscriptBlock::Error(line) => vec![line],
+            TranscriptBlock::Info(line) => vec![line],
+        }
+    }
+}
+
 /// The TUI application state. Rendering lives in `ui/render.rs` (`view`);
 /// turn execution lives either in the local engine or, in client-server
 /// mode, in `ui/remote.rs` which drives the same state from daemon events.
 pub(crate) struct App {
-    pub(crate) transcript: Vec<Line<'static>>,
+    pub(crate) transcript: Vec<TranscriptBlock>,
     pub(crate) input: InputField,
     pub(crate) config: LlmConfig,
     pub(crate) messages: Vec<crate::core::types::ChatMessage>,
@@ -74,6 +119,11 @@ pub(crate) struct App {
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: String,
     pub(crate) slash_selected: usize,
+    /// Whether the tail `Assistant` block is still open for streaming
+    /// coalescence. Tracked so an initial transcript block (e.g. in tests)
+    /// does not merge with the first streamed assistant turn; gaps remain
+    /// canonical between blocks.
+    pub(crate) assistant_open: bool,
 }
 
 impl App {
@@ -190,141 +240,162 @@ fn indent_transcript_line(mut line: Line<'static>) -> Line<'static> {
     line
 }
 
-fn push_transcript_gap(app: &mut App) {
-    if !app
-        .transcript
-        .last()
-        .is_some_and(|line| line.spans.is_empty())
-    {
-        app.transcript.push(Line::from(String::new()));
-    }
-}
-
 pub(super) fn push_info(app: &mut App, text: String) {
+    app.assistant_open = false;
     app.transcript
-        .push(indent_transcript_line(Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Cyan),
+        .push(TranscriptBlock::Info(indent_transcript_line(Line::from(
+            Span::styled(text, Style::default().fg(Color::Cyan)),
         ))));
 }
 
 /// Route a streamed console line into the transcript with the same styling
 /// the local engine uses, so remote and local turns look identical.
+/// Each `SinkLine` maps to one `TranscriptBlock` (or an extension of the
+/// tail `Assistant` block while streaming). No empty gap `Line`s are stored;
+/// `TranscriptView` inserts a single blank `Line` between any two blocks.
 pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
     match sl {
         SinkLine::Assistant(s) => {
             if s.trim().is_empty() {
-                push_transcript_gap(app);
-            } else {
-                if app
-                    .transcript
-                    .last()
-                    .is_some_and(|line| is_tool_line(line) || is_user_line(line))
-                {
-                    push_transcript_gap(app);
+                // Blank inside the current assistant message (e.g. streaming
+                // blank line between paragraphs). Keep it inside the tail
+                // Assistant block so the inter-block gutter remains canonical.
+                if app.assistant_open {
+                    if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
+                        lines.push(Line::default());
+                    }
                 }
-                for line in render::markdown_lines(s.trim_end()) {
-                    app.transcript.push(indent_transcript_line(line));
+                app.autoscroll = true;
+                return;
+            }
+            let new_lines: Vec<Line<'static>> = render::markdown_lines(s.trim_end())
+                .into_iter()
+                .map(indent_transcript_line)
+                .collect();
+            if app.assistant_open {
+                if let Some(TranscriptBlock::Assistant(existing)) = app.transcript.last_mut() {
+                    existing.extend(new_lines);
+                    app.autoscroll = true;
+                    return;
                 }
             }
+            app.transcript.push(TranscriptBlock::Assistant(new_lines));
+            app.assistant_open = true;
+            app.autoscroll = true;
+            return;
         }
         SinkLine::ToolInput(s) => {
             dim_intermediate_assistant_block(app);
-            if app
-                .transcript
-                .last()
-                .is_some_and(|line| !line.spans.is_empty())
-            {
-                push_transcript_gap(app);
-            }
+            app.assistant_open = false;
             let mut it = s.splitn(2, ' ');
             let name = it.next().unwrap_or("").to_string();
             let arg = it.next().unwrap_or("").to_string();
             app.active_tool = Some(name.clone());
-            app.transcript.push(indent_transcript_line(Line::from(vec![
+            let input = indent_transcript_line(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Yellow)),
                 Span::styled(name, Style::default().fg(Color::Yellow)),
                 Span::styled(format!(" {arg}"), Style::default().fg(Color::DarkGray)),
-            ])));
+            ]));
+            app.transcript.push(TranscriptBlock::Tool {
+                input,
+                output: None,
+                preview: Vec::new(),
+            });
         }
         SinkLine::ToolOutput {
-            name,
+            name: _,
             summary,
             success,
             preview,
+            duration,
         } => {
+            // The ▸ line above already names the tool; the └ line leads with
+            // the outcome (glyph + summary) and trails timing in dim.
             let failed = !success;
             let color = if failed {
                 Color::LightRed
             } else {
                 Color::LightGreen
             };
-            app.transcript.push(indent_transcript_line(Line::from(vec![
+            let mut spans = vec![
                 Span::styled("└ ", Style::default().fg(color)),
                 Span::styled(if failed { "✗ " } else { "✓ " }, Style::default().fg(color)),
-                Span::styled(name, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!(" {summary}"), Style::default().fg(color)),
-            ])));
-            push_tool_preview(&mut app.transcript, &preview);
-        }
-        SinkLine::System(s) => app.transcript.push(indent_transcript_line(Line::from(vec![
-            Span::styled("· ", Style::default().fg(Color::DarkGray)),
-            Span::styled(s, Style::default().fg(Color::DarkGray)),
-        ]))),
-        SinkLine::Error(s) => {
-            if app
-                .transcript
-                .last()
-                .is_some_and(|line| !line.spans.is_empty())
-            {
-                push_transcript_gap(app);
+                Span::styled(summary, Style::default().fg(color)),
+            ];
+            if duration > 0.0 {
+                spans.push(Span::styled(
+                    format!(" · {}", crate::core::format::format_duration(duration)),
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
-            app.transcript.push(indent_transcript_line(Line::from(vec![
-                Span::styled("! ", Style::default().fg(Color::Red)),
-                Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
-            ])));
+            let output = indent_transcript_line(Line::from(spans));
+            let preview_lines: Vec<Line<'static>> = preview
+                .iter()
+                .map(|line| {
+                    indent_transcript_line(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )))
+                })
+                .collect();
+            app.assistant_open = false;
+            // Complete the tool block started by ToolInput if it is still open.
+            if let Some(TranscriptBlock::Tool {
+                output: out,
+                preview: prev,
+                ..
+            }) = app.transcript.last_mut()
+            {
+                if out.is_none() {
+                    *out = Some(output);
+                    *prev = preview_lines;
+                    app.autoscroll = true;
+                    return;
+                }
+            }
+            // Fallback: no open ToolInput (e.g. replay); synthesize a block.
+            app.transcript.push(TranscriptBlock::Tool {
+                input: indent_transcript_line(Line::from(Span::styled(
+                    "▸ tool",
+                    Style::default().fg(Color::Yellow),
+                ))),
+                output: Some(output),
+                preview: preview_lines,
+            });
+        }
+        SinkLine::System(s) => {
+            app.assistant_open = false;
+            app.transcript
+                .push(TranscriptBlock::System(indent_transcript_line(Line::from(
+                    vec![
+                        Span::styled("· ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(s, Style::default().fg(Color::DarkGray)),
+                    ],
+                ))));
+        }
+        // Usage updates flow into the status bar via StreamEvent::Usage in
+        // the remote handler, not into the transcript.
+        SinkLine::Usage(_) => {}
+        SinkLine::Error(s) => {
+            app.assistant_open = false;
+            app.transcript
+                .push(TranscriptBlock::Error(indent_transcript_line(Line::from(
+                    vec![
+                        Span::styled("! ", Style::default().fg(Color::Red)),
+                        Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
+                    ],
+                ))));
         }
     }
     app.autoscroll = true;
 }
 
-fn is_tool_line(line: &Line<'static>) -> bool {
-    line.spans.iter().any(|span| {
-        span.content.as_ref().starts_with("▸") || span.content.as_ref().starts_with("└")
-    })
-}
-
-/// Render a tool result's informational preview lines: indented under the
-/// `└` result line and dimmed, so they read as detail rather than dialogue.
-fn push_tool_preview(transcript: &mut Vec<Line<'static>>, preview: &[String]) {
-    for line in preview {
-        transcript.push(indent_transcript_line(Line::from(Span::styled(
-            format!("  {line}"),
-            Style::default().fg(Color::DarkGray),
-        ))));
-    }
-}
-
-fn is_user_line(line: &Line<'static>) -> bool {
-    line.spans.iter().any(|span| span.style.bg.is_some())
-}
-
-fn is_assistant_line(line: &Line<'static>) -> bool {
-    !line.spans.is_empty()
-        && !is_user_line(line)
-        && !line.spans.iter().any(|span| {
-            let text = span.content.as_ref();
-            text.starts_with("▸") || text.starts_with("└") || text.starts_with("· ")
-        })
-}
-
 fn dim_intermediate_assistant_block(app: &mut App) {
-    for line in app.transcript.iter_mut().rev() {
-        if line.spans.is_empty() || !is_assistant_line(line) {
-            break;
-        }
-        for span in &mut line.spans {
-            span.style = span.style.fg(Color::DarkGray);
+    if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
+        for line in lines.iter_mut() {
+            for span in &mut line.spans {
+                span.style = span.style.fg(Color::DarkGray);
+            }
         }
     }
 }
@@ -344,23 +415,25 @@ pub(super) fn scroll_transcript(app: &mut App, delta: i32) {
 }
 
 /// Render the user's submitted prompt with the shared transcript grid.
+/// No empty gap `Line`s are stored; gutter is inserted by `TranscriptView`.
 pub(super) fn render_user_prompt(app: &mut App, line: &str) {
+    app.assistant_open = false;
     let user_bg = Style::default()
         .fg(theme::surface_fg())
         .bg(theme::surface_bg());
     let horizontal_pad = " ".repeat(TRANSCRIPT_INDENT);
     let edge_pad = Span::styled(" ", user_bg);
-    app.transcript.push(Line::from(String::new()));
-    app.transcript.push(Line::from(edge_pad.clone()));
+    let mut block_lines = Vec::new();
+    block_lines.push(Line::from(edge_pad.clone()));
     for sub in line.split('\n') {
-        app.transcript.push(Line::from(vec![
+        block_lines.push(Line::from(vec![
             Span::styled(horizontal_pad.clone(), user_bg),
             Span::styled(sub.to_string(), user_bg),
             edge_pad.clone(),
         ]));
     }
-    app.transcript.push(Line::from(edge_pad));
-    app.transcript.push(Line::from(String::new()));
+    block_lines.push(Line::from(edge_pad));
+    app.transcript.push(TranscriptBlock::User(block_lines));
 }
 
 #[cfg(test)]
@@ -383,17 +456,80 @@ mod tests {
 
     #[test]
     fn tool_preview_lines_are_indented_and_dimmed() {
-        let mut transcript: Vec<Line<'static>> = Vec::new();
-        push_tool_preview(
-            &mut transcript,
-            &["src/main.rs".into(), "… +3 more lines".into()],
+        // Preview formatting is exercised through the Tool block produced by
+        // `append_sink_line`; the stored preview lines must be indented and
+        // dimmed exactly as before.
+        let mut app = App {
+            transcript: Vec::new(),
+            input: crate::ui::input::InputField::new(),
+            config: crate::llm::config::LlmConfig {
+                provider: crate::core::types::Provider::OpenCode,
+                api_key: String::new(),
+                base_url: String::new(),
+                model: "test".into(),
+                available_models: vec!["test".into()],
+                api: crate::core::types::ApiProtocol::Responses,
+                account_id: None,
+                thinking_effort: None,
+                context_window: 128_000,
+                permission: crate::core::types::PermissionMode::Trusted,
+                max_tool_iterations: 60,
+                max_prompt_tokens: 128_000,
+                max_turn_seconds: 900,
+                client: reqwest::blocking::Client::new(),
+            },
+            messages: Vec::new(),
+            tool_state: crate::agent::state::ToolState::default(),
+            session: crate::session::Session::in_memory("/tmp".into()),
+            skills: Vec::new(),
+            turn_start: 0,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            git_dirty: false,
+            turn_started: None,
+            active_tool: None,
+            last_activity: None,
+            steering_rx: None,
+            followup_rx: None,
+            pending_steering: Vec::new(),
+            pending_followups: Vec::new(),
+            cancel_requested: false,
+            approval_rx: None,
+            pending_approval: None,
+            busy: false,
+            autoscroll: true,
+            scroll: 0,
+            tick: 0,
+            quit: false,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            slash_selected: 0,
+            assistant_open: false,
+        };
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash echo hi".into()),
         );
-        assert_eq!(transcript.len(), 2);
-        for line in &transcript {
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "bash".into(),
+                summary: "v ok".into(),
+                success: true,
+                preview: vec!["src/main.rs".into(), "… +3 more lines".into()],
+                duration: 0.0,
+            },
+        );
+        let TranscriptBlock::Tool { preview, .. } = &app.transcript[0] else {
+            panic!("expected Tool block");
+        };
+        assert_eq!(preview.len(), 2);
+        for line in preview {
             assert!(line.spans.len() == 2); // indent gutter + content
             assert_eq!(line.spans[1].style.fg, Some(Color::DarkGray));
         }
-        assert!(transcript[0].spans[1].content.as_ref() == "  src/main.rs");
-        assert!(transcript[1].spans[1].content.as_ref() == "  … +3 more lines");
+        assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
+        assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");
     }
 }

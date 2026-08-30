@@ -373,14 +373,17 @@ fn run_turn_inner(
                         summary,
                         success,
                         preview,
+                        duration,
                     } => StreamEvent::ToolResult {
                         name,
                         summary,
                         success,
                         preview,
+                        duration,
                     },
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
+                    SinkLine::Usage(tokens) => StreamEvent::Usage { tokens },
                 };
                 let _ = stream_tx.blocking_send(event);
             }
