@@ -355,7 +355,7 @@ impl ActivityView {
                 .unwrap_or_default();
             (
                 truncate_display(&format!("{} working…{}", frame, tool), content_width),
-                Color::DarkGray,
+                theme::muted_fg(),
             )
         } else {
             (
@@ -553,6 +553,9 @@ impl ApprovalOverlay {
         let block = Block::default()
             .title(" Approval required ")
             .borders(Borders::TOP | Borders::BOTTOM)
+            // Keep the overlay's text in the same left gutter as the
+            // transcript and composer instead of flush with the screen edge.
+            .padding(Padding::horizontal(super::HORIZONTAL_GUTTER))
             .border_style(Style::default().fg(Color::Yellow))
             .style(Style::default().bg(theme::surface_bg()));
         let inner = block.inner(area);
@@ -607,7 +610,7 @@ impl ApprovalOverlay {
         );
         f.render_widget(
             Paragraph::new("↑/↓ select · Enter confirm · Esc deny")
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(theme::muted_fg())),
             Rect {
                 x: inner.x,
                 y: inner.y + 8,
@@ -961,6 +964,24 @@ mod tests {
         assert!(symbols.contains("bash cargo test"));
         assert!(symbols.contains("Allow for this session"));
         assert!(symbols.contains("Esc deny"));
+        // Tool/why text sits in the app's one-column left gutter, aligned
+        // with the rest of the UI instead of flush with the screen edge.
+        let width = 100;
+        let rows: Vec<String> = symbols
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(width)
+            .map(|c| c.iter().collect())
+            .collect();
+        let at_gutter = |needle: &str| {
+            rows.iter().any(|r| {
+                r.find(needle)
+                    .is_some_and(|byte| r[..byte].chars().count() == 1)
+            })
+        };
+        assert!(at_gutter("The agent"), "header not in gutter");
+        assert!(at_gutter("bash cargo"), "command not in gutter");
+        assert!(at_gutter("\u{2191}/\u{2193} select"), "hint not in gutter");
     }
 
     #[test]

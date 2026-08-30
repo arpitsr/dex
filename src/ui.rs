@@ -325,7 +325,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             if duration > 0.0 {
                 spans.push(Span::styled(
                     format!(" · {}", crate::core::format::format_duration(duration)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::muted_fg()),
                 ));
             }
             let output = indent_transcript_line(Line::from(spans));
@@ -368,8 +368,8 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             app.transcript
                 .push(TranscriptBlock::System(indent_transcript_line(Line::from(
                     vec![
-                        Span::styled("· ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(s, Style::default().fg(Color::DarkGray)),
+                        Span::styled("· ", Style::default().fg(theme::muted_fg())),
+                        Span::styled(s, Style::default().fg(theme::muted_fg())),
                     ],
                 ))));
         }
@@ -394,7 +394,7 @@ fn dim_intermediate_assistant_block(app: &mut App) {
     if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
         for line in lines.iter_mut() {
             for span in &mut line.spans {
-                span.style = span.style.fg(Color::DarkGray);
+                span.style = span.style.fg(theme::muted_fg());
             }
         }
     }

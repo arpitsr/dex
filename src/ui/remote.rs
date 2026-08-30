@@ -449,7 +449,13 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.busy {
-                request_cancel(remote);
+                if app.cancel_requested {
+                    // Second Ctrl+C while a cancel is already in flight: the
+                    // daemon is stuck, force-quit rather than stay trapped.
+                    app.quit = true;
+                } else {
+                    request_cancel(remote);
+                }
             } else {
                 app.quit = true;
             }

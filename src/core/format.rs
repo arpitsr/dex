@@ -103,6 +103,7 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| input.to_string());
     let s = s.lines().next().unwrap_or(&s).trim();
+    let s = strip_ansi(s);
     let limit = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
     s[..limit].to_string()
 }
@@ -110,7 +111,8 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
 /// First non-empty, trimmed line of a tool result, truncated — a one-line
 /// confirmation for the REPL transcript instead of the full output.
 pub(crate) fn one_line_summary(text: &str) -> String {
-    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let stripped = strip_ansi(text);
+    let line = stripped.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let line = line.trim();
     let limit = line
         .char_indices()
@@ -120,12 +122,15 @@ pub(crate) fn one_line_summary(text: &str) -> String {
     line[..limit].to_string()
 }
 
-/// Drop ANSI escape sequences (colors, cursor movement) so tool output
-/// renders as plain text in the transcript.
+/// Drop ANSI escape sequences (colors, cursor movement) and carriage
+/// returns/bells so tool output renders as plain text in the transcript.
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '\r' || c == '\x07' {
+            continue;
+        }
         if c != '\x1b' {
             out.push(c);
             continue;
@@ -439,5 +444,13 @@ mod tests {
     fn preview_of_empty_output_is_empty() {
         assert!(tool_result_preview("", 3, false).is_empty());
         assert!(tool_result_preview("\n \n", 3, true).is_empty());
+    }
+
+    #[test]
+    fn summary_and_arg_strip_escapes_and_carriage_returns() {
+        assert_eq!(one_line_summary("\x1b[31mboom\x1b[0m\r\nnext"), "boom");
+        assert_eq!(one_line_summary("progress\r\r\x07done"), "progressdone");
+        // Fallback path: unparseable input JSON is sanitized too.
+        assert_eq!(short_arg("x", "'\x1b[1mevil\x1b[0m\r"), "'evil");
     }
 }
