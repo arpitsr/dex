@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::r#loop::process_turn;
 use crate::agent::state::ToolState;
-use crate::core::console::{Console, CancellationToken};
+use crate::core::console::{CancellationToken, Console};
 use crate::core::format::git_context;
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;

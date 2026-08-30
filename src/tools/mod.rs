@@ -276,7 +276,10 @@ fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
     fs::read_to_string(workspace_path(&arg_str(args, "path")?)?).map_err(ToolError::Io)
 }
 
-fn tool_bash(args: &Map<String, Value>, cancel: &dyn CancellationSource) -> Result<String, ToolError> {
+fn tool_bash(
+    args: &Map<String, Value>,
+    cancel: &dyn CancellationSource,
+) -> Result<String, ToolError> {
     run_bash(&arg_str(args, "command")?, cancel)
 }
 
@@ -304,7 +307,10 @@ fn replace_exact(content: &str, old: &str, new: &str) -> Result<String, ToolErro
     Ok(content.replacen(old, new, 1))
 }
 
-fn tool_grep(args: &Map<String, Value>, cancel: &dyn CancellationSource) -> Result<String, ToolError> {
+fn tool_grep(
+    args: &Map<String, Value>,
+    cancel: &dyn CancellationSource,
+) -> Result<String, ToolError> {
     let pattern = arg_str(args, "pattern")?;
     let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
     let path = workspace_path(&path)?;
@@ -473,9 +479,13 @@ mod tests {
 
     #[test]
     fn shell_timeout_terminates_long_running_command() {
-        let result =
-            run_bash_with_limits("sleep 1", Duration::from_millis(10), 1024, &GlobalCancellation)
-                .unwrap();
+        let result = run_bash_with_limits(
+            "sleep 1",
+            Duration::from_millis(10),
+            1024,
+            &GlobalCancellation,
+        )
+        .unwrap();
         assert!(result.contains("timed out"));
     }
 }

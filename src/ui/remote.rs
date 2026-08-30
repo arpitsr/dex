@@ -172,6 +172,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         cancel_flag,
     };
 
+    // Detect the terminal background before raw mode / the alternate screen
+    // take over; surface colors are resolved from this once.
+    super::theme::detect_background();
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
@@ -624,8 +627,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 app,
-                "mouse: drag to select text and copy · wheel scrolls"
-                    .to_string(),
+                "mouse: drag to select text and copy · wheel scrolls".to_string(),
             );
             push_info(
                 app,
