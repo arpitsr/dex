@@ -113,6 +113,39 @@ pub(crate) fn muted_fg() -> Color {
     Color::DarkGray
 }
 
+/// Core readable color for secondary tool text (args + previews).
+/// Derived from the terminal's actual foreground blended toward its
+/// background so it keeps the theme's hue and contrasts on both light
+/// and dark tinted backgrounds. Fixed ANSI grays (`DarkGray`/`Gray`)
+/// bypass the palette and clash with tinted themes.
+fn tool_muted_fg() -> Color {
+    match palette() {
+        Some(p) => {
+            // Blend foreground toward background just enough to read as
+            // detail rather than dialogue, while preserving contrast.
+            let amount = match p.mode {
+                ThemeMode::Dark => 0.38,
+                ThemeMode::Light => 0.42,
+            };
+            let (r, g, b) = blend(p.foreground, p.background, amount);
+            Color::Rgb(r, g, b)
+        }
+        None => Color::Gray,
+    }
+}
+
+/// Foreground for tool output previews: dimmed but still readable.
+pub(crate) fn tool_preview_fg() -> Color {
+    tool_muted_fg()
+}
+
+/// Foreground for tool input arguments: same readable dim as previews.
+/// Separate semantic alias so call sites read intention while sharing a
+/// single tunable (`tool_muted_fg`). Keeps both in sync modularly.
+pub(crate) fn tool_input_fg() -> Color {
+    tool_muted_fg()
+}
+
 fn background() -> Background {
     match palette() {
         Some(p) => match p.mode {

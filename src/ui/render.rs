@@ -338,6 +338,10 @@ struct ActivityView;
 
 impl ActivityView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
+        // Always clear the rect first: ratatui only repaints cells the
+        // widget writes, so a shorter "worked for …" line would otherwise
+        // leave trailing chars from the previous spinner text.
+        f.render_widget(Clear, area);
         if !(app.busy || app.last_activity.is_some()) {
             return;
         }
@@ -415,6 +419,7 @@ struct ComposerView;
 
 impl ComposerView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+        f.render_widget(Clear, area);
         let input_style = if app.busy || app.pending_approval.is_some() {
             Style::default()
                 .fg(theme::muted_fg())
@@ -615,6 +620,10 @@ impl ApprovalOverlay {
 
 pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
+    // Ratatui only repaints cells the widget touches; without a full clear,
+    // a shorter line (e.g. "worked for …" replacing the spinner, or a
+    // shrunken input) would leave trailing chars from the previous frame.
+    f.render_widget(Clear, area);
     let input_rows = render_input(&app.input, input_content_width(area.width))
         .0
         .len() as u16;
