@@ -2,7 +2,54 @@ use std::io::{self, Write};
 
 use crate::protocol::{ApprovalDecision, StreamEvent};
 
-use super::http::DaemonClient;
+use super::http::{ChatOptions, DaemonClient};
+
+fn prompt_for_approval(name: &str, input: &str) -> ApprovalDecision {
+    eprintln!("\n  Approve {name}? ({input})");
+    eprint!("  [y/N/s(session)] ");
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).ok();
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => ApprovalDecision::AllowOnce,
+        "s" | "session" => ApprovalDecision::AllowSession,
+        _ => ApprovalDecision::Deny,
+    }
+}
+
+fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
+    match event {
+        StreamEvent::AssistantText(text) => {
+            print!("{text}");
+            io::stdout().flush().ok();
+        }
+        StreamEvent::ToolCall { name, .. } => {
+            eprintln!("\n  > {name}...");
+        }
+        StreamEvent::ToolResult {
+            name,
+            summary,
+            success,
+        } => {
+            let icon = if success { "✓" } else { "✗" };
+            eprintln!("  {icon} {name}: {summary}");
+        }
+        StreamEvent::ApprovalRequired { name, input, .. } => {
+            return Some(prompt_for_approval(&name, &input));
+        }
+        StreamEvent::TurnFailed { error } => {
+            eprintln!("\nerror: {error}");
+        }
+        StreamEvent::System(msg) => {
+            eprintln!("[system] {msg}");
+        }
+        StreamEvent::Error(msg) => {
+            eprintln!("[error] {msg}");
+        }
+        StreamEvent::TurnComplete { .. } => {}
+    }
+    None
+}
 
 /// One-shot mode: send a single prompt and print the response.
 pub(crate) fn one_shot(
@@ -16,48 +63,12 @@ pub(crate) fn one_shot(
 
     eprintln!("session: {}", session.session_id);
 
-    let events = client.chat_with_approval(&session.session_id, prompt, |name, input| {
-        eprintln!("\n  Approve {name}? ({input})");
-        eprint!("  [y/N/s(session)] ");
-        io::stderr().flush().ok();
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer).ok();
-        match answer.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => ApprovalDecision::AllowOnce,
-            "s" | "session" => ApprovalDecision::AllowSession,
-            _ => ApprovalDecision::Deny,
-        }
-    })?;
-
-    for event in &events {
-        match event {
-            StreamEvent::AssistantText(text) => {
-                print!("{text}");
-                io::stdout().flush()?;
-            }
-            StreamEvent::ToolCall { name, .. } => {
-                eprintln!("\n  > {name}...");
-            }
-            StreamEvent::ToolResult {
-                name,
-                summary,
-                success,
-            } => {
-                let icon = if *success { "✓" } else { "✗" };
-                eprintln!("  {icon} {name}: {summary}");
-            }
-            StreamEvent::TurnFailed { error } => {
-                eprintln!("\nerror: {error}");
-            }
-            StreamEvent::System(msg) => {
-                eprintln!("[system] {msg}");
-            }
-            StreamEvent::Error(msg) => {
-                eprintln!("[error] {msg}");
-            }
-            _ => {}
-        }
-    }
+    client.chat(
+        &session.session_id,
+        prompt,
+        ChatOptions::default(),
+        &mut handle_event,
+    )?;
 
     println!();
     Ok(())
@@ -121,53 +132,13 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
             continue;
         }
 
-        let events = match client.chat_with_approval(&session.session_id, input, |name, input| {
-            eprintln!("\n  Approve {name}? ({input})");
-            eprint!("  [y/N/s(session)] ");
-            io::stderr().flush().ok();
-            let mut answer = String::new();
-            io::stdin().read_line(&mut answer).ok();
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "y" | "yes" => ApprovalDecision::AllowOnce,
-                "s" | "session" => ApprovalDecision::AllowSession,
-                _ => ApprovalDecision::Deny,
-            }
-        }) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("error: {e}");
-                continue;
-            }
-        };
-
-        for event in &events {
-            match event {
-                StreamEvent::AssistantText(text) => {
-                    print!("{text}");
-                    io::stdout().flush()?;
-                }
-                StreamEvent::ToolCall { name, .. } => {
-                    eprintln!("\n  > {name}...");
-                }
-                StreamEvent::ToolResult {
-                    name,
-                    summary,
-                    success,
-                } => {
-                    let icon = if *success { "✓" } else { "✗" };
-                    eprintln!("  {icon} {name}: {summary}");
-                }
-                StreamEvent::TurnFailed { error } => {
-                    eprintln!("\nerror: {error}");
-                }
-                StreamEvent::System(msg) => {
-                    eprintln!("[system] {msg}");
-                }
-                StreamEvent::Error(msg) => {
-                    eprintln!("[error] {msg}");
-                }
-                _ => {}
-            }
+        if let Err(e) = client.chat(
+            &session.session_id,
+            input,
+            ChatOptions::default(),
+            &mut handle_event,
+        ) {
+            eprintln!("error: {e}");
         }
 
         println!();

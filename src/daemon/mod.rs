@@ -1,25 +1,35 @@
 pub(crate) mod server;
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
+use std::sync::Mutex;
 
-use tokio::sync::RwLock;
-
-use crate::agent::state::GlobalCancellation;
+use crate::core::console::CancellationToken;
 use crate::core::types::ApprovalDecision;
 
-/// Shared state for the daemon.
-#[allow(dead_code)]
+/// A tool execution awaiting the client's approval decision.
+pub(crate) struct PendingApproval {
+    pub(crate) session_id: String,
+    pub(crate) response: mpsc::Sender<ApprovalDecision>,
+}
+
+/// Shared state for the daemon. Plain mutexes are fine here: every critical
+/// section is short and never holds the lock across an `.await`.
 pub(crate) struct DaemonState {
-    pub base_dir: PathBuf,
-    pub sessions: RwLock<HashMap<String, SessionEntry>>,
-    /// Pending approval requests keyed by request ID. The sender side resolves
-    /// the blocking `approve_tool` call in the agent loop.
-    pub pending_approvals: RwLock<HashMap<String, mpsc::Sender<ApprovalDecision>>>,
-    /// Per-session cancellation flags.
-    pub cancellations: RwLock<HashMap<String, Arc<GlobalCancellation>>>,
+    pub sessions: Mutex<HashMap<String, SessionEntry>>,
+    /// Pending approval requests keyed by request ID (as sent to the client
+    /// in the `ApprovalRequired` stream event). The sender resolves the
+    /// blocking `approve_tool` call inside the agent loop.
+    pub pending_approvals: Mutex<HashMap<String, PendingApproval>>,
+    /// Sessions with a turn currently in flight; one turn at a time per
+    /// session keeps the append-only session log consistent.
+    pub active_turns: Mutex<HashSet<String>>,
+    /// Per-session cancellation tokens for in-flight turns. POST /cancel
+    /// signals the token so this turn unwinds without touching other
+    /// sessions; the entry is removed when the turn finishes.
+    pub cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
 }
 
 #[derive(Clone)]
@@ -30,30 +40,32 @@ pub(crate) struct SessionEntry {
 }
 
 impl DaemonState {
-    pub fn new(base_dir: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
-            base_dir,
-            sessions: RwLock::new(HashMap::new()),
-            pending_approvals: RwLock::new(HashMap::new()),
-            cancellations: RwLock::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            pending_approvals: Mutex::new(HashMap::new()),
+            active_turns: Mutex::new(HashSet::new()),
+            cancel_tokens: Mutex::new(HashMap::new()),
         }
     }
 }
 
-/// Start the daemon HTTP server.
-pub(crate) async fn run_daemon(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let base_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ak")
-        .join("sessions");
-
-    let state = Arc::new(DaemonState::new(base_dir));
+/// Start the daemon HTTP server on an already-bound listener.
+pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
+    let state = std::sync::Arc::new(DaemonState::new());
 
     let app = server::router(state.clone());
 
-    println!("ak daemon listening on {addr}");
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    println!("oye daemon listening on {addr}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // tokio refuses blocking fds; the std listener must be non-blocking
+    // before registration.
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
     axum::serve(listener, app).await?;
 
     Ok(())

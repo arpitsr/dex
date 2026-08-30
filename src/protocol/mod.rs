@@ -14,7 +14,9 @@ pub struct CreateSessionResponse {
     pub path: String,
 }
 
-/// Summary of a session for listing.
+/// Summary of a session for listing. Constructed via serde from the
+/// daemon's `GET /api/sessions` response.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
@@ -31,11 +33,22 @@ pub struct ChatRequest {
     pub prompt: String,
     #[serde(default)]
     pub skill_dirs: Vec<String>,
+    /// Optional per-request overrides; when absent the daemon uses its own
+    /// environment/config file. These let a co-located client forward its
+    /// CLI flags through to the turn.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission: Option<String>,
 }
 
-/// Response to approve/deny a tool execution.
+/// Response to approve/deny a tool execution. `request_id` must match the
+/// `ApprovalRequired` stream event the decision resolves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalResponse {
+    pub request_id: String,
     pub decision: ApprovalDecision,
 }
 
@@ -78,9 +91,14 @@ pub enum StreamEvent {
         input: String,
     },
 
-    /// The turn completed successfully.
+    /// The turn completed successfully. `usage` is the daemon-reported prompt
+    /// token count for the conversation, when known.
     #[serde(rename = "turn_complete")]
-    TurnComplete { response: String },
+    TurnComplete {
+        response: String,
+        #[serde(default)]
+        usage: Option<u64>,
+    },
 
     /// The turn failed.
     #[serde(rename = "turn_failed")]
@@ -95,19 +113,17 @@ pub enum StreamEvent {
     Error(String),
 }
 
-impl StreamEvent {
-    /// Serialize to SSE `data:` format.
-    pub fn to_sse(&self) -> String {
-        let json = serde_json::to_string(self).expect("StreamEvent should always serialize");
-        format!("data: {json}\n\n")
-    }
-}
-
-/// Daemon configuration sent by the client.
+/// Runtime info about the daemon, returned by `GET /api/config`. The client
+/// TUI uses it for the status footer and slash-command suggestions; the
+/// daemon resolves provider/model/permission from its own environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct DaemonConfig {
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-    pub permission: Option<String>,
+pub struct DaemonInfo {
+    pub provider: String,
+    pub model: String,
+    pub available_models: Vec<String>,
+    pub context_window: u64,
+    pub permission: String,
+    pub cwd: String,
+    pub git_branch: Option<String>,
+    pub git_dirty: bool,
 }

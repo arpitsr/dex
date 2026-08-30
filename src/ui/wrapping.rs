@@ -29,7 +29,10 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
             last_space_end = Some(end);
         }
         if row_width + char_width > width && begin > start {
-            if let Some(space_end) = last_space_end.filter(|end| *end > start) {
+            // Wrap at the last whitespace inside the current row, if any; a
+            // space at the wrap point itself (`end > begin`) belongs to the
+            // next row, so fall through to the hard break then.
+            if let Some(space_end) = last_space_end.filter(|end| *end > start && *end <= begin) {
                 segments.push((start, space_end));
                 start = space_end;
                 row_width = line[start..begin]
@@ -91,5 +94,13 @@ mod tests {
     fn narrow_width_still_makes_progress() {
         let (lines, _, _) = wrap_line("abc", 0, 0);
         assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn wrap_point_on_whitespace_does_not_invert_range() {
+        // Width boundary lands exactly on a space: previously this produced
+        // line[3..2] and panicked. Greedy wrapping keeps making progress.
+        let (lines, _, _) = wrap_line("In one", 2, 0);
+        assert_eq!(lines, vec!["In", " o", "ne"]);
     }
 }

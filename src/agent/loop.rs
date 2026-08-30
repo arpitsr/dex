@@ -34,7 +34,7 @@ pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<Stri
         PermissionMode::AskShell => name == "bash",
         PermissionMode::Trusted => false,
     };
-    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure AK_PERMISSION", name))
+    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure OYE_PERMISSION", name))
 }
 
 pub(crate) fn approve_tool(
@@ -127,6 +127,7 @@ pub(crate) fn approve_tool(
 pub(crate) fn execute_tool_call(
     call: &LlmToolCall,
     permission: PermissionMode,
+    cancel: &dyn CancellationSource,
     console: &Console,
 ) -> (String, String, String) {
     let name = call.function.name.clone();
@@ -156,7 +157,7 @@ pub(crate) fn execute_tool_call(
             format!("Error: permission denied for tool '{}'", name),
         );
     }
-    (name.clone(), input, execute_to_string(&name, &args))
+    (name.clone(), input, execute_to_string(&name, &args, cancel))
 }
 
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
@@ -192,7 +193,7 @@ pub(crate) fn persist_pending(
 /// globals.
 fn call_client_cancellable(
     client: &(impl ModelClient + Sync + Send + Clone + 'static),
-    cancel: &(impl CancellationSource + ?Sized),
+    cancel: &(impl CancellationSource + Clone + Send + Sync + 'static),
     messages: &[ChatMessage],
     with_tools: bool,
     console: &Console,
@@ -200,10 +201,13 @@ fn call_client_cancellable(
     let client = (*client).clone();
     let messages = messages.to_vec();
     let sink = console.sink().cloned();
+    // The worker outlives this call when cancelled early; it polls a private
+    // clone of the source so the stream read unwinds too.
+    let handle = cancel.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = client
-            .complete(&messages, with_tools, sink)
+            .complete(&messages, with_tools, sink, &handle)
             .map_err(|error| error.to_string());
         let _ = tx.send(result);
     });
@@ -231,7 +235,7 @@ pub(crate) fn process_turn(
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
     mut session: Option<&mut Session>,
     client: &(impl ModelClient + Sync + Send + Clone + 'static),
-    cancel: &(impl CancellationSource + ?Sized),
+    cancel: &(impl CancellationSource + Clone + Send + Sync + 'static),
     console: &Console,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Spins while the agent works; erased automatically on return.
@@ -297,14 +301,14 @@ pub(crate) fn process_turn(
             });
             persist_pending(&mut session, messages, &mut persisted_cursor);
         }
-        let (message, usage) =
-            match call_client_cancellable(client, cancel, messages, true, console) {
-                Ok(result) => result,
-                Err(e) if e.to_string() == "interrupted" => {
-                    return Err("interrupted by user (Ctrl+C)".into());
-                }
-                Err(e) => return Err(e),
-            };
+        let (message, usage) = match call_client_cancellable(client, cancel, messages, true, console)
+        {
+            Ok(result) => result,
+            Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
+                return Err("cancelled by user".into());
+            }
+            Err(e) => return Err(e),
+        };
         if usage.is_some() {
             last_usage = usage;
         }
@@ -312,7 +316,7 @@ pub(crate) fn process_turn(
         // budget is exceeded (API-reported usage takes precedence).
         let est = last_usage.unwrap_or_else(|| estimate_tokens(messages));
         if messages.len() > 1 + KEEP_RECENT_MESSAGES || est > config.context_window / 2 {
-            compact_history(config, messages)?;
+            compact_history(config, messages, cancel)?;
         }
         if let Some(calls) = message.tool_calls.clone() {
             messages.push(ChatMessage {
@@ -331,7 +335,7 @@ pub(crate) fn process_turn(
                 let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 calls
                     .iter()
-                    .map(|call| execute_tool_call(call, config.permission, console))
+                    .map(|call| execute_tool_call(call, config.permission, cancel, console))
                     .collect()
             } else {
                 calls
@@ -340,7 +344,10 @@ pub(crate) fn process_turn(
                         let call = call.clone();
                         let permission = config.permission;
                         let console = console.clone();
-                        thread::spawn(move || execute_tool_call(&call, permission, &console))
+                        let cancel = cancel.clone();
+                        thread::spawn(move || {
+                            execute_tool_call(&call, permission, &cancel, &console)
+                        })
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
@@ -509,6 +516,7 @@ mod tests {
             _messages: &[ChatMessage],
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
+            _cancel: &dyn CancellationSource,
         ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
             Ok((
                 ChatMessage {
@@ -523,6 +531,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct NeverCancel;
 
     impl CancellationSource for NeverCancel {
