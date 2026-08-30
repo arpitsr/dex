@@ -221,7 +221,10 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll"
                     .to_string(),
             );
-            push_info(app, "mouse: drag to select text and copy · wheel scrolls".to_string());
+            push_info(
+                app,
+                "mouse: drag to select text and copy · wheel scrolls".to_string(),
+            );
             push_info(app, "while working: Enter queues steer · Alt+Enter queues follow-up · Esc/Ctrl+C cancels and restores queued input".to_string());
         }
         _ if line.starts_with("/model ") => {

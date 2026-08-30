@@ -301,14 +301,14 @@ pub(crate) fn process_turn(
             });
             persist_pending(&mut session, messages, &mut persisted_cursor);
         }
-        let (message, usage) = match call_client_cancellable(client, cancel, messages, true, console)
-        {
-            Ok(result) => result,
-            Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
-                return Err("cancelled by user".into());
-            }
-            Err(e) => return Err(e),
-        };
+        let (message, usage) =
+            match call_client_cancellable(client, cancel, messages, true, console) {
+                Ok(result) => result,
+                Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
+                    return Err("cancelled by user".into());
+                }
+                Err(e) => return Err(e),
+            };
         if usage.is_some() {
             last_usage = usage;
         }

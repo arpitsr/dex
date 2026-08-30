@@ -11,9 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::slash;
 use super::wrapping::wrap_line;
-use super::{
-    format_tokens, transcript_indent, App, InputField, SUBMITTED_PROMPT_BG, TRANSCRIPT_INDENT,
-};
+use super::{format_tokens, theme, transcript_indent, App, InputField, TRANSCRIPT_INDENT};
 
 pub(super) fn surface_padding() -> Padding {
     Padding {
@@ -32,7 +30,7 @@ pub(super) fn input_block() -> Block<'static> {
             top: super::INPUT_PAD_Y,
             bottom: super::INPUT_PAD_Y,
         })
-        .style(Style::default().bg(super::INPUT_BG))
+        .style(Style::default().bg(theme::surface_bg()))
 }
 
 pub(super) fn input_outer_height(content_rows: u16) -> u16 {
@@ -408,9 +406,13 @@ struct ComposerView;
 impl ComposerView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let input_style = if app.busy || app.pending_approval.is_some() {
-            Style::default().fg(Color::DarkGray).bg(SUBMITTED_PROMPT_BG)
+            Style::default()
+                .fg(theme::muted_fg())
+                .bg(theme::surface_bg())
         } else {
-            Style::default().fg(Color::White).bg(SUBMITTED_PROMPT_BG)
+            Style::default()
+                .fg(theme::surface_fg())
+                .bg(theme::surface_bg())
         };
         let block = input_block();
         let inner = block.inner(area);
@@ -471,7 +473,9 @@ impl SlashSuggestionsView {
                 let row_style = if selected {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else {
-                    Style::default().fg(Color::White).bg(Color::Rgb(18, 25, 38))
+                    Style::default()
+                        .fg(theme::surface_fg())
+                        .bg(theme::popup_bg())
                 };
                 let command_style = if selected {
                     Style::default()
@@ -485,7 +489,7 @@ impl SlashSuggestionsView {
                 let description_style = if selected {
                     Style::default().fg(Color::Black)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(theme::secondary_fg())
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{command:<20}"), command_style),
@@ -500,7 +504,7 @@ impl SlashSuggestionsView {
                     .title(" Slash commands ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue))
-                    .style(Style::default().bg(Color::Rgb(18, 25, 38))),
+                    .style(Style::default().bg(theme::popup_bg())),
             ),
             popup,
         );
@@ -535,7 +539,7 @@ impl ApprovalOverlay {
             .title(" Approval required ")
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_style(Style::default().fg(Color::Yellow))
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(theme::surface_bg()));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -544,10 +548,7 @@ impl ApprovalOverlay {
             inner.width.saturating_sub(2),
         );
         let header = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "The agent wants to run:",
-                Style::default().fg(Color::White),
-            )),
+            Line::from(Span::styled("The agent wants to run:", theme::surface_fg())),
             Line::from(Span::styled(command, Style::default().fg(Color::Cyan))),
             Line::from(""),
         ])
@@ -576,7 +577,7 @@ impl ApprovalOverlay {
             let style = if approval.selected == index {
                 Style::default().fg(Color::Black).bg(Color::Yellow)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::surface_fg())
             };
             ListItem::new(format!("{marker} {label}  [{key}]")).style(style)
         });

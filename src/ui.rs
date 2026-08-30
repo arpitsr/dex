@@ -17,6 +17,7 @@ mod input;
 mod remote;
 mod render;
 mod slash;
+mod theme;
 mod wrapping;
 
 pub(crate) use remote::run_ratatui_repl_with_remote;
@@ -34,9 +35,8 @@ const INPUT_MIN_ROWS: u16 = 3;
 const INPUT_STATUS_GUTTER: u16 = 0;
 const APPROVAL_HEIGHT: u16 = 11;
 
-const SUBMITTED_PROMPT_BG: Color = Color::Rgb(20, 38, 54);
-const INPUT_BG: Color = SUBMITTED_PROMPT_BG;
-
+/// Raised-surface colors are resolved in `ui/theme.rs` from the terminal's
+/// own palette / detected background, so they follow the terminal theme.
 /// Braille spinner frames, matching the headless console spinner.
 const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -328,7 +328,9 @@ pub(super) fn scroll_transcript(app: &mut App, delta: i32) {
 
 /// Render the user's submitted prompt with the shared transcript grid.
 pub(super) fn render_user_prompt(app: &mut App, line: &str) {
-    let user_bg = Style::default().fg(Color::White).bg(SUBMITTED_PROMPT_BG);
+    let user_bg = Style::default()
+        .fg(theme::surface_fg())
+        .bg(theme::surface_bg());
     let horizontal_pad = " ".repeat(TRANSCRIPT_INDENT);
     let edge_pad = Span::styled(" ", user_bg);
     app.transcript.push(Line::from(String::new()));

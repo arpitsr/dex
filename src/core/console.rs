@@ -82,10 +82,10 @@ impl CancellationToken {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Cached cancellation (like `is_cancelled`); kept for symmetry with
-    /// `CancellationSource`.
+    /// Consumes the cancellation: returns true if it was set and resets it,
+    /// mirroring `take_interrupt`.
     pub(crate) fn take_cancelled(&self) -> bool {
-        self.cancelled.swap(true, Ordering::SeqCst)
+        self.cancelled.swap(false, Ordering::SeqCst)
     }
 }
 
