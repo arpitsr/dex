@@ -129,7 +129,7 @@ pub(crate) fn execute_tool_call(
     permission: PermissionMode,
     cancel: &dyn CancellationSource,
     console: &Console,
-) -> (String, String, String) {
+) -> (String, String, ToolOutcome) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
     let value: Value = match serde_json::from_str(&raw_args) {
@@ -138,7 +138,10 @@ pub(crate) fn execute_tool_call(
             return (
                 name,
                 raw_args,
-                format!("Error: invalid tool arguments: {}", error),
+                ToolOutcome {
+                    text: format!("Error: invalid tool arguments: {}", error),
+                    ok: false,
+                },
             )
         }
     };
@@ -146,7 +149,10 @@ pub(crate) fn execute_tool_call(
         return (
             name,
             raw_args,
-            "Error: tool arguments must be a JSON object".into(),
+            ToolOutcome {
+                text: "Error: tool arguments must be a JSON object".into(),
+                ok: false,
+            },
         );
     };
     let input = serde_json::to_string(&args).unwrap_or_default();
@@ -154,10 +160,13 @@ pub(crate) fn execute_tool_call(
         return (
             name.clone(),
             input,
-            format!("Error: permission denied for tool '{}'", name),
+            ToolOutcome {
+                text: format!("Error: permission denied for tool '{}'", name),
+                ok: false,
+            },
         );
     }
-    (name.clone(), input, execute_to_string(&name, &args, cancel))
+    (name.clone(), input, execute_outcome(&name, &args, cancel))
 }
 
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
@@ -206,9 +215,22 @@ fn call_client_cancellable(
     let handle = cancel.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = client
-            .complete(&messages, with_tools, sink, &handle)
-            .map_err(|error| error.to_string());
+        // A panic inside the provider stack must reach the channel as an
+        // error (with its message), not surface as an opaque "worker
+        // disconnected" after the sender silently drops.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client
+                .complete(&messages, with_tools, sink, &handle)
+                .map_err(|error| error.to_string())
+        }))
+        .unwrap_or_else(|payload| {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Err(format!("provider worker panicked: {}", detail))
+        });
         let _ = tx.send(result);
     });
     loop {
@@ -251,7 +273,12 @@ pub(crate) fn process_turn(
     let turn_deadline = crate::agent::r#loop::deadline(limits);
     for iteration in 0..config.max_tool_iterations {
         if !within_budget(turn_deadline) {
-            return Err("turn exceeded configured time limit".into());
+            return Err(format!(
+                "turn exceeded the configured time limit ({} seconds); \
+                 raise OYE_MAX_TURN_SECONDS to allow longer turns",
+                limits.elapsed_seconds
+            )
+            .into());
         }
         persist_pending(&mut session, messages, &mut persisted_cursor);
         if cancellation.is_cancelled() {
@@ -356,14 +383,17 @@ pub(crate) fn process_turn(
                             (
                                 String::new(),
                                 String::new(),
-                                "Error: tool worker panicked".into(),
+                                ToolOutcome {
+                                    text: "Error: tool worker panicked".into(),
+                                    ok: false,
+                                },
                             )
                         })
                     })
                     .collect()
             };
 
-            for (call, (name, input, result)) in calls.iter().zip(results) {
+            for (call, (name, input, outcome)) in calls.iter().zip(results) {
                 let cache_key = format!(
                     "{}:{}:{}{}",
                     env::current_dir()
@@ -377,7 +407,7 @@ pub(crate) fn process_turn(
                 // Only successful calls count toward the repeated-identical
                 // limit; a failed call is a legitimate retry and must stay
                 // allowed so the model can recover instead of being blocked.
-                let succeeded = !result.starts_with("Error: ");
+                let succeeded = outcome.ok;
                 if succeeded {
                     if last_tools.len() >= 6 {
                         last_tools.remove(0);
@@ -405,7 +435,9 @@ pub(crate) fn process_turn(
 
                 let cacheable = matches!(name.as_str(), "read" | "grep" | "find");
                 let mut cache_hit = false;
+                let mut ok = succeeded;
                 let result = if repeated_count >= 3 {
+                    ok = false;
                     "Error: repeated identical tool call; choose a different action or finish."
                         .to_string()
                 } else if cacheable && succeeded {
@@ -418,23 +450,24 @@ pub(crate) fn process_turn(
                         }
                         cached.clone()
                     } else {
-                        state.insert(cache_key, result.clone());
-                        result
+                        state.insert(cache_key, outcome.text.clone());
+                        outcome.text
                     }
                 } else {
                     if matches!(name.as_str(), "write" | "edit") {
                         state.clear();
                     }
-                    result
+                    outcome.text
                 };
                 if let Some(sink) = console.sink() {
-                    let mut summary = tool_result_summary(&name, &result);
+                    let mut summary = tool_result_summary(&name, &result, ok);
                     if cache_hit {
                         summary = format!("cached · {summary}");
                     }
                     let _ = sink.send(SinkLine::ToolOutput {
                         name: name.clone(),
                         summary,
+                        success: ok,
                     });
                 } else {
                     with_console(console.sink().is_some(), || {
@@ -490,14 +523,15 @@ pub(crate) fn process_turn(
             return Ok(text);
         }
     }
-    Err(
-        "too many tool iterations: the task did not complete within the per-turn \
-         tool-call budget. Partial progress (if any) is preserved in the conversation. \
-         To continue, you can ask me to resume the task — optionally on a new path or \
-         with a different approach — e.g. \"continue from where you left off\" or \
-         \"try a different approach\"."
-            .into(),
+    Err(format!(
+        "too many tool iterations (budget: {}): the task did not complete within the per-turn \
+             tool-call budget. Partial progress (if any) is preserved in the conversation. \
+             To continue, you can ask me to resume the task — optionally on a new path or \
+             with a different approach — e.g. \"continue from where you left off\" or \
+             \"try a different approach\".",
+        config.max_tool_iterations
     )
+    .into())
 }
 
 #[cfg(test)]

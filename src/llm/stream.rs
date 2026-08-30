@@ -119,7 +119,12 @@ pub(crate) fn read_stream(
         if data == "[DONE]" {
             break;
         }
-        let chunk: StreamChunk = serde_json::from_str(data)?;
+        // Providers interleave non-chunk payloads (keep-alives, error
+        // notices); skipping one unshapely line beats aborting a
+        // multi-minute generation.
+        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+            continue;
+        };
         if let Some(usage) = &chunk.usage {
             usage_tokens = Some(usage.prompt_tokens);
         }
@@ -196,7 +201,10 @@ pub(crate) fn read_responses_stream(
         if data == "[DONE]" || data.is_empty() {
             continue;
         }
-        let event: Value = serde_json::from_str(data)?;
+        let event: Value = match serde_json::from_str(data) {
+            Ok(event) => event,
+            Err(_) => continue,
+        };
         let event_type = event
             .get("type")
             .and_then(Value::as_str)
@@ -228,7 +236,9 @@ pub(crate) fn read_responses_stream(
                     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
                         response_items.insert(item_id.to_string(), index);
                         if let Some(arguments) = pending_arguments.remove(item_id) {
-                            tool_calls[index].function.arguments.push_str(&arguments);
+                            if let Some(call) = tool_calls.get_mut(index) {
+                                call.function.arguments.push_str(&arguments);
+                            }
                         }
                     }
                 }
@@ -253,7 +263,9 @@ pub(crate) fn read_responses_stream(
                         .and_then(Value::as_str)
                         .and_then(|id| response_items.get(id).copied())
                     {
-                        tool_calls[index].function.arguments.push_str(delta);
+                        if let Some(call) = tool_calls.get_mut(index) {
+                            call.function.arguments.push_str(delta);
+                        }
                     } else {
                         pending_arguments.entry(key).or_default().push_str(delta);
                     }
@@ -274,7 +286,9 @@ pub(crate) fn read_responses_stream(
                     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
                         response_items.insert(item_id.to_string(), index);
                         if let Some(arguments) = pending_arguments.remove(item_id) {
-                            tool_calls[index].function.arguments.push_str(&arguments);
+                            if let Some(call) = tool_calls.get_mut(index) {
+                                call.function.arguments.push_str(&arguments);
+                            }
                         }
                     }
                 }

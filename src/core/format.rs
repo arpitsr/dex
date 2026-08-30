@@ -77,8 +77,11 @@ pub(crate) fn one_line_summary(text: &str) -> String {
 
 /// Human-sized result for the TUI. The full result still goes to the model;
 /// the transcript only needs enough information to explain what happened.
-pub(crate) fn tool_result_summary(name: &str, text: &str) -> String {
-    if text.starts_with("Error:") || text.contains("[exit ") {
+/// Failure is passed in by the caller (which knows the real exit status) —
+/// never inferred from the text, whose content may legitimately contain
+/// markers like `[exit 1]`.
+pub(crate) fn tool_result_summary(name: &str, text: &str, ok: bool) -> String {
+    if !ok {
         return format!("failed · {}", one_line_summary(text));
     }
     let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
@@ -115,4 +118,27 @@ pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
             .ok()
             .is_some_and(|output| !output.stdout.is_empty());
     (branch, dirty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_uses_explicit_status_not_text_sniffing() {
+        // A successful read whose content happens to contain the shell
+        // failure marker must not be reported as failed.
+        assert!(tool_result_summary(
+            "read",
+            "use serde_json::{Map, Value};\nresult.push_str(\"[exit 1]\");\n",
+            true
+        )
+        .starts_with("ok ·"));
+        // A genuinely failed tool reports failure with its first output line.
+        assert_eq!(
+            tool_result_summary("bash", "ls: no such file\n[exit 2]", false),
+            "failed · ls: no such file"
+        );
+        assert_eq!(tool_result_summary("grep", "", true), "ok · 0 matches");
+    }
 }

@@ -368,14 +368,15 @@ fn run_turn_inner(
                             args: serde_json::Value::String(args),
                         }
                     }
-                    SinkLine::ToolOutput { name, summary } => {
-                        let success = !summary.starts_with("failed");
-                        StreamEvent::ToolResult {
-                            name,
-                            summary,
-                            success,
-                        }
-                    }
+                    SinkLine::ToolOutput {
+                        name,
+                        summary,
+                        success,
+                    } => StreamEvent::ToolResult {
+                        name,
+                        summary,
+                        success,
+                    },
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
                 };

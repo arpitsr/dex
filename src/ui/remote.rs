@@ -265,9 +265,16 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
         StreamEvent::ToolResult {
             name,
             summary,
-            success: _,
+            success,
         } => {
-            append_sink_line(&mut remote.app, SinkLine::ToolOutput { name, summary });
+            append_sink_line(
+                &mut remote.app,
+                SinkLine::ToolOutput {
+                    name,
+                    summary,
+                    success,
+                },
+            );
         }
         StreamEvent::ApprovalRequired { name, input, .. } => {
             // The worker thread is parked waiting for this decision; show the

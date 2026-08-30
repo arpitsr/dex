@@ -70,7 +70,23 @@ pub(crate) enum ToolError {
     Io(io::Error),
     EditNotUnique(usize),
     OutsideWorkspace(String),
+    /// A shell command ran but signalled failure (non-zero exit, killed, or
+    /// timed out). `code` is `None` when the process never exited on its own.
+    /// Carries the combined output so partial results still reach the model.
+    Shell {
+        output: String,
+        code: Option<i32>,
+    },
     Unknown(String),
+}
+
+/// A tool result together with whether the call actually succeeded. Success
+/// is decided where the exit status is known — never inferred from the
+/// output text, which may legitimately contain markers like `[exit 1]`.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolOutcome {
+    pub(crate) text: String,
+    pub(crate) ok: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +154,10 @@ impl std::fmt::Display for ToolError {
             Self::Io(e) => write!(f, "io error: {}", e),
             Self::EditNotUnique(n) => write!(f, "edit target appears {} times (need exactly 1)", n),
             Self::OutsideWorkspace(path) => write!(f, "path is outside the workspace: {}", path),
+            Self::Shell { output, code } => match code {
+                Some(code) => write!(f, "{output}\n[exit {code}]"),
+                None => write!(f, "{output}"),
+            },
             Self::Unknown(t) => write!(f, "unknown tool '{}'", t),
         }
     }
@@ -170,7 +190,12 @@ fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
         "outcome": outcome,
     });
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{}", record);
+        // One write syscall per record: parallel tool executions append to
+        // this file concurrently, and a multi-syscall formatted write would
+        // interleave mid-record.
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -200,7 +225,10 @@ fn read_limited<R: Read>(mut reader: R, limit: usize) -> Vec<u8> {
     bytes
 }
 
-fn run_bash(command: &str, cancel: &dyn CancellationSource) -> Result<String, ToolError> {
+fn run_bash(
+    command: &str,
+    cancel: &dyn CancellationSource,
+) -> Result<(String, Option<i32>), ToolError> {
     let timeout = shell_timeout();
     let max_bytes = env::var("OYE_TOOL_OUTPUT_BYTES")
         .ok()
@@ -215,7 +243,7 @@ fn run_bash_with_limits(
     timeout: Duration,
     max_bytes: usize,
     cancel: &dyn CancellationSource,
-) -> Result<String, ToolError> {
+) -> Result<(String, Option<i32>), ToolError> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -245,7 +273,7 @@ fn run_bash_with_limits(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Ok("Error: shell command cancelled".to_string());
+            return Ok(("Error: shell command cancelled".to_string(), None));
         }
         if Instant::now() >= deadline {
             unsafe {
@@ -255,9 +283,12 @@ fn run_bash_with_limits(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Ok(format!(
-                "Error: shell command timed out after {} seconds",
-                timeout.as_secs()
+            return Ok((
+                format!(
+                    "Error: shell command timed out after {} seconds",
+                    timeout.as_secs()
+                ),
+                None,
             ));
         }
         thread::sleep(Duration::from_millis(25));
@@ -266,10 +297,7 @@ fn run_bash_with_limits(
     let stderr = stderr_reader.join().unwrap_or_default();
     let mut result = String::from_utf8_lossy(&stdout).into_owned();
     result.push_str(&String::from_utf8_lossy(&stderr));
-    if !status.success() {
-        result.push_str(&format!("\n[exit {}]", status.code().unwrap_or(-1)));
-    }
-    Ok(result)
+    Ok((result, status.code()))
 }
 
 fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
@@ -280,7 +308,11 @@ fn tool_bash(
     args: &Map<String, Value>,
     cancel: &dyn CancellationSource,
 ) -> Result<String, ToolError> {
-    run_bash(&arg_str(args, "command")?, cancel)
+    let (output, code) = run_bash(&arg_str(args, "command")?, cancel)?;
+    match code {
+        Some(0) => Ok(output),
+        code => Err(ToolError::Shell { output, code }),
+    }
 }
 
 fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
@@ -307,6 +339,10 @@ fn replace_exact(content: &str, old: &str, new: &str) -> Result<String, ToolErro
     Ok(content.replacen(old, new, 1))
 }
 
+/// Directories that are noise for a coding agent and slow (`target/` alone
+/// can be gigabytes) enough to cause spurious tool timeouts when searched.
+const SKIP_DIRS: &str = "--exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules";
+
 fn tool_grep(
     args: &Map<String, Value>,
     cancel: &dyn CancellationSource,
@@ -314,14 +350,20 @@ fn tool_grep(
     let pattern = arg_str(args, "pattern")?;
     let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
     let path = workspace_path(&path)?;
-    run_bash(
+    let (output, code) = run_bash(
         &format!(
-            "grep -R -I -n -- {} {}",
+            "grep -R -I -n {} -- {} {}",
+            SKIP_DIRS,
             shell_escape(&pattern),
             shell_escape(&path.to_string_lossy())
         ),
         cancel,
-    )
+    )?;
+    // grep exits 1 when there are no matches — a normal result, not a failure.
+    match code {
+        Some(0) | Some(1) => Ok(output),
+        code => Err(ToolError::Shell { output, code }),
+    }
 }
 
 fn tool_find(
@@ -329,21 +371,26 @@ fn tool_find(
     cancel: &dyn CancellationSource,
 ) -> Result<String, ToolError> {
     let pattern = arg_str(args, "pattern")?;
-    let path = arg_str(args, "path")?;
+    // Optional, matching the advertised schema (only `pattern` is required).
+    let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
     if pattern.trim().is_empty() || pattern == "*" {
         return Err(ToolError::InvalidArgument(
             "find pattern must be targeted (not empty or '*')",
         ));
     }
     let path = workspace_path(&path)?;
-    run_bash(
+    let (output, code) = run_bash(
         &format!(
-            "find {} -path '*{}*' -print",
+            "find {} \\( -name .git -o -name target -o -name node_modules \\) -prune -o -path '*{}*' -print",
             shell_escape(&path.to_string_lossy()),
             shell_escape(&pattern)
         ),
         cancel,
-    )
+    )?;
+    match code {
+        Some(0) => Ok(output),
+        code => Err(ToolError::Shell { output, code }),
+    }
 }
 
 fn tool_git(args: &Map<String, Value>) -> Result<String, ToolError> {
@@ -360,7 +407,10 @@ fn tool_git(args: &Map<String, Value>) -> Result<String, ToolError> {
     let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
     result.push_str(&String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
-        result.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+        return Err(ToolError::Shell {
+            output: result,
+            code: output.status.code(),
+        });
     }
     Ok(result)
 }
@@ -398,14 +448,23 @@ pub(crate) fn execute(
     result
 }
 
-pub(crate) fn execute_to_string(
+/// Execute a tool, reporting success explicitly. Callers must not re-derive
+/// success from the output text: tool output can legitimately contain
+/// strings like `[exit 1]` (shell markers appear in source files and logs).
+pub(crate) fn execute_outcome(
     name: &str,
     args: &Map<String, Value>,
     cancel: &dyn CancellationSource,
-) -> String {
+) -> ToolOutcome {
     match execute(name, args, cancel) {
-        Ok(out) => out,
-        Err(e) => format!("Error: {}", e),
+        Ok(out) => ToolOutcome {
+            text: out,
+            ok: true,
+        },
+        Err(e) => ToolOutcome {
+            text: format!("Error: {}", e),
+            ok: false,
+        },
     }
 }
 
@@ -479,7 +538,7 @@ mod tests {
 
     #[test]
     fn shell_timeout_terminates_long_running_command() {
-        let result = run_bash_with_limits(
+        let (result, code) = run_bash_with_limits(
             "sleep 1",
             Duration::from_millis(10),
             1024,
@@ -487,5 +546,63 @@ mod tests {
         )
         .unwrap();
         assert!(result.contains("timed out"));
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn shell_exit_code_is_reported_separately_from_output() {
+        let (output, code) = run_bash_with_limits(
+            "echo partial-results; exit 3",
+            Duration::from_secs(5),
+            1024,
+            &GlobalCancellation,
+        )
+        .unwrap();
+        assert_eq!(code, Some(3));
+        assert_eq!(output, "partial-results\n");
+    }
+
+    #[test]
+    fn grep_without_matches_is_success() {
+        // Assembled at runtime so the needle does not appear in this source
+        // file (the test greps the crate it lives in).
+        let needle = format!("oye-no-such-token-{}", "xyz");
+        let mut args = Map::new();
+        args.insert("pattern".into(), Value::String(needle));
+        let outcome = execute_outcome("grep", &args, &GlobalCancellation);
+        assert!(
+            outcome.ok,
+            "grep exit 1 (no matches) must be ok: {}",
+            outcome.text
+        );
+        assert!(outcome.text.trim().is_empty());
+    }
+
+    #[test]
+    fn find_defaults_path_to_workspace() {
+        let mut args = Map::new();
+        args.insert("pattern".into(), Value::String("mod.rs".into()));
+        args.insert("path".into(), Value::String("src".into()));
+        let with_path = execute_outcome("find", &args, &GlobalCancellation);
+        assert!(with_path.ok, "{}", with_path.text);
+        let mut args = Map::new();
+        args.insert("pattern".into(), Value::String("mod.rs".into()));
+        let without_path = execute_outcome("find", &args, &GlobalCancellation);
+        assert!(
+            without_path.ok,
+            "find without path must default to '.': {}",
+            without_path.text
+        );
+        assert!(without_path.text.contains("src/tools/mod.rs"));
+    }
+
+    #[test]
+    fn failed_shell_command_keeps_output_and_exit_marker() {
+        let mut args = Map::new();
+        args.insert("command".into(), Value::String("echo boom; exit 2".into()));
+        let outcome = execute_outcome("bash", &args, &GlobalCancellation);
+        assert!(!outcome.ok);
+        assert!(outcome.text.contains("boom"));
+        assert!(outcome.text.contains("[exit 2]"));
     }
 }

@@ -85,7 +85,10 @@ pub(crate) fn provider_log(event: &str, detail: &str) {
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let record =
             json!({"timestamp": chrono::Utc::now().to_rfc3339(), "event": event, "detail": detail});
-        let _ = writeln!(file, "{}", record);
+        // Single write syscall so concurrent turns cannot interleave records.
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
     }
 }
 /// Send a provider request with shared retry/backoff, 401 credential refresh

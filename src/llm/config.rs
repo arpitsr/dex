@@ -192,6 +192,9 @@ impl LlmConfig {
                         .or(file.http_connect_timeout_secs)
                         .unwrap_or(10),
                 ))
+                // Note: for the blocking client this deadline applies to the
+                // connect and to each individual body read (not to the whole
+                // streamed response), so long-lived SSE streams are safe.
                 .timeout(Duration::from_secs(
                     env::var("OYE_HTTP_REQUEST_TIMEOUT_SECS")
                         .ok()
