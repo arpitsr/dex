@@ -266,6 +266,7 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             name,
             summary,
             success,
+            preview,
         } => {
             append_sink_line(
                 &mut remote.app,
@@ -273,6 +274,7 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                     name,
                     summary,
                     success,
+                    preview,
                 },
             );
         }

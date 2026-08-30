@@ -81,6 +81,9 @@ pub enum StreamEvent {
         name: String,
         summary: String,
         success: bool,
+        /// A few informational output lines to show under the summary.
+        #[serde(default)]
+        preview: Vec<String>,
     },
 
     /// The agent needs user approval for a tool.

@@ -30,9 +30,13 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
             name,
             summary,
             success,
+            preview,
         } => {
             let icon = if success { "✓" } else { "✗" };
             eprintln!("  {icon} {name}: {summary}");
+            for line in preview {
+                eprintln!("      {line}");
+            }
         }
         StreamEvent::ApprovalRequired { name, input, .. } => {
             return Some(prompt_for_approval(&name, &input));

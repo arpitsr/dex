@@ -464,10 +464,18 @@ pub(crate) fn process_turn(
                     if cache_hit {
                         summary = format!("cached · {summary}");
                     }
+                    // Tools whose summary is a bare count get a preview from
+                    // the top of their output; for the rest the summary
+                    // already shows the first line, so preview continues
+                    // after it. Failed calls always continue past the first
+                    // line to expose the actual error detail.
+                    let counts_only = matches!(name.as_str(), "read" | "grep" | "find");
+                    let skip_first = !counts_only || !ok;
                     let _ = sink.send(SinkLine::ToolOutput {
                         name: name.clone(),
                         summary,
                         success: ok,
+                        preview: tool_result_preview(&result, 3, skip_first),
                     });
                 } else {
                     with_console(console.sink().is_some(), || {
@@ -623,5 +631,112 @@ mod tests {
         assert!(messages
             .iter()
             .any(|m| m.content.as_deref() == Some("hello from mock")));
+    }
+
+    /// Calls a tool on the first round, then answers with plain text.
+    #[derive(Clone)]
+    struct ToolThenAnswer {
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ToolThenAnswer {
+        fn new() -> Self {
+            Self {
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ModelClient for ToolThenAnswer {
+        fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _with_tools: bool,
+            _sink: Option<mpsc::Sender<SinkLine>>,
+            _cancel: &dyn CancellationSource,
+        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if round == 0 {
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: Some(vec![crate::core::types::LlmToolCall {
+                        id: "call-1".into(),
+                        call_type: "function".into(),
+                        function: crate::core::types::FunctionCall {
+                            name: "bash".into(),
+                            arguments: r#"{"command":"echo line-one; echo line-two; echo line-three; echo line-four"}"#.into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                }
+            } else {
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: Some("done".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                }
+            };
+            Ok((message, Some(1)))
+        }
+    }
+
+    #[test]
+    fn tool_result_streams_summary_preview_and_success() {
+        let config = test_config();
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let mut state = ToolState::default();
+        let (sink_tx, sink_rx) = mpsc::channel();
+        let (approval_tx, _approval_rx) = mpsc::channel();
+        let console = crate::core::console::Console::daemon(sink_tx, approval_tx);
+
+        let result = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &ToolThenAnswer::new(),
+            &NeverCancel,
+            &console,
+        );
+        assert_eq!(result.unwrap(), "done");
+
+        let outputs: Vec<SinkLine> = sink_rx
+            .try_iter()
+            .filter(|line| matches!(line, SinkLine::ToolOutput { .. }))
+            .collect();
+        let [SinkLine::ToolOutput {
+            name,
+            summary,
+            success,
+            preview,
+        }] = outputs.as_slice()
+        else {
+            panic!("expected exactly one tool output, got {outputs:?}");
+        };
+        assert_eq!(name, "bash");
+        assert!(success);
+        // Summary carries the first output line; the preview continues after
+        // it instead of repeating it.
+        assert_eq!(summary, "ok · line-one");
+        assert_eq!(
+            preview,
+            &[
+                "line-two".to_string(),
+                "line-three".to_string(),
+                "line-four".to_string()
+            ]
+        );
     }
 }

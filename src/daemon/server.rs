@@ -372,10 +372,12 @@ fn run_turn_inner(
                         name,
                         summary,
                         success,
+                        preview,
                     } => StreamEvent::ToolResult {
                         name,
                         summary,
                         success,
+                        preview,
                     },
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
