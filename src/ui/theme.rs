@@ -98,19 +98,19 @@ pub(crate) fn surface_fg() -> Color {
 }
 
 /// Foreground for secondary text on a raised surface (descriptions, hints):
-/// quiet, but still readable in both theme modes.
+/// quiet, but still readable in both theme modes. Uses the same blended
+/// foreground guideline as tool input/previews so it keeps the terminal's
+/// hue and stays readable on tinted backgrounds instead of a fixed ANSI gray.
 pub(crate) fn secondary_fg() -> Color {
-    match background() {
-        // Bright black is a readable mid-gray on light themes, whereas ANSI
-        // silver (Gray) all but disappears on them.
-        Background::Light => Color::DarkGray,
-        _ => Color::Gray,
-    }
+    tool_muted_fg()
 }
 
 /// Foreground for de-emphasised text on the composer/surface.
+/// Uses the same blended-foreground guideline as tool input/previews so
+/// de-emphasised text keeps the terminal's hue and stays readable on
+/// tinted light/dark backgrounds instead of a fixed low-contrast gray.
 pub(crate) fn muted_fg() -> Color {
-    Color::DarkGray
+    tool_muted_fg()
 }
 
 /// Core readable color for secondary tool text (args + previews).
