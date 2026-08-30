@@ -251,6 +251,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             name,
             summary,
             success,
+            preview,
         } => {
             let failed = !success;
             let color = if failed {
@@ -264,6 +265,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 Span::styled(name, Style::default().fg(Color::DarkGray)),
                 Span::styled(format!(" {summary}"), Style::default().fg(color)),
             ])));
+            push_tool_preview(&mut app.transcript, &preview);
         }
         SinkLine::System(s) => app.transcript.push(indent_transcript_line(Line::from(vec![
             Span::styled("· ", Style::default().fg(Color::DarkGray)),
@@ -290,6 +292,17 @@ fn is_tool_line(line: &Line<'static>) -> bool {
     line.spans.iter().any(|span| {
         span.content.as_ref().starts_with("▸") || span.content.as_ref().starts_with("└")
     })
+}
+
+/// Render a tool result's informational preview lines: indented under the
+/// `└` result line and dimmed, so they read as detail rather than dialogue.
+fn push_tool_preview(transcript: &mut Vec<Line<'static>>, preview: &[String]) {
+    for line in preview {
+        transcript.push(indent_transcript_line(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
 }
 
 fn is_user_line(line: &Line<'static>) -> bool {
@@ -366,5 +379,21 @@ mod tests {
         let (branch, dirty) = crate::core::format::git_context("/tmp/not-a-repo-12345");
         assert!(branch.is_none());
         assert!(!dirty);
+    }
+
+    #[test]
+    fn tool_preview_lines_are_indented_and_dimmed() {
+        let mut transcript: Vec<Line<'static>> = Vec::new();
+        push_tool_preview(
+            &mut transcript,
+            &["src/main.rs".into(), "… +3 more lines".into()],
+        );
+        assert_eq!(transcript.len(), 2);
+        for line in &transcript {
+            assert!(line.spans.len() == 2); // indent gutter + content
+            assert_eq!(line.spans[1].style.fg, Some(Color::DarkGray));
+        }
+        assert!(transcript[0].spans[1].content.as_ref() == "  src/main.rs");
+        assert!(transcript[1].spans[1].content.as_ref() == "  … +3 more lines");
     }
 }

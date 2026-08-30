@@ -22,6 +22,8 @@ pub enum SinkLine {
         summary: String,
         /// Whether the tool call succeeded; rendered as ✓/✗ by the UIs.
         success: bool,
+        /// A few informational output lines shown dim under the summary.
+        preview: Vec<String>,
     },
     System(String),
     Error(String),

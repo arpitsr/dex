@@ -75,6 +75,70 @@ pub(crate) fn one_line_summary(text: &str) -> String {
     line[..limit].to_string()
 }
 
+/// Drop ANSI escape sequences (colors, cursor movement) so tool output
+/// renders as plain text in the transcript.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            // Consume the CSI sequence up to its final byte (@..~).
+            for next in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&next) {
+                    break;
+                }
+            }
+        }
+        // A lone ESC (or non-CSI sequence) is dropped.
+    }
+    out
+}
+
+/// A few informational lines from a tool result, rendered dim under the
+/// one-line summary: enough to see *what* happened without flooding the
+/// transcript. Blank lines and ANSI escapes are removed; when truncated, a
+/// `… +N more lines` tail notes how much was elided. `skip_first` lets
+/// callers omit the line the one-line summary already shows.
+pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool) -> Vec<String> {
+    let mut lines = text
+        .lines()
+        .map(strip_ansi)
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty());
+    if skip_first {
+        lines.next();
+    }
+    let mut preview: Vec<String> = lines
+        .by_ref()
+        .map(|line| {
+            let limit = line
+                .char_indices()
+                .nth(120)
+                .map(|(i, _)| i)
+                .unwrap_or(line.len());
+            let mut clipped = line[..limit].to_string();
+            if limit < line.len() {
+                clipped.push('…');
+            }
+            clipped
+        })
+        .take(max_lines)
+        .collect();
+    let remaining = lines.count();
+    if remaining > 0 {
+        preview.push(format!(
+            "… +{remaining} more line{}",
+            if remaining == 1 { "" } else { "s" }
+        ));
+    }
+    preview
+}
+
 /// Human-sized result for the TUI. The full result still goes to the model;
 /// the transcript only needs enough information to explain what happened.
 /// Failure is passed in by the caller (which knows the real exit status) —
@@ -140,5 +204,40 @@ mod tests {
             "failed · ls: no such file"
         );
         assert_eq!(tool_result_summary("grep", "", true), "ok · 0 matches");
+    }
+
+    #[test]
+    fn preview_shows_meaningful_lines_with_more_tail() {
+        let text = "\nfirst\n\nsecond\nthird\nfourth\n";
+        assert_eq!(
+            tool_result_preview(text, 3, false),
+            vec!["first", "second", "third", "… +1 more line"]
+        );
+    }
+
+    #[test]
+    fn preview_can_skip_the_line_already_in_the_summary() {
+        let text = "Error: boom\nat src/main.rs:1\nat src/main.rs:2\n";
+        assert_eq!(
+            tool_result_preview(text, 3, true),
+            vec!["at src/main.rs:1", "at src/main.rs:2"]
+        );
+    }
+
+    #[test]
+    fn preview_strips_ansi_and_clips_long_lines() {
+        let text = format!("\x1b[1;32m{}\x1b[0m", "x".repeat(200));
+        let preview = tool_result_preview(&text, 1, false);
+        assert_eq!(preview.len(), 1);
+        assert!(preview[0].starts_with("xxx"));
+        assert!(preview[0].ends_with('…'));
+        assert!(preview[0].chars().count() <= 121);
+        assert!(!preview[0].contains('\x1b'));
+    }
+
+    #[test]
+    fn preview_of_empty_output_is_empty() {
+        assert!(tool_result_preview("", 3, false).is_empty());
+        assert!(tool_result_preview("\n \n", 3, true).is_empty());
     }
 }
