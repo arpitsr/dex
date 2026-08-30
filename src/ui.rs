@@ -294,7 +294,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let input = indent_transcript_line(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Yellow)),
                 Span::styled(name, Style::default().fg(Color::Yellow)),
-                Span::styled(format!(" {arg}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {arg}"), Style::default().fg(theme::tool_input_fg())),
             ]));
             app.transcript.push(TranscriptBlock::Tool {
                 input,
@@ -334,7 +334,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 .map(|line| {
                     indent_transcript_line(Line::from(Span::styled(
                         format!("  {line}"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme::tool_preview_fg()),
                     )))
                 })
                 .collect();
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(preview.len(), 2);
         for line in preview {
             assert!(line.spans.len() == 2); // indent gutter + content
-            assert_eq!(line.spans[1].style.fg, Some(Color::DarkGray));
+            assert_eq!(line.spans[1].style.fg, Some(theme::tool_preview_fg()));
         }
         assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
         assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");

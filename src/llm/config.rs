@@ -183,7 +183,7 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_turn_seconds)
-                .unwrap_or(900),
+                .unwrap_or(3600),
             client: reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(
                     env::var("OYE_HTTP_CONNECT_TIMEOUT_SECS")
