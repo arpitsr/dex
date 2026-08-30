@@ -282,9 +282,12 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             );
         }
         StreamEvent::ApprovalRequired { name, input, .. } => {
-            // The worker thread is parked waiting for this decision; show the
-            // overlay. The decision travels through `decision_tx`, which the
-            // worker converts into a POST /approve.
+            // Invariant: the daemon parks at most one approval per turn
+            // (agent thread blocks until it is resolved), so overwriting would
+            // drop the prior sender. If it happens, deny the stale one.
+            if let Some(stale) = remote.app.pending_approval.take() {
+                let _ = stale.response.send(CoreApprovalDecision::Deny);
+            }
             remote.app.pending_approval = Some(PendingApproval {
                 name,
                 input,
@@ -661,9 +664,23 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
         }
         _ => {
+            let had_model = app.config.model.clone();
+            let had_permission = app.config.permission;
             let quit = handle_slash(app, line);
-            // /model <m> mutates the display config; forward it to future turns.
-            remote.options.model = Some(remote.app.config.model.clone());
+            // Forward mutations made by handle_slash (model/permission)
+            // so future turns use the same overrides. Base URL and skill dirs
+            // are daemon-owned and not forwarded.
+            if app.config.model != had_model {
+                remote.options.model = Some(app.config.model.clone());
+            }
+            if app.config.permission != had_permission {
+                remote.options.permission = Some(match app.config.permission {
+                    PermissionMode::ReadOnly => "read-only".to_string(),
+                    PermissionMode::AskWrites => "ask-writes".to_string(),
+                    PermissionMode::AskShell => "ask-shell".to_string(),
+                    PermissionMode::Trusted => "trusted".to_string(),
+                });
+            }
             return quit;
         }
     }

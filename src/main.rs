@@ -205,6 +205,11 @@ fn main() {
             } else {
                 ([127, 0, 0, 1], bind.parse().unwrap_or(8420)).into()
             };
+            if addr.ip().is_unspecified() {
+                eprintln!(
+                    "warning: daemon listening on {addr} is exposed on all interfaces and has no authentication — prefer 127.0.0.1 for local use"
+                );
+            }
             let listener = match std::net::TcpListener::bind(addr) {
                 Ok(listener) => listener,
                 Err(e) => {

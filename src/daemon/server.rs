@@ -157,6 +157,9 @@ async fn create_session(
 }
 
 async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    // Sessions are in-memory only; after a daemon restart the map is empty
+    // even though session files remain on disk. This is a known limitation —
+    // the next turn creates a fresh session and history is still on disk.
     let sessions: Vec<serde_json::Value> = state
         .sessions
         .lock()
@@ -243,42 +246,63 @@ fn run_agent_turn(
     cancel: CancellationToken,
     tx: mpsc::Sender<StreamEvent>,
 ) {
-    let result = run_turn_inner(&state, &session_id, &req, &cancel, &tx);
-
-    // Resolve any approvals still pending for this session (the turn is over;
-    // nothing can consume them anymore).
-    {
-        let mut pending = state
-            .pending_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        pending.retain(|_, p| {
-            if p.session_id == session_id {
-                let _ = p.response.send(ApprovalDecision::Deny);
-                false
-            } else {
-                true
-            }
-        });
+    // Use a guard so active_turns/cancel_tokens/pending approvals are cleaned
+    // even when run_turn_inner panics inside spawn_blocking.
+    struct TurnGuard {
+        state: Arc<DaemonState>,
+        session_id: String,
     }
-    state
-        .active_turns
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&session_id);
-    state
-        .cancel_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&session_id);
+    impl Drop for TurnGuard {
+        fn drop(&mut self) {
+            {
+                let mut pending = self
+                    .state
+                    .pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                pending.retain(|_, p| {
+                    if p.session_id == self.session_id {
+                        let _ = p.response.send(ApprovalDecision::Deny);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            self.state
+                .active_turns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
+            self.state
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
+        }
+    }
+    let _guard = TurnGuard {
+        state: state.clone(),
+        session_id: session_id.clone(),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_turn_inner(&state, &session_id, &req, &cancel, &tx)
+    }));
+    // Drop the guard now before sending the terminal event so a new turn can
+    // be accepted promptly; drop ordering handles pending approvals/active turns.
+    drop(_guard);
 
     match result {
-        Ok((response, usage)) => {
-            // Stream closed (client disconnected): stop trying to deliver.
+        Ok(Ok((response, usage))) => {
             let _ = tx.blocking_send(StreamEvent::TurnComplete { response, usage });
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             let _ = tx.blocking_send(StreamEvent::TurnFailed { error });
+        }
+        Err(_) => {
+            let _ = tx.blocking_send(StreamEvent::TurnFailed {
+                error: "turn panicked".to_string(),
+            });
         }
     }
 }
@@ -450,17 +474,17 @@ fn run_turn_inner(
 
 async fn approve(
     State(state): State<Arc<DaemonState>>,
-    Path(_session_id): Path<String>,
+    Path(session_id): Path<String>,
     Json(req): Json<ApprovalResponse>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let sender = state
+    let pending = state
         .pending_approvals
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&req.request_id);
 
-    match sender {
-        Some(pending) => {
+    match pending {
+        Some(pending) if pending.session_id == session_id => {
             let decision = match req.decision {
                 crate::protocol::ApprovalDecision::AllowOnce => ApprovalDecision::Once,
                 crate::protocol::ApprovalDecision::AllowSession => ApprovalDecision::Session,
@@ -468,6 +492,16 @@ async fn approve(
             };
             let _ = pending.response.send(decision);
             Ok(Json(json!({ "status": "ok" })))
+        }
+        Some(pending) => {
+            // Restore on cross-session attempt so the legitimate session can
+            // still resolve it.
+            state
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(req.request_id, pending);
+            Err(StatusCode::NOT_FOUND)
         }
         None => Err(StatusCode::NOT_FOUND),
     }
