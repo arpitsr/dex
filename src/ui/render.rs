@@ -761,7 +761,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn test_app() -> super::super::App {
-        let cwd = "/tmp/ak-ui-test".to_string();
+        let cwd = "/tmp/oye-ui-test".to_string();
         super::super::App {
             transcript: vec![super::super::indent_transcript_line(Line::from(
                 "hello from the transcript — this line is intentionally long enough to wrap",

@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::agent::state::CancellationSource;
+
 unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
@@ -156,7 +158,7 @@ fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
     else {
         return;
     };
-    let path = base.join("ak/audit.jsonl");
+    let path = base.join("oye/audit.jsonl");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -173,10 +175,10 @@ fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
 }
 
 /// Maximum wall-clock duration for a shell command.
-/// Configure with AK_TOOL_TIMEOUT_SECS (default: 120).
-/// Output is capped by AK_TOOL_OUTPUT_BYTES (default: 1 MiB).
+/// Configure with OYE_TOOL_TIMEOUT_SECS (default: 120).
+/// Output is capped by OYE_TOOL_OUTPUT_BYTES (default: 1 MiB).
 fn shell_timeout() -> Duration {
-    env::var("AK_TOOL_TIMEOUT_SECS")
+    env::var("OYE_TOOL_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -198,24 +200,21 @@ fn read_limited<R: Read>(mut reader: R, limit: usize) -> Vec<u8> {
     bytes
 }
 
-pub(crate) fn cancellation_requested() -> bool {
-    crate::core::console::take_cancel_requested()
-}
-
-fn run_bash(command: &str) -> Result<String, ToolError> {
+fn run_bash(command: &str, cancel: &dyn CancellationSource) -> Result<String, ToolError> {
     let timeout = shell_timeout();
-    let max_bytes = env::var("AK_TOOL_OUTPUT_BYTES")
+    let max_bytes = env::var("OYE_TOOL_OUTPUT_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
         .unwrap_or_else(|| CONFIGURED_OUTPUT_LIMIT.load(Ordering::Relaxed));
-    run_bash_with_limits(command, timeout, max_bytes)
+    run_bash_with_limits(command, timeout, max_bytes, cancel)
 }
 
 fn run_bash_with_limits(
     command: &str,
     timeout: Duration,
     max_bytes: usize,
+    cancel: &dyn CancellationSource,
 ) -> Result<String, ToolError> {
     let mut child = Command::new("sh")
         .arg("-c")
@@ -238,7 +237,7 @@ fn run_bash_with_limits(
         if let Some(status) = child.try_wait().map_err(ToolError::Io)? {
             break status;
         }
-        if cancellation_requested() {
+        if cancel.is_cancelled() {
             unsafe {
                 let _ = kill(-(child.id() as i32), SIGKILL);
             }
@@ -277,8 +276,8 @@ fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
     fs::read_to_string(workspace_path(&arg_str(args, "path")?)?).map_err(ToolError::Io)
 }
 
-fn tool_bash(args: &Map<String, Value>) -> Result<String, ToolError> {
-    run_bash(&arg_str(args, "command")?)
+fn tool_bash(args: &Map<String, Value>, cancel: &dyn CancellationSource) -> Result<String, ToolError> {
+    run_bash(&arg_str(args, "command")?, cancel)
 }
 
 fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
@@ -305,18 +304,24 @@ fn replace_exact(content: &str, old: &str, new: &str) -> Result<String, ToolErro
     Ok(content.replacen(old, new, 1))
 }
 
-fn tool_grep(args: &Map<String, Value>) -> Result<String, ToolError> {
+fn tool_grep(args: &Map<String, Value>, cancel: &dyn CancellationSource) -> Result<String, ToolError> {
     let pattern = arg_str(args, "pattern")?;
     let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
     let path = workspace_path(&path)?;
-    run_bash(&format!(
-        "grep -R -I -n -- {} {}",
-        shell_escape(&pattern),
-        shell_escape(&path.to_string_lossy())
-    ))
+    run_bash(
+        &format!(
+            "grep -R -I -n -- {} {}",
+            shell_escape(&pattern),
+            shell_escape(&path.to_string_lossy())
+        ),
+        cancel,
+    )
 }
 
-fn tool_find(args: &Map<String, Value>) -> Result<String, ToolError> {
+fn tool_find(
+    args: &Map<String, Value>,
+    cancel: &dyn CancellationSource,
+) -> Result<String, ToolError> {
     let pattern = arg_str(args, "pattern")?;
     let path = arg_str(args, "path")?;
     if pattern.trim().is_empty() || pattern == "*" {
@@ -325,11 +330,14 @@ fn tool_find(args: &Map<String, Value>) -> Result<String, ToolError> {
         ));
     }
     let path = workspace_path(&path)?;
-    run_bash(&format!(
-        "find {} -path '*{}*' -print",
-        shell_escape(&path.to_string_lossy()),
-        shell_escape(&pattern)
-    ))
+    run_bash(
+        &format!(
+            "find {} -path '*{}*' -print",
+            shell_escape(&path.to_string_lossy()),
+            shell_escape(&pattern)
+        ),
+        cancel,
+    )
 }
 
 fn tool_git(args: &Map<String, Value>) -> Result<String, ToolError> {
@@ -356,7 +364,11 @@ fn shell_escape(s: &str) -> String {
 }
 
 /// Execute a tool using paths confined to the current workspace.
-pub(crate) fn execute(name: &str, args: &Map<String, Value>) -> Result<String, ToolError> {
+pub(crate) fn execute(
+    name: &str,
+    args: &Map<String, Value>,
+    cancel: &dyn CancellationSource,
+) -> Result<String, ToolError> {
     if metadata(name).is_none() {
         let error = ToolError::Unknown(name.to_string());
         audit(name, args, &error.to_string());
@@ -364,11 +376,11 @@ pub(crate) fn execute(name: &str, args: &Map<String, Value>) -> Result<String, T
     }
     let result = match name {
         "read" => tool_read(args),
-        "bash" => tool_bash(args),
+        "bash" => tool_bash(args, cancel),
         "write" => tool_write(args),
         "edit" => tool_edit(args),
-        "grep" => tool_grep(args),
-        "find" => tool_find(args),
+        "grep" => tool_grep(args, cancel),
+        "find" => tool_find(args, cancel),
         "git" => tool_git(args),
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
@@ -380,8 +392,12 @@ pub(crate) fn execute(name: &str, args: &Map<String, Value>) -> Result<String, T
     result
 }
 
-pub(crate) fn execute_to_string(name: &str, args: &Map<String, Value>) -> String {
-    match execute(name, args) {
+pub(crate) fn execute_to_string(
+    name: &str,
+    args: &Map<String, Value>,
+    cancel: &dyn CancellationSource,
+) -> String {
+    match execute(name, args, cancel) {
         Ok(out) => out,
         Err(e) => format!("Error: {}", e),
     }
@@ -390,6 +406,7 @@ pub(crate) fn execute_to_string(name: &str, args: &Map<String, Value>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::state::GlobalCancellation;
     #[test]
     fn shell_escape_handles_quotes_and_commands() {
         assert_eq!(shell_escape("a'b; echo hacked"), "'a'\"'\"'b; echo hacked'");
@@ -405,13 +422,13 @@ mod tests {
     fn tool_arguments_are_validated() {
         let args = Map::new();
         assert!(matches!(
-            execute("read", &args),
+            execute("read", &args, &GlobalCancellation),
             Err(ToolError::Missing("path"))
         ));
         let mut args = Map::new();
         args.insert("path".into(), Value::Bool(true));
         assert!(matches!(
-            execute("read", &args),
+            execute("read", &args, &GlobalCancellation),
             Err(ToolError::NotString("path"))
         ));
     }
@@ -422,7 +439,7 @@ mod tests {
         args.insert("pattern".into(), Value::String("*".into()));
         args.insert("path".into(), Value::String(".".into()));
         assert!(matches!(
-            execute("find", &args),
+            execute("find", &args, &GlobalCancellation),
             Err(ToolError::InvalidArgument(_))
         ));
     }
@@ -442,7 +459,7 @@ mod tests {
 
     #[test]
     fn temporary_workspace_paths_are_confined() {
-        let root = std::env::temp_dir().join(format!("ak-workspace-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("oye-workspace-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         assert!(resolve_workspace_path(&root, "inside.txt")
             .unwrap()
@@ -456,7 +473,9 @@ mod tests {
 
     #[test]
     fn shell_timeout_terminates_long_running_command() {
-        let result = run_bash_with_limits("sleep 1", Duration::from_millis(10), 1024).unwrap();
+        let result =
+            run_bash_with_limits("sleep 1", Duration::from_millis(10), 1024, &GlobalCancellation)
+                .unwrap();
         assert!(result.contains("timed out"));
     }
 }

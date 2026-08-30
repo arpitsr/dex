@@ -19,15 +19,15 @@ pub(crate) struct Args {
 /// The mode in which the binary was invoked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// Start a headless HTTP server (`ak serve`).
-    Serve { port: u16 },
-    /// Start the TUI connected to a remote daemon (`ak connect <url>`).
+    /// Start a headless HTTP server (`oye serve [host:port|port]`).
+    Serve { bind: String },
+    /// Start the TUI connected to a remote daemon (`oye connect <url>`).
     Connect { url: String },
-    /// Start both server + TUI in the same process (default `ak`).
+    /// Start both server + TUI in the same process (default `oye`).
     Default,
-    /// One-shot prompt (`ak "prompt"`).
+    /// One-shot prompt (`oye "prompt"`).
     OneShot { prompt: String },
-    /// Raw tool mode (`ak --tool`).
+    /// Raw tool mode (`oye --tool`).
     Tool,
 }
 
@@ -79,12 +79,12 @@ pub(crate) fn parse_args() -> Args {
 pub(crate) fn resolve_mode(args: &Args) -> Mode {
     match args.rest.first().map(|s| s.as_str()) {
         Some("serve") => {
-            let port = args
+            let bind = args
                 .rest
                 .get(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8420);
-            Mode::Serve { port }
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:8420".to_string());
+            Mode::Serve { bind }
         }
         Some("connect") => {
             let url = args

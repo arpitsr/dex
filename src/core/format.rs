@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::process::Command;
 
 pub(crate) fn truncate_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
     let mut preview = String::new();
@@ -96,4 +97,22 @@ pub(crate) fn tool_result_summary(name: &str, text: &str) -> String {
 
 pub(crate) fn model_tool_result(text: &str) -> String {
     truncate_text(text, 50 * 1024, 2_000)
+}
+
+/// Git branch + dirty flag for a working directory, for status displays.
+pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
+    let branch = Command::new("git")
+        .args(["-C", cwd, "branch", "--show-current"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty());
+    let dirty = branch.is_some()
+        && Command::new("git")
+            .args(["-C", cwd, "status", "--porcelain"])
+            .output()
+            .ok()
+            .is_some_and(|output| !output.stdout.is_empty());
+    (branch, dirty)
 }

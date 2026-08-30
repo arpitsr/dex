@@ -90,6 +90,7 @@ impl StreamPrinter {
 pub(crate) fn read_stream(
     response: reqwest::blocking::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &dyn crate::agent::state::CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
@@ -100,12 +101,12 @@ pub(crate) fn read_stream(
     let mut usage_tokens: Option<u64> = None;
 
     loop {
-        if take_interrupt() || take_cancel_requested() {
-            // Ctrl+C during generation: stop consuming the stream and
+        if cancel.take_cancelled() {
+            // Cancellation during generation: stop consuming the stream and
             // unwind so control returns to the prompt.
             with_console(sink.is_some(), || println!());
             io::stdout().flush()?;
-            return Err("interrupted".into());
+            return Err("cancelled".into());
         }
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -166,6 +167,7 @@ pub(crate) fn read_stream(
 pub(crate) fn read_responses_stream(
     response: reqwest::blocking::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &dyn crate::agent::state::CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
@@ -178,10 +180,10 @@ pub(crate) fn read_responses_stream(
     let mut usage_tokens = None;
 
     loop {
-        if take_interrupt() || take_cancel_requested() {
+        if cancel.take_cancelled() {
             with_console(sink.is_some(), || println!());
             io::stdout().flush()?;
-            return Err("interrupted".into());
+            return Err("cancelled".into());
         }
         line.clear();
         if reader.read_line(&mut line)? == 0 {

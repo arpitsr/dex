@@ -1,6 +1,6 @@
-# ak
+# oye
 
-A terminal-based coding agent written in Rust. `ak` talks to OpenAI-compatible
+A terminal-based coding agent written in Rust. `oye` talks to OpenAI-compatible
 Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`, `grep`,
 `find`) to operate on your local files, and offers an interactive TUI, a
 one-shot prompt mode, and a raw JSON tool mode. Conversations are persisted as
@@ -13,7 +13,7 @@ sessions and can be resumed.
   automatic retries with exponential backoff, and configurable reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write
   and edit files, search the filesystem, and inspect git status/diffs. Tool
-  output caching is disabled by default; set `AK_TOOL_CACHE=1` to opt in.
+  output caching is disabled by default; set `OYE_TOOL_CACHE=1` to opt in.
 - **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript
   (via `ratatui-markdown`), a custom multi-line input editor with an inline
   block cursor and soft-wrapping (no `tui-textarea` underline / horizontal
@@ -35,22 +35,22 @@ Requires a Rust toolchain (edition 2021):
 
 ```sh
 cargo build --release
-# binary: target/release/ak
+# binary: target/release/oye
 ```
 
 ## Configuration
 
 Configuration is read from a JSON file. The path is resolved in this order:
 
-1. `$RUSTY_PI_CONFIG` (if set)
-2. `$XDG_CONFIG_HOME/ak/config.json`
-3. `~/.config/ak/config.json`
+1. `$OYE_CONFIG` (if set)
+2. `$XDG_CONFIG_HOME/oye/config.json`
+3. `~/.config/oye/config.json`
 
 Copy the sample to get started:
 
 ```sh
-mkdir -p ~/.config/ak
-cp config.sample.json ~/.config/ak/config.json
+mkdir -p ~/.config/oye
+cp config.sample.json ~/.config/oye/config.json
 ```
 
 `config.json` fields:
@@ -61,10 +61,10 @@ cp config.sample.json ~/.config/ak/config.json
 | `api_key`        | string   | Default API key (overridable by `OPENAI_API_KEY`).                 |
 | `base_url`       | string   | Default API base URL (overridable by `OPENAI_BASE_URL`).           |
 | `model`          | string   | Default model (overridable by `OPENAI_MODEL`).                     |
-| `models`         | string[] | Models shown by `/model` autocomplete (also configurable via `AK_MODELS`, comma-separated). |
+| `models`         | string[] | Models shown by `/model` autocomplete (also configurable via `OYE_MODELS`, comma-separated). |
 | `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
 | `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
-| `context_window` | integer  | Token context window used for compaction/status (overridable by `AK_CONTEXT_WINDOW`). |
+| `context_window` | integer  | Token context window used for compaction/status (overridable by `OYE_CONTEXT_WINDOW`). |
 | `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits. |
 | `http_connect_timeout_secs` / `http_request_timeout_secs` | integer | HTTP connection and request limits. |
 
@@ -81,7 +81,7 @@ For OpenCode, use its API key and endpoint. For ChatGPT-backed Codex, first run
 }
 ```
 
-When `provider` is `openai-codex`, `ak` reads the current access token and
+When `provider` is `openai-codex`, `oye` reads the current access token and
 account ID from `CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or
 `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`). Run `codex --login`
 again when the local token expires.
@@ -99,10 +99,10 @@ A minimal example:
 
 ## Usage
 
-Run `ak` with no arguments to launch the interactive TUI:
+Run `oye` with no arguments to launch the interactive TUI:
 
 ```sh
-ak
+oye
 ```
 
 Ask it to do something:
@@ -116,20 +116,50 @@ Ask it to do something:
 Pass a prompt as arguments to get a single answer (no TUI):
 
 ```sh
-ak "explain the Cargo.toml dependencies"
+oye "explain the Cargo.toml dependencies"
 ```
 
 ### Raw tool mode
 
-`ak --tool` reads JSON tool-invocation lines from stdin and prints JSON
+`oye --tool` reads JSON tool-invocation lines from stdin and prints JSON
 results. Useful for piping tool calls from another process:
 
 ```sh
-echo '{"name":"read","args":{"path":"Cargo.toml"}}' | ak --tool
-# => {"ok":"[package]\nname = \"ak\"\n..."}
+echo '{"name":"read","args":{"path":"Cargo.toml"}}' | oye --tool
+# => {"ok":"[package]\nname = \"oye\"\n..."}
 ```
 
 An empty line quits raw tool mode.
+
+### Client–server mode
+
+The TUI is a pure HTTP client; all agent work (LLM calls, tools, sessions)
+happens in a daemon. `oye` with no arguments starts a daemon in the
+background and attaches the TUI to it:
+
+```sh
+oye                     # daemon on a random localhost port + TUI
+```
+
+Run the daemon headless (e.g. on a remote machine, in the directory you want
+as the agent workspace) and connect the TUI from anywhere:
+
+```sh
+oye serve               # daemon on 127.0.0.1:8420
+oye serve 0.0.0.0:8420  # reachable from other machines
+oye connect http://127.0.0.1:8420
+oye connect http://10.0.0.5:8420 "explain the Cargo.toml dependencies"  # one-shot
+```
+
+The TUI behaves exactly like the local one: assistant text streams live,
+tool calls and results appear as they happen, tool approvals pop up as an
+overlay (the daemon parks the turn until you decide), and Ctrl+C/Esc cancels
+the in-flight turn. API keys, the model, and the permission mode are
+resolved by the daemon's own environment/config file; client flags like
+`--model` and `--permission` are forwarded as per-request overrides.
+
+Note that tools execute on the machine where the daemon runs, confined to
+the daemon's working directory.
 
 ## Command-line flags
 
@@ -149,9 +179,9 @@ workspace; `bash` can execute arbitrary commands in that workspace and should
 only be enabled in trusted environments. Shell commands default to 120
 seconds and 1 MiB per output stream. HTTP requests default to 10 seconds to
 connect and 300 seconds overall. Tool calls are recorded in
-`$XDG_DATA_HOME/ak/audit.jsonl` (or the equivalent path under
-`~/.local/share`). Configure limits with `AK_TOOL_*`, `AK_HTTP_*`, and
-`AK_MAX_*` environment variables or the corresponding JSON config fields.
+`$XDG_DATA_HOME/oye/audit.jsonl` (or the equivalent path under
+`~/.local/share`). Configure limits with `OYE_TOOL_*`, `OYE_HTTP_*`, and
+`OYE_MAX_*` environment variables or the corresponding JSON config fields.
 
 In the interactive TUI, actions requiring approval open a dedicated overlay.
 Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`,
@@ -186,10 +216,11 @@ Any other arguments are treated as a one-shot prompt.
 - **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages.
 - **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the transcript.
 - **Paste** — pasted text is inserted at the cursor.
+- **Mouse drag** — selects text natively for copying; the TUI does not capture the mouse.
 
 ### Steering and follow-ups
 
-While `ak` is working, the input remains available. Submitted steering and
+While `oye` is working, the input remains available. Submitted steering and
 follow-up messages stay visible in the queue directly above the input box until
 the worker accepts them. Steering is delivered before the next model call;
 follow-ups wait until the current task has finished. The queue is kept separate
@@ -199,12 +230,12 @@ from the transcript so pending messages do not scroll away.
 
 Sessions are stored as JSONL files under:
 
-- `$XDG_DATA_HOME/ak/sessions` (or `~/.local/share/ak/sessions`),
+- `$XDG_DATA_HOME/oye/sessions` (or `~/.local/share/oye/sessions`),
 - organized in subdirectories by a slug of the current working directory.
 
 Each file starts with a `session` header line followed by `message` entries and
 optional `session_info` (rename) entries. Entries are appended after every
-turn, so a crash or Ctrl+C loses at most the in-progress turn. Starting `ak` in
+turn, so a crash or Ctrl+C loses at most the in-progress turn. Starting `oye` in
 a directory creates a fresh session; use `--session <path>` to continue a saved
 one.
 
@@ -212,9 +243,9 @@ one.
 
 Skills are discovered from these directories (first match wins per directory):
 
-- `<cwd>/.ak/skills`
+- `<cwd>/.oye/skills`
 - `<cwd>/.agents/skills`
-- `$XDG_CONFIG_HOME/ak/skills` (or `~/.config/ak/skills`)
+- `$XDG_CONFIG_HOME/oye/skills` (or `~/.config/oye/skills`)
 
 A skill is a directory containing a `SKILL.md` file with YAML frontmatter:
 
@@ -246,7 +277,7 @@ schema):
 | `find`  | Find file paths matching a pattern (`pattern`, `path`).          |
 
 Tool results are truncated before being sent back to the model, and a result
-cache (`ak-tool-cache.json`) is kept across runs to reduce redundant work.
+cache (`oye-tool-cache.json`) is kept across runs to reduce redundant work.
 
 ## Environment variables
 
@@ -256,21 +287,21 @@ cache (`ak-tool-cache.json`) is kept across runs to reduce redundant work.
 | `OPENAI_BASE_URL`    | API base URL override (non-empty).                       |
 | `OPENAI_MODEL`       | Model override.                                          |
 | `OPENAI_API`         | Wire protocol override (`openai-completions` or `openai-responses`). |
-| `AK_PROVIDER`        | Provider override (`opencode` or `openai-codex`).          |
+| `OYE_PROVIDER`        | Provider override (`opencode` or `openai-codex`).          |
 | `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |
 | `CODEX_ACCOUNT_ID`   | Account ID paired with `CODEX_ACCESS_TOKEN`.               |
-| `AK_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
-| `AK_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
-| `AK_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
-| `RUSTY_PI_CONFIG`    | Explicit path to `config.json`.                          |
+| `OYE_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
+| `OYE_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
+| `OYE_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
+| `OYE_CONFIG`    | Explicit path to `config.json`.                          |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
 
 ## Project structure
 
 ```
-ak/
-├── .ak/
+oye/
+├── .oye/
 │   └── skills/           # (optional) project-level agent skills
 ├── target/
 ├── Cargo.lock
@@ -278,27 +309,35 @@ ak/
 ├── README.md
 ├── config.sample.json
 └── src/
-    ├── main.rs           # agent core: LLM client, tool loop, sessions, CLI
+    ├── main.rs           # entry point: mode resolution, daemon bootstrap
+    ├── cli.rs            # argument parsing / invocation mode
+    ├── protocol/         # client<->daemon wire types (HTTP + SSE events)
+    ├── client/           # HTTP client: SSE turn streaming, approvals, REPL
+    ├── daemon/           # axum daemon: sessions, chat SSE, approve, cancel
+    ├── agent/            # turn loop, steering, compaction, tool state
+    ├── core/             # console sinks, formatting, highlighting, types
+    ├── llm/              # provider clients, streaming parsers, auth, config
     ├── session.rs        # JSONL session persistence
-    ├── tools.rs          # builtin tools: read, bash, write, edit, grep, find
-    └── ui.rs             # ratatui interactive REPL
+    ├── tools/            # builtin tools: read, bash, write, edit, grep, find
+    ├── skills.rs         # skill discovery
+    └── ui/               # ratatui TUI (local event loop + remote client UI)
 ```
 
 ## How it works
 
-`src/main.rs` contains the agent core: configuration loading, the OpenAI
-client + streaming parser (`read_stream`/`call_llm`), the tool implementations
-(`execute`), session persistence (`Session`), skills discovery, history
-compaction, and the headless one-shot / raw-tool entry points. `src/ui.rs`
-implements the `ratatui` REPL; it runs `process_turn` on a worker thread and
-routes streamed output into the UI through a channel (`SinkLine`). `src/tools.rs`
-holds the six builtin tool implementations, and `src/session.rs` manages the
-JSONL conversation logs.
+A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
+model with tools enabled, executes any requested tool calls in parallel, feeds
+results back, and compacts history once the message count or estimated token
+budget is exceeded. A wrap-up nudge is injected when few tool-call iterations
+remain. Progress is reported through a `Console` (streamed lines + approval
+requests).
 
-The turn loop (`process_turn`) repeatedly calls the model with tools enabled,
-executes any requested tool calls in parallel, feeds results back, and compacts
-history once the message count or estimated token budget is exceeded. A
-wrap-up nudge is injected when few tool-call iterations remain.
+In client–server mode the daemon runs `process_turn` on a blocking thread and
+translates console output into `StreamEvent`s over SSE
+(`src/daemon/server.rs`). The TUI (`src/ui/remote.rs`) consumes those events
+from a worker thread and renders them live; approvals and cancellation are
+round-tripped over `POST .../approve` and `POST .../cancel`. The local TUI
+(`src/ui/event.rs`) runs the same loop in-process with direct channels.
 
 ## License
 

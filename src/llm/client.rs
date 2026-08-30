@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use crate::agent::state::CancellationSource;
 use crate::core::console::*;
 use crate::core::types::*;
 use crate::llm::auth::*;
@@ -35,6 +36,7 @@ pub(crate) trait ModelClient {
         messages: &[ChatMessage],
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
+        cancel: &dyn CancellationSource,
     ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>>;
 }
 
@@ -44,8 +46,9 @@ impl ModelClient for LlmConfig {
         messages: &[ChatMessage],
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
+        cancel: &dyn CancellationSource,
     ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
-        call_llm(self, messages, with_tools, sink)
+        call_llm(self, messages, with_tools, sink, cancel)
     }
 }
 
@@ -75,7 +78,7 @@ pub(crate) fn provider_log(event: &str, detail: &str) {
     else {
         return;
     };
-    let path = base.join("ak/provider.jsonl");
+    let path = base.join("oye/provider.jsonl");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -154,6 +157,7 @@ pub(crate) fn call_chat_completions(
     messages: &[ChatMessage],
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &dyn CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let req = ChatRequest {
         model: config.model.clone(),
@@ -175,7 +179,7 @@ pub(crate) fn call_chat_completions(
         &req,
         sink.as_ref(),
     )?;
-    read_stream(resp, sink)
+    read_stream(resp, sink, cancel)
 }
 
 pub(crate) fn call_responses(
@@ -183,6 +187,7 @@ pub(crate) fn call_responses(
     messages: &[ChatMessage],
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &dyn CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let (instructions, input) = responses_input(messages);
     let mut body = json!({
@@ -206,7 +211,7 @@ pub(crate) fn call_responses(
         &body,
         sink.as_ref(),
     )?;
-    read_responses_stream(resp, sink)
+    read_responses_stream(resp, sink, cancel)
 }
 
 pub(crate) fn call_llm(
@@ -214,12 +219,13 @@ pub(crate) fn call_llm(
     messages: &[ChatMessage],
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &dyn CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let capabilities = crate::llm::discover_capabilities(config);
     if with_tools && !capabilities.tools {
         return Err("configured model does not support tools".into());
     }
-    crate::llm::streaming::complete(config, messages, with_tools, sink)
+    crate::llm::streaming::complete(config, messages, with_tools, sink, cancel)
 }
 
 #[cfg(test)]
@@ -234,6 +240,7 @@ mod tests {
             _messages: &[ChatMessage],
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
+            _cancel: &dyn CancellationSource,
         ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
             Ok((
                 ChatMessage {
@@ -250,7 +257,9 @@ mod tests {
 
     #[test]
     fn model_boundary_supports_deterministic_mock() {
-        let (message, usage) = MockModel.complete(&[], false, None).unwrap();
+        let (message, usage) = MockModel
+            .complete(&[], false, None, &crate::agent::state::GlobalCancellation)
+            .unwrap();
         assert_eq!(message.content.as_deref(), Some("mock response"));
         assert_eq!(usage, Some(3));
     }

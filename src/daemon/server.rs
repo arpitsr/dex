@@ -1,28 +1,36 @@
 use std::convert::Infallible;
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::agent::r#loop::process_turn;
-use crate::agent::state::{GlobalCancellation, ToolState};
-use crate::core::console::Console;
+use crate::agent::state::ToolState;
+use crate::core::console::{Console, CancellationToken};
+use crate::core::format::git_context;
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
-use crate::protocol::{ApprovalResponse, ChatRequest, CreateSessionRequest, StreamEvent};
+use crate::protocol::{
+    ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, StreamEvent,
+};
 use crate::session::{self, Session};
+use crate::skills::{discover_skills, skill_dirs};
 
-use super::DaemonState;
+use super::{DaemonState, PendingApproval, SessionEntry};
 
 pub(crate) fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
+        .route("/health", get(health))
+        .route("/api/config", get(get_config))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
         .route("/api/sessions/{id}/approve", post(approve))
@@ -30,11 +38,99 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .with_state(state)
 }
 
+async fn health() -> Json<serde_json::Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+/// Best-effort runtime info so remote clients can render the same status
+/// footer as the local TUI. Resolved from the daemon's own environment.
+fn resolve_daemon_info() -> DaemonInfo {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (git_branch, git_dirty) = git_context(&cwd);
+    match LlmConfig::from_env(None, None, None) {
+        Ok(config) => DaemonInfo {
+            provider: config.provider.name().to_string(),
+            model: config.model.clone(),
+            available_models: config.available_models.clone(),
+            context_window: config.context_window,
+            permission: match config.permission {
+                crate::core::types::PermissionMode::ReadOnly => "read-only".into(),
+                crate::core::types::PermissionMode::AskWrites => "ask-writes".into(),
+                crate::core::types::PermissionMode::AskShell => "ask-shell".into(),
+                crate::core::types::PermissionMode::Trusted => "trusted".into(),
+            },
+            cwd,
+            git_branch,
+            git_dirty,
+        },
+        Err(_) => {
+            // Config is incomplete (e.g. no API key yet); report what we can
+            // so the client still renders.
+            let file = crate::llm::config::load_file_config().ok();
+            let permission = file
+                .as_ref()
+                .and_then(|f| crate::llm::config::permission_from_env_or_file(f).ok())
+                .map(|mode| match mode {
+                    crate::core::types::PermissionMode::ReadOnly => "read-only".to_string(),
+                    crate::core::types::PermissionMode::AskWrites => "ask-writes".to_string(),
+                    crate::core::types::PermissionMode::AskShell => "ask-shell".to_string(),
+                    crate::core::types::PermissionMode::Trusted => "trusted".to_string(),
+                })
+                .unwrap_or_else(|| "ask-writes".to_string());
+            let model = std::env::var("OPENAI_MODEL")
+                .ok()
+                .or_else(|| file.as_ref().and_then(|f| f.model.clone()))
+                .unwrap_or_else(|| "unknown".to_string());
+            let provider_name = std::env::var("OYE_PROVIDER")
+                .ok()
+                .or_else(|| file.as_ref().and_then(|f| f.provider.clone()))
+                .unwrap_or_else(|| "opencode".to_string());
+            DaemonInfo {
+                provider: provider_name,
+                model,
+                available_models: Vec::new(),
+                context_window: 128_000,
+                permission,
+                cwd,
+                git_branch,
+                git_dirty,
+            }
+        }
+    }
+}
+
+async fn get_config() -> Json<DaemonInfo> {
+    // `LlmConfig::from_env` builds a blocking reqwest client, which must not
+    // be created or dropped on a runtime worker.
+    let info = tokio::task::spawn_blocking(resolve_daemon_info)
+        .await
+        .unwrap_or(DaemonInfo {
+            provider: "opencode".into(),
+            model: "unknown".into(),
+            available_models: Vec::new(),
+            context_window: 128_000,
+            permission: "ask-writes".into(),
+            cwd: String::new(),
+            git_branch: None,
+            git_dirty: false,
+        });
+    Json(info)
+}
+
 async fn create_session(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let session = session::Session::new(req.cwd.clone(), req.name.clone())
+    // Tools run in the daemon's working directory (the server owns the
+    // workspace), so sessions are recorded against it. A co-located client's
+    // cwd matches anyway; a remote client's cwd is not meaningful on the
+    // server and would be misleading in session listings.
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| req.cwd.clone());
+    let session = Session::new(cwd.clone(), req.name.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let session_id = session.id().to_string();
@@ -43,15 +139,15 @@ async fn create_session(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let entry = super::SessionEntry {
+    let entry = SessionEntry {
         path: path.clone().into(),
         name: req.name,
-        cwd: req.cwd,
+        cwd,
     };
     state
         .sessions
-        .write()
-        .await
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(session_id.clone(), entry);
 
     Ok(Json(json!({
@@ -63,8 +159,8 @@ async fn create_session(
 async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     let sessions: Vec<serde_json::Value> = state
         .sessions
-        .read()
-        .await
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|(id, entry)| {
             json!({
@@ -83,50 +179,125 @@ async fn chat(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
     Json(req): Json<ChatRequest>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let (tx, rx) = mpsc::channel::<StreamEvent>(64);
-
-    // Spawn the agent loop in a blocking task.
-    let state_clone = state.clone();
-    let sid = session_id.clone();
-    tokio::task::spawn(async move {
-        if let Err(e) = run_agent_turn(state_clone, &sid, req, tx.clone()).await {
-            let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // Reject concurrent turns on the same session up front so the
+    // append-only session log stays consistent.
+    {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if !sessions.contains_key(&session_id) {
+            return Err(StatusCode::NOT_FOUND);
         }
+    }
+    {
+        let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        if active.contains(&session_id) {
+            return Err(StatusCode::CONFLICT);
+        }
+        active.insert(session_id.clone());
+    }
+
+    // Register a fresh per-turn cancellation token before spawning so a
+    // /cancel arriving during turn setup is still observed. The agent loop
+    // and the stream reader poll it; it never leaks across sessions or
+    // later turns.
+    let cancel = CancellationToken::new();
+    state
+        .cancel_tokens
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id.clone(), cancel.clone());
+
+    let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
+
+    // Run the whole (blocking) agent turn on the blocking pool. Everything
+    // below — session IO, config building, the LLM call and tool execution —
+    // is synchronous, so it must never run on a runtime worker.
+    let state_for_turn = state.clone();
+    let sid = session_id.clone();
+    tokio::task::spawn_blocking(move || {
+        run_agent_turn(state_for_turn, sid, req, cancel, tx);
     });
 
-    // Convert the receiver into an SSE stream.
+    // Convert the receiver into an SSE stream. Each event is serialized
+    // exactly once: axum adds the `data:` prefix, so hand it raw JSON.
     let event_stream = async_stream::stream! {
-        let mut rx = rx;
         while let Some(event) = rx.recv().await {
-            let sse_event = Event::default()
-                .data(event.to_sse());
-            yield Ok(sse_event);
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            yield Ok(Event::default().data(data));
         }
     };
 
-    Sse::new(event_stream).keep_alive(
+    Ok(Sse::new(event_stream).keep_alive(
         axum::response::sse::KeepAlive::default()
-            .interval(std::time::Duration::from_secs(30))
+            .interval(Duration::from_secs(15))
             .text("ping"),
-    )
+    ))
 }
 
-async fn run_agent_turn(
+/// Run one agent turn and push `StreamEvent`s into `tx`. Fully blocking;
+/// called from `spawn_blocking` only.
+fn run_agent_turn(
     state: Arc<DaemonState>,
-    session_id: &str,
+    session_id: String,
     req: ChatRequest,
+    cancel: CancellationToken,
     tx: mpsc::Sender<StreamEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Resolve session path.
-    let entry = state
-        .sessions
-        .read()
-        .await
-        .get(session_id)
-        .cloned()
-        .ok_or("session not found")?;
+) {
+    let result = run_turn_inner(&state, &session_id, &req, &cancel, &tx);
 
+    // Resolve any approvals still pending for this session (the turn is over;
+    // nothing can consume them anymore).
+    {
+        let mut pending = state
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, p| {
+            if p.session_id == session_id {
+                let _ = p.response.send(ApprovalDecision::Deny);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    state
+        .active_turns
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&session_id);
+    state
+        .cancel_tokens
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&session_id);
+
+    match result {
+        Ok((response, usage)) => {
+            // Stream closed (client disconnected): stop trying to deliver.
+            let _ = tx.blocking_send(StreamEvent::TurnComplete { response, usage });
+        }
+        Err(error) => {
+            let _ = tx.blocking_send(StreamEvent::TurnFailed { error });
+        }
+    }
+}
+
+fn run_turn_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: &ChatRequest,
+    cancel: &CancellationToken,
+    tx: &mpsc::Sender<StreamEvent>,
+) -> Result<(String, Option<u64>), String> {
+    let entry = {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(session_id).cloned()
+    }
+    .ok_or_else(|| "session not found".to_string())?;
+
+    // Resume the session created via POST /api/sessions; fall back to a fresh
+    // one if the file vanished.
     let mut session = if entry.path.exists() {
         Session::from_path(&entry.path).map_err(|e| format!("failed to load session: {e}"))?
     } else {
@@ -134,174 +305,162 @@ async fn run_agent_turn(
             .map_err(|e| format!("failed to create session: {e}"))?
     };
 
-    // Build config from environment.
-    let config = LlmConfig::from_env(None, None, None)
-        .map_err(|e| format!("failed to build config: {e}"))?;
+    // Build the config from the daemon's own environment/config file, with
+    // optional per-request overrides sent by the client.
+    let config = LlmConfig::from_env(
+        req.base_url.clone().filter(|v| !v.is_empty()),
+        req.model.clone().filter(|v| !v.is_empty()),
+        req.permission
+            .as_deref()
+            .map(crate::core::types::PermissionMode::parse)
+            .transpose()?,
+    )
+    .map_err(|e| format!("failed to build config: {e}"))?;
 
-    // Build messages.
+    // Skills are resolved on the daemon (its filesystem is the workspace).
+    let mut dirs = skill_dirs();
+    dirs.extend(req.skill_dirs.iter().map(std::path::PathBuf::from));
+    let skills = discover_skills(&dirs);
+
+    // Rebuild the conversation: system prompt + persisted history + prompt.
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage {
         role: "system".into(),
-        content: Some(system_prompt(&[])),
+        content: Some(system_prompt(&skills)),
         tool_calls: None,
         tool_call_id: None,
         name: None,
     });
-    messages.extend(session::load_messages_from_session(&entry.path).unwrap_or_default());
-    messages.push(ChatMessage {
+    if let Some(path) = session.path() {
+        messages.extend(session::load_messages_from_session(path).unwrap_or_default());
+    }
+    let user_message = ChatMessage {
         role: "user".into(),
-        content: Some(req.prompt),
+        content: Some(req.prompt.clone()),
         tool_calls: None,
         tool_call_id: None,
         name: None,
-    });
-
-    let mut tool_state = ToolState::load();
-
-    // Create channels for the console.
-    let (sink_tx_std, sink_rx_std) = std::sync::mpsc::channel::<SinkLine>();
-    let (approval_tx_std, approval_rx_std) = std::sync::mpsc::channel::<ApprovalRequest>();
-
-    // Use the daemon console that flags remote approval handling.
-    let console = Console::daemon(sink_tx_std, approval_tx_std);
-
-    // Bridge sink: std → tokio for SSE streaming.
-    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkLine>(64);
-    tokio::task::spawn_blocking(move || {
-        while let Ok(sl) = sink_rx_std.recv() {
-            if sink_tx.blocking_send(sl).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Spawn a task to forward sink events as StreamEvents.
-    let tx_forward = tx.clone();
-    tokio::task::spawn(async move {
-        while let Some(sl) = sink_rx.recv().await {
-            let event = match sl {
-                SinkLine::Assistant(s) => StreamEvent::AssistantText(s),
-                SinkLine::ToolInput(s) => {
-                    let parts: Vec<&str> = s.splitn(2, ' ').collect();
-                    let name = parts.first().unwrap_or(&"").to_string();
-                    let args = if parts.len() > 1 {
-                        serde_json::Value::String(parts[1].to_string())
-                    } else {
-                        serde_json::Value::Null
-                    };
-                    StreamEvent::ToolCall { name, args }
-                }
-                SinkLine::ToolOutput { name, summary } => {
-                    let success = !summary.starts_with("failed");
-                    StreamEvent::ToolResult {
-                        name,
-                        summary,
-                        success,
-                    }
-                }
-                SinkLine::System(s) => StreamEvent::System(s),
-                SinkLine::Error(s) => StreamEvent::Error(s),
-            };
-            let _ = tx_forward.send(event).await;
-        }
-    });
-
-    // Bridge approval requests: the agent loop sends ApprovalRequests via std
-    // mpsc; this task converts them to StreamEvents and stores the response
-    // sender so the POST /approve handler can resolve them.
-    let tx_approval = tx.clone();
-    let state_for_approval = state.clone();
-    tokio::task::spawn(async move {
-        while let Ok(req) = approval_rx_std.recv() {
-            let request_id = uuid::Uuid::new_v4().to_string();
-
-            // Store the response sender so /approve can resolve it.
-            state_for_approval
-                .pending_approvals
-                .write()
-                .await
-                .insert(request_id.clone(), req.response);
-
-            // Notify the client via SSE.
-            let _ = tx_approval
-                .send(StreamEvent::ApprovalRequired {
-                    request_id,
-                    name: req.name,
-                    input: req.input,
-                })
-                .await;
-        }
-    });
-
-    // Store a cancellation token for this session.
-    let cancellation = Arc::new(GlobalCancellation);
-    state
-        .cancellations
-        .write()
-        .await
-        .insert(session_id.to_string(), cancellation.clone());
-
-    // Run the agent loop (blocking, in a spawn_blocking context).
-    let result: Result<String, String> = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || {
-            process_turn(
-                &config,
-                &mut messages,
-                &mut tool_state,
-                None,
-                None,
-                Some(&mut session),
-                &config,
-                &*cancellation,
-                &console,
-            )
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| format!("agent task panicked: {e}"))?
     };
+    let _ = session.turn_event("turn_start");
+    let _ = session.append_message(user_message.clone());
+    messages.push(user_message);
 
-    // Clean up pending approvals and cancellation token.
-    state.pending_approvals.write().await.remove(session_id);
-    state.cancellations.write().await.remove(session_id);
+    // The agent loop reports through std channels; bridge them onto the
+    // tokio sender with dedicated threads.
+    let (sink_tx, sink_rx) = std_mpsc::channel::<SinkLine>();
+    let (approval_tx, approval_rx) = std_mpsc::channel::<ApprovalRequest>();
+    let console = Console::daemon(sink_tx, approval_tx);
 
-    match result {
-        Ok(response) => {
-            let _ = tx.send(StreamEvent::TurnComplete { response }).await;
-        }
-        Err(e) => {
-            let _ = tx
-                .send(StreamEvent::TurnFailed {
-                    error: e.to_string(),
-                })
-                .await;
-        }
+    // Sink bridge: SinkLines arrive from the streaming LLM reader and tool
+    // executor; forward them as StreamEvents on a dedicated thread.
+    {
+        let stream_tx = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(sl) = sink_rx.recv() {
+                let event = match sl {
+                    SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
+                    SinkLine::ToolInput(preview) => {
+                        let mut parts = preview.splitn(2, ' ');
+                        let name = parts.next().unwrap_or_default().to_string();
+                        let args = parts.next().unwrap_or_default().to_string();
+                        StreamEvent::ToolCall {
+                            name,
+                            args: serde_json::Value::String(args),
+                        }
+                    }
+                    SinkLine::ToolOutput { name, summary } => {
+                        let success = !summary.starts_with("failed");
+                        StreamEvent::ToolResult {
+                            name,
+                            summary,
+                            success,
+                        }
+                    }
+                    SinkLine::System(text) => StreamEvent::System(text),
+                    SinkLine::Error(text) => StreamEvent::Error(text),
+                };
+                let _ = stream_tx.blocking_send(event);
+            }
+        });
     }
 
-    Ok(())
+    // Approval bridge: each ApprovalRequest gets a fresh request_id; the
+    // response sender is parked in the shared state so POST /approve can
+    // resolve it. The agent thread blocks on that sender until then.
+    {
+        let state = state.clone();
+        let session_id = session_id.to_string();
+        let stream_tx = tx.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            while let Ok(request) = approval_rx.recv() {
+                // A cancellation was requested: don't surface new approvals,
+                // deny them so the agent thread can unwind.
+                if cancel.is_cancelled() {
+                    let _ = request.response.send(ApprovalDecision::Deny);
+                    continue;
+                }
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let parked = PendingApproval {
+                    session_id: session_id.clone(),
+                    response: request.response,
+                };
+                let replaced = state
+                    .pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(request_id.clone(), parked);
+                if let Some(stale) = replaced {
+                    // Should not happen (request_ids are unique); deny to
+                    // avoid a deadlock in a stray agent thread.
+                    let _ = stale.response.send(ApprovalDecision::Deny);
+                }
+                let _ = stream_tx.blocking_send(StreamEvent::ApprovalRequired {
+                    request_id,
+                    name: request.name,
+                    input: request.input,
+                });
+            }
+        });
+    }
+
+    let mut tool_state = ToolState::load();
+    let turn_result = process_turn(
+        &config,
+        &mut messages,
+        &mut tool_state,
+        None,
+        None,
+        Some(&mut session),
+        &config,
+        cancel,
+        &console,
+    );
+    let usage = tool_state.last_usage;
+    turn_result
+        .map_err(|e| e.to_string())
+        .map(|response| (response, usage))
 }
 
 async fn approve(
     State(state): State<Arc<DaemonState>>,
-    Path(session_id): Path<String>,
+    Path(_session_id): Path<String>,
     Json(req): Json<ApprovalResponse>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // The request_id comes from the client's response to an ApprovalRequired
-    // SSE event. For now we match by session (one pending approval per session).
-    // A more robust design would include request_id in the ApprovalResponse.
-    let decision = match req.decision {
-        crate::protocol::ApprovalDecision::AllowOnce => ApprovalDecision::Once,
-        crate::protocol::ApprovalDecision::AllowSession => ApprovalDecision::Session,
-        crate::protocol::ApprovalDecision::Deny => ApprovalDecision::Deny,
-    };
-
-    // Find and resolve the pending approval for this session.
-    let sender = state.pending_approvals.write().await.remove(&session_id);
+    let sender = state
+        .pending_approvals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&req.request_id);
 
     match sender {
-        Some(tx) => {
-            let _ = tx.send(decision);
+        Some(pending) => {
+            let decision = match req.decision {
+                crate::protocol::ApprovalDecision::AllowOnce => ApprovalDecision::Once,
+                crate::protocol::ApprovalDecision::AllowSession => ApprovalDecision::Session,
+                crate::protocol::ApprovalDecision::Deny => ApprovalDecision::Deny,
+            };
+            let _ = pending.response.send(decision);
             Ok(Json(json!({ "status": "ok" })))
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -311,15 +470,37 @@ async fn approve(
 async fn cancel(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Deny any pending approval for this session.
-    if let Some(sender) = state.pending_approvals.write().await.remove(&session_id) {
-        let _ = sender.send(ApprovalDecision::Deny);
+) -> Json<serde_json::Value> {
+    // Ask the in-flight turn to unwind: the LLM stream reader and the agent
+    // loop poll this token between steps. A missing entry means no turn is
+    // running for the session, so there is nothing to cancel.
+    if let Some(token) = state
+        .cancel_tokens
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session_id)
+    {
+        token.cancel();
     }
 
-    // The GlobalCancellation token would need to be checked inside process_turn.
-    // For now we deny pending approvals as a best-effort cancellation.
-    // TODO: Wire GlobalCancellation into the agent loop's main loop condition.
+    // Deny any approvals still pending for this session so agent threads
+    // blocked on them wake up promptly.
+    {
+        let mut pending = state
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stale: Vec<String> = pending
+            .iter()
+            .filter(|(_, p)| p.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(p) = pending.remove(&id) {
+                let _ = p.response.send(ApprovalDecision::Deny);
+            }
+        }
+    }
 
-    Ok(Json(json!({ "status": "ok" })))
+    Json(json!({ "status": "ok" }))
 }
