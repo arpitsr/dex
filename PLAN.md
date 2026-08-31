@@ -63,7 +63,7 @@ Add a plan object that outlives the transcript and is re-injected every turn.
 Edits currently go unverified unless the model volunteers. Make verification
 a harness reflex.
 
-- [ ] Config: `verify_command: Option<String>` (and `OYE_VERIFY` env) in
+- [ ] Config: `verify_command: Option<String>` (and `DEX_VERIFY` env) in
   `LlmConfig`/`config.sample.json`. Explicit command first; auto-detection
   (cargo/go/package.json) is a later fallback, not now.
 - [ ] In `process_turn`, after a batch containing a mutating call

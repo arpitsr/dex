@@ -203,7 +203,7 @@ fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
     else {
         return;
     };
-    let path = base.join("oye/audit.jsonl");
+    let path = base.join("dex/audit.jsonl");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -225,10 +225,10 @@ fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
 }
 
 /// Maximum wall-clock duration for a shell command.
-/// Configure with OYE_TOOL_TIMEOUT_SECS (default: 120).
-/// Output is capped by OYE_TOOL_OUTPUT_BYTES (default: 1 MiB).
+/// Configure with DEX_TOOL_TIMEOUT_SECS (default: 120).
+/// Output is capped by DEX_TOOL_OUTPUT_BYTES (default: 1 MiB).
 fn shell_timeout() -> Duration {
-    env::var("OYE_TOOL_TIMEOUT_SECS")
+    env::var("DEX_TOOL_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -236,16 +236,16 @@ fn shell_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(120))
 }
 
-/// Expose the running binary to shell commands as $OYE_BIN so a script can
-/// call tools locally (`"$OYE_BIN" run read path=src/main.rs`) and stitch a
+/// Expose the running binary to shell commands as $DEX_BIN so a script can
+/// call tools locally (`"$DEX_BIN" run read path=src/main.rs`) and stitch a
 /// whole read-only pipeline in one call — intermediate output stays out of
 /// the conversation and only the distilled result reaches the model.
 /// ponytail: shell stitching only — if JSON routing in pipelines gets
-/// painful, embed rquickjs and expose tools as functions (same $OYE_BIN mechanism).
+/// painful, embed rquickjs and expose tools as functions (same $DEX_BIN mechanism).
 fn tool_runner_env() -> Vec<(String, String)> {
     std::env::current_exe()
         .ok()
-        .map(|exe| vec![("OYE_BIN".to_string(), exe.display().to_string())])
+        .map(|exe| vec![("DEX_BIN".to_string(), exe.display().to_string())])
         .unwrap_or_default()
 }
 
@@ -275,7 +275,7 @@ fn run_bash(
     cancel: &dyn CancellationSource,
 ) -> Result<(String, Option<i32>), ToolError> {
     let timeout = shell_timeout();
-    let max_bytes = env::var("OYE_TOOL_OUTPUT_BYTES")
+    let max_bytes = env::var("DEX_TOOL_OUTPUT_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
@@ -908,7 +908,7 @@ fn tool_git(
 /// small enough to stay predictable.
 const CHAIN_MAX_STEPS: usize = 4;
 
-/// A bounded, read-only chain executed in ONE LLM round trip — oye's scoped
+/// A bounded, read-only chain executed in ONE LLM round trip — dex's scoped
 /// take on programmatic tool calling. The model declares steps; routing
 /// between steps is mechanical (`from` a search step, `take: "paths"` into a
 /// read fan-out), never semantic: the model cannot branch or transform
@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn bash_exposes_the_binary_for_local_stitching() {
         let (output, code) = run_bash_with_limits(
-            "printf '%s' \"$OYE_BIN\"",
+            "printf '%s' \"$DEX_BIN\"",
             Duration::from_secs(5),
             4096,
             &GlobalCancellation,
@@ -1225,7 +1225,7 @@ mod tests {
 
     #[test]
     fn temporary_workspace_paths_are_confined() {
-        let root = std::env::temp_dir().join(format!("oye-workspace-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dex-workspace-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         assert!(resolve_workspace_path(&root, "inside.txt")
             .unwrap()
@@ -1288,7 +1288,7 @@ mod tests {
         let root = std::env::current_dir()
             .unwrap()
             .join("target")
-            .join(format!("oye-read-test-{}", std::process::id()));
+            .join(format!("dex-read-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("sample.txt");
         fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
@@ -1328,7 +1328,7 @@ mod tests {
         // and glob rules deliberately exclude target/.
         let root = std::env::current_dir()
             .unwrap()
-            .join(format!("oye-fanout-test-{}", std::process::id()));
+            .join(format!("dex-fanout-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.txt"), "alpha\n").unwrap();
         fs::write(root.join("b.txt"), "beta\n").unwrap();
@@ -1366,7 +1366,7 @@ mod tests {
         let root = std::env::current_dir()
             .unwrap()
             .join("target")
-            .join(format!("oye-grep-ctx-test-{}", std::process::id()));
+            .join(format!("dex-grep-ctx-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("code.rs"),
@@ -1398,7 +1398,9 @@ mod tests {
         let needle = format!("TARGET_{}", "TOKEN");
         let root = std::env::current_dir()
             .unwrap()
-            .join(format!("oye-chain-test-{}", std::process::id()));
+            // Prefix must NOT match .gitignore entries: the chain's grep respects
+        // ignore files, so an ignored fixture dir is invisible to it.
+        .join(format!("dex-chain-fx-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("one.rs"), format!("{needle} in one\n")).unwrap();
         fs::write(root.join("two.rs"), "nothing here\n").unwrap();
@@ -1483,7 +1485,7 @@ mod tests {
     fn grep_without_matches_is_success() {
         // Assembled at runtime so the needle does not appear in this source
         // file (the test greps the crate it lives in).
-        let needle = format!("oye-no-such-token-{}", "xyz");
+        let needle = format!("dex-no-such-token-{}", "xyz");
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String(needle));
         let outcome = execute_outcome("grep", &args, &GlobalCancellation);

@@ -20,17 +20,17 @@ pub(crate) struct Args {
 /// The mode in which the binary was invoked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// Start a headless HTTP server (`oye serve [host:port|port]`).
+    /// Start a headless HTTP server (`dex serve [host:port|port]`).
     Serve { bind: String },
-    /// Start the TUI connected to a remote daemon (`oye connect <url>`).
+    /// Start the TUI connected to a remote daemon (`dex connect <url>`).
     Connect { url: String },
-    /// Start both server + TUI in the same process (default `oye`).
+    /// Start both server + TUI in the same process (default `dex`).
     Default,
-    /// One-shot prompt (`oye "prompt"`).
+    /// One-shot prompt (`dex "prompt"`).
     OneShot { prompt: String },
-    /// Raw tool mode (`oye --tool`).
+    /// Raw tool mode (`dex --tool`).
     Tool,
-    /// One-shot tool execution (`oye run <tool> <args...>`) so scripts can
+    /// One-shot tool execution (`dex run <tool> <args...>`) so scripts can
     /// call tools locally and stitch pipelines without model round trips.
     RunTool { name: String, args: Vec<String> },
 }

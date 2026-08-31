@@ -12,7 +12,7 @@ pub(crate) struct ChatOptions {
     pub(crate) permission: Option<String>,
 }
 
-/// HTTP client for communicating with the oye daemon.
+/// HTTP client for communicating with the dex daemon.
 ///
 /// The blocking reqwest client is deliberate: the TUI runs a dedicated worker
 /// thread per turn that consumes the SSE stream, so no async runtime is
