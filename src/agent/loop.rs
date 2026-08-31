@@ -34,7 +34,7 @@ pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<Stri
         PermissionMode::AskShell => name == "bash",
         PermissionMode::Trusted => false,
     };
-    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure AK_PERMISSION", name))
+    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure OYE_PERMISSION", name))
 }
 
 pub(crate) fn approve_tool(
@@ -63,6 +63,31 @@ pub(crate) fn approve_tool(
     }
     if console.session_approved(name) {
         return true;
+    }
+    // Remote approval: daemon sends the request via SSE and blocks for the
+    // client's POST response. We skip the stdin terminal check entirely.
+    if console.remote_approval {
+        if let Some(approval_sink) = console.approval() {
+            let (response_tx, response_rx) = mpsc::channel();
+            if approval_sink
+                .send(ApprovalRequest {
+                    name: name.to_string(),
+                    input: input.to_string(),
+                    response: response_tx,
+                })
+                .is_ok()
+            {
+                return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
+                    ApprovalDecision::Once => true,
+                    ApprovalDecision::Session => {
+                        console.record_session_approval(name);
+                        true
+                    }
+                    ApprovalDecision::Deny => false,
+                };
+            }
+        }
+        return false;
     }
     if !io::stdin().is_terminal() {
         return false;
@@ -102,8 +127,9 @@ pub(crate) fn approve_tool(
 pub(crate) fn execute_tool_call(
     call: &LlmToolCall,
     permission: PermissionMode,
+    cancel: &dyn CancellationSource,
     console: &Console,
-) -> (String, String, String) {
+) -> (String, String, ToolOutcome) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
     let value: Value = match serde_json::from_str(&raw_args) {
@@ -112,7 +138,10 @@ pub(crate) fn execute_tool_call(
             return (
                 name,
                 raw_args,
-                format!("Error: invalid tool arguments: {}", error),
+                ToolOutcome {
+                    text: format!("Error: invalid tool arguments: {}", error),
+                    ok: false,
+                },
             )
         }
     };
@@ -120,7 +149,10 @@ pub(crate) fn execute_tool_call(
         return (
             name,
             raw_args,
-            "Error: tool arguments must be a JSON object".into(),
+            ToolOutcome {
+                text: "Error: tool arguments must be a JSON object".into(),
+                ok: false,
+            },
         );
     };
     let input = serde_json::to_string(&args).unwrap_or_default();
@@ -128,10 +160,13 @@ pub(crate) fn execute_tool_call(
         return (
             name.clone(),
             input,
-            format!("Error: permission denied for tool '{}'", name),
+            ToolOutcome {
+                text: format!("Error: permission denied for tool '{}'", name),
+                ok: false,
+            },
         );
     }
-    (name.clone(), input, execute_to_string(&name, &args))
+    (name.clone(), input, execute_outcome(&name, &args, cancel))
 }
 
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
@@ -167,7 +202,7 @@ pub(crate) fn persist_pending(
 /// globals.
 fn call_client_cancellable(
     client: &(impl ModelClient + Sync + Send + Clone + 'static),
-    cancel: &(impl CancellationSource + ?Sized),
+    cancel: &(impl CancellationSource + Clone + Send + Sync + 'static),
     messages: &[ChatMessage],
     with_tools: bool,
     console: &Console,
@@ -175,11 +210,27 @@ fn call_client_cancellable(
     let client = (*client).clone();
     let messages = messages.to_vec();
     let sink = console.sink().cloned();
+    // The worker outlives this call when cancelled early; it polls a private
+    // clone of the source so the stream read unwinds too.
+    let handle = cancel.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = client
-            .complete(&messages, with_tools, sink)
-            .map_err(|error| error.to_string());
+        // A panic inside the provider stack must reach the channel as an
+        // error (with its message), not surface as an opaque "worker
+        // disconnected" after the sender silently drops.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client
+                .complete(&messages, with_tools, sink, &handle)
+                .map_err(|error| error.to_string())
+        }))
+        .unwrap_or_else(|payload| {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Err(format!("provider worker panicked: {}", detail))
+        });
         let _ = tx.send(result);
     });
     loop {
@@ -206,7 +257,7 @@ pub(crate) fn process_turn(
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
     mut session: Option<&mut Session>,
     client: &(impl ModelClient + Sync + Send + Clone + 'static),
-    cancel: &(impl CancellationSource + ?Sized),
+    cancel: &(impl CancellationSource + Clone + Send + Sync + 'static),
     console: &Console,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Spins while the agent works; erased automatically on return.
@@ -222,7 +273,12 @@ pub(crate) fn process_turn(
     let turn_deadline = crate::agent::r#loop::deadline(limits);
     for iteration in 0..config.max_tool_iterations {
         if !within_budget(turn_deadline) {
-            return Err("turn exceeded configured time limit".into());
+            return Err(format!(
+                "turn exceeded the configured time limit ({} seconds); \
+                 raise OYE_MAX_TURN_SECONDS to allow longer turns",
+                limits.elapsed_seconds
+            )
+            .into());
         }
         persist_pending(&mut session, messages, &mut persisted_cursor);
         if cancellation.is_cancelled() {
@@ -275,19 +331,26 @@ pub(crate) fn process_turn(
         let (message, usage) =
             match call_client_cancellable(client, cancel, messages, true, console) {
                 Ok(result) => result,
-                Err(e) if e.to_string() == "interrupted" => {
-                    return Err("interrupted by user (Ctrl+C)".into());
+                Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
+                    return Err("cancelled by user".into());
                 }
                 Err(e) => return Err(e),
             };
-        if usage.is_some() {
-            last_usage = usage;
+        if let Some(tokens) = usage {
+            last_usage = Some(tokens);
+            // Persist promptly so a cancelled turn still keeps an accurate
+            // context figure, and push it to the UI: the status bar tracks
+            // usage after every LLM call, not once per turn.
+            state.last_usage = last_usage;
+            if let Some(sink) = console.sink() {
+                let _ = sink.send(SinkLine::Usage(tokens));
+            }
         }
         // Compact when either the message count or an estimated token
         // budget is exceeded (API-reported usage takes precedence).
         let est = last_usage.unwrap_or_else(|| estimate_tokens(messages));
         if messages.len() > 1 + KEEP_RECENT_MESSAGES || est > config.context_window / 2 {
-            compact_history(config, messages)?;
+            compact_history(config, messages, cancel)?;
         }
         if let Some(calls) = message.tool_calls.clone() {
             messages.push(ChatMessage {
@@ -306,7 +369,12 @@ pub(crate) fn process_turn(
                 let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 calls
                     .iter()
-                    .map(|call| execute_tool_call(call, config.permission, console))
+                    .map(|call| {
+                        let started = Instant::now();
+                        let (name, input, outcome) =
+                            execute_tool_call(call, config.permission, cancel, console);
+                        (name, input, outcome, started.elapsed())
+                    })
                     .collect()
             } else {
                 calls
@@ -315,7 +383,13 @@ pub(crate) fn process_turn(
                         let call = call.clone();
                         let permission = config.permission;
                         let console = console.clone();
-                        thread::spawn(move || execute_tool_call(&call, permission, &console))
+                        let cancel = cancel.clone();
+                        thread::spawn(move || {
+                            let started = Instant::now();
+                            let (name, input, outcome) =
+                                execute_tool_call(&call, permission, &cancel, &console);
+                            (name, input, outcome, started.elapsed())
+                        })
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
@@ -324,14 +398,18 @@ pub(crate) fn process_turn(
                             (
                                 String::new(),
                                 String::new(),
-                                "Error: tool worker panicked".into(),
+                                ToolOutcome {
+                                    text: "Error: tool worker panicked".into(),
+                                    ok: false,
+                                },
+                                Duration::ZERO,
                             )
                         })
                     })
                     .collect()
             };
 
-            for (call, (name, input, result)) in calls.iter().zip(results) {
+            for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
                 let cache_key = format!(
                     "{}:{}:{}{}",
                     env::current_dir()
@@ -345,7 +423,7 @@ pub(crate) fn process_turn(
                 // Only successful calls count toward the repeated-identical
                 // limit; a failed call is a legitimate retry and must stay
                 // allowed so the model can recover instead of being blocked.
-                let succeeded = !result.starts_with("Error: ");
+                let succeeded = outcome.ok;
                 if succeeded {
                     if last_tools.len() >= 6 {
                         last_tools.remove(0);
@@ -373,7 +451,9 @@ pub(crate) fn process_turn(
 
                 let cacheable = matches!(name.as_str(), "read" | "grep" | "find");
                 let mut cache_hit = false;
+                let mut ok = succeeded;
                 let result = if repeated_count >= 3 {
+                    ok = false;
                     "Error: repeated identical tool call; choose a different action or finish."
                         .to_string()
                 } else if cacheable && succeeded {
@@ -386,23 +466,33 @@ pub(crate) fn process_turn(
                         }
                         cached.clone()
                     } else {
-                        state.insert(cache_key, result.clone());
-                        result
+                        state.insert(cache_key, outcome.text.clone());
+                        outcome.text
                     }
                 } else {
                     if matches!(name.as_str(), "write" | "edit") {
                         state.clear();
                     }
-                    result
+                    outcome.text
                 };
                 if let Some(sink) = console.sink() {
-                    let mut summary = tool_result_summary(&name, &result);
+                    let mut summary = tool_result_summary(&name, &input, &result, ok);
                     if cache_hit {
                         summary = format!("cached · {summary}");
                     }
+                    // Tools whose summary is a bare count get a preview from
+                    // the top of their output; for the rest the summary
+                    // already shows the first line, so preview continues
+                    // after it. Failed calls always continue past the first
+                    // line to expose the actual error detail.
+                    let counts_only = matches!(name.as_str(), "read" | "grep" | "find" | "chain");
+                    let skip_first = !counts_only || !ok;
                     let _ = sink.send(SinkLine::ToolOutput {
                         name: name.clone(),
                         summary,
+                        success: ok,
+                        preview: tool_result_preview(&result, 3, skip_first),
+                        duration: elapsed.as_secs_f64(),
                     });
                 } else {
                     with_console(console.sink().is_some(), || {
@@ -458,14 +548,15 @@ pub(crate) fn process_turn(
             return Ok(text);
         }
     }
-    Err(
-        "too many tool iterations: the task did not complete within the per-turn \
-         tool-call budget. Partial progress (if any) is preserved in the conversation. \
-         To continue, you can ask me to resume the task — optionally on a new path or \
-         with a different approach — e.g. \"continue from where you left off\" or \
-         \"try a different approach\"."
-            .into(),
+    Err(format!(
+        "too many tool iterations (budget: {}): the task did not complete within the per-turn \
+             tool-call budget. Partial progress (if any) is preserved in the conversation. \
+             To continue, you can ask me to resume the task — optionally on a new path or \
+             with a different approach — e.g. \"continue from where you left off\" or \
+             \"try a different approach\".",
+        config.max_tool_iterations
     )
+    .into())
 }
 
 #[cfg(test)]
@@ -484,6 +575,7 @@ mod tests {
             _messages: &[ChatMessage],
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
+            _cancel: &dyn CancellationSource,
         ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
             Ok((
                 ChatMessage {
@@ -498,6 +590,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct NeverCancel;
 
     impl CancellationSource for NeverCancel {
@@ -555,5 +648,125 @@ mod tests {
         assert!(messages
             .iter()
             .any(|m| m.content.as_deref() == Some("hello from mock")));
+    }
+
+    /// Calls a tool on the first round, then answers with plain text.
+    #[derive(Clone)]
+    struct ToolThenAnswer {
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ToolThenAnswer {
+        fn new() -> Self {
+            Self {
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ModelClient for ToolThenAnswer {
+        fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _with_tools: bool,
+            _sink: Option<mpsc::Sender<SinkLine>>,
+            _cancel: &dyn CancellationSource,
+        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if round == 0 {
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: Some(vec![crate::core::types::LlmToolCall {
+                        id: "call-1".into(),
+                        call_type: "function".into(),
+                        function: crate::core::types::FunctionCall {
+                            name: "bash".into(),
+                            arguments: r#"{"command":"echo line-one; echo line-two; echo line-three; echo line-four"}"#.into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                }
+            } else {
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: Some("done".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                }
+            };
+            Ok((message, Some(1)))
+        }
+    }
+
+    #[test]
+    fn tool_result_streams_summary_preview_and_success() {
+        let config = test_config();
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let mut state = ToolState::default();
+        let (sink_tx, sink_rx) = mpsc::channel();
+        let (approval_tx, _approval_rx) = mpsc::channel();
+        let console = crate::core::console::Console::daemon(sink_tx, approval_tx);
+
+        let result = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &ToolThenAnswer::new(),
+            &NeverCancel,
+            &console,
+        );
+        assert_eq!(result.unwrap(), "done");
+
+        let lines: Vec<SinkLine> = sink_rx.try_iter().collect();
+        let outputs: Vec<&SinkLine> = lines
+            .iter()
+            .filter(|line| matches!(line, SinkLine::ToolOutput { .. }))
+            .collect();
+        let [SinkLine::ToolOutput {
+            name,
+            summary,
+            success,
+            preview,
+            ..
+        }] = outputs.as_slice()
+        else {
+            panic!("expected exactly one tool output, got {outputs:?}");
+        };
+        assert_eq!(name, "bash");
+        assert!(success);
+        // Summary carries the first output line; the preview continues after
+        // it instead of repeating it.
+        assert_eq!(summary, "line-one");
+        assert_eq!(
+            preview,
+            &[
+                "line-two".to_string(),
+                "line-three".to_string(),
+                "line-four".to_string()
+            ]
+        );
+
+        // The mock makes two LLM calls (tool round, then answer), each
+        // reporting usage: the status bar must get a Usage event per call.
+        let usage_events: Vec<u64> = lines
+            .iter()
+            .filter_map(|line| match line {
+                SinkLine::Usage(tokens) => Some(*tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage_events, vec![1, 1]);
     }
 }

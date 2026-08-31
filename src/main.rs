@@ -1,8 +1,11 @@
 mod agent;
 mod cli;
+mod client;
 mod config;
 mod core;
+mod daemon;
 mod llm;
+mod protocol;
 mod session;
 mod skills;
 mod tools;
@@ -13,7 +16,7 @@ use session::*;
 use tools::*;
 
 use crate::agent::r#loop::{approve_tool, process_turn};
-use crate::agent::state::ToolState;
+use crate::agent::state::{GlobalCancellation, ToolState};
 use crate::core::console::install_sigint_handler;
 use crate::core::types::{ChatMessage, PermissionMode};
 use crate::llm::config::{load_file_config, permission_from_env_or_file, LlmConfig};
@@ -102,7 +105,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
 }
 
 fn run_interactive() {
-    eprintln!("ak raw tool mode");
+    eprintln!("oye raw tool mode");
     eprintln!("tools: read, bash, write, edit, grep, find, git");
     eprintln!("send JSON lines like: {{\"name\":\"read\",\"args\":{{\"path\":\"Cargo.toml\"}}}}");
     eprintln!("empty line quits");
@@ -151,7 +154,7 @@ fn run_interactive() {
         ) {
             json!({"err": format!("permission denied for tool '{}'", name)})
         } else {
-            match execute(name, &args) {
+            match execute(name, &args, &GlobalCancellation) {
                 Ok(out) => json!({"ok": out}),
                 Err(e) => json!({"err": e.to_string()}),
             }
@@ -161,19 +164,142 @@ fn run_interactive() {
     }
 }
 
+/// Start the daemon server on a background thread with a pre-bound listener
+/// (no window for another process to steal the port), and wait until it is
+/// ready to serve. Returns the address it listens on.
+fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(async {
+            if let Err(e) = daemon::run_daemon(listener).await {
+                eprintln!("daemon error: {e}");
+            }
+        });
+    });
+
+    // Block until /health answers so the TUI never races server startup.
+    let url = format!("http://{addr}");
+    let client = client::http::DaemonClient::new(&url)
+        .map_err(|e| std::io::Error::other(format!("failed to reach daemon: {e}")))?;
+    client
+        .wait_until_ready(std::time::Duration::from_secs(10))
+        .map_err(|e| std::io::Error::other(format!("daemon startup failed: {e}")))?;
+    Ok(addr)
+}
+
 fn main() {
     install_sigint_handler();
     let args = cli::parse_args();
-    if args.rest.len() == 1 && args.rest[0] == "--tool" {
-        run_interactive();
-    } else if !args.rest.is_empty() {
-        let prompt = args.rest.join(" ");
-        if let Err(e) = run_one_shot(&prompt, &args) {
-            eprintln!("agent error: {}", e);
-            std::process::exit(1);
+    let mode = cli::resolve_mode(&args);
+
+    match mode {
+        Mode::Serve { bind } => {
+            let addr: std::net::SocketAddr = if bind.contains(':') {
+                bind.parse().unwrap_or_else(|_| {
+                    eprintln!("error: invalid bind address '{bind}' (use [host:]port)");
+                    std::process::exit(1);
+                })
+            } else {
+                ([127, 0, 0, 1], bind.parse().unwrap_or(8420)).into()
+            };
+            if addr.ip().is_unspecified() {
+                eprintln!(
+                    "warning: daemon listening on {addr} is exposed on all interfaces and has no authentication — prefer 127.0.0.1 for local use"
+                );
+            }
+            let listener = match std::net::TcpListener::bind(addr) {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("daemon error: cannot bind {addr}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(async {
+                if let Err(e) = daemon::run_daemon(listener).await {
+                    eprintln!("daemon error: {e}");
+                    std::process::exit(1);
+                }
+            });
         }
-    } else if let Err(e) = ui::run_ratatui_repl(&args) {
-        eprintln!("ui error: {}", e);
-        std::process::exit(1);
+        Mode::Connect { url } => {
+            // `oye connect <url>` opens the TUI; `oye connect <url> "prompt"`
+            // runs a one-shot turn against the daemon.
+            let prompt = args
+                .rest
+                .get(2..)
+                .map(|rest| rest.join(" "))
+                .filter(|p| !p.trim().is_empty());
+            let result = match prompt {
+                Some(prompt) => client::http::DaemonClient::new(&url).and_then(|client| {
+                    client.wait_until_ready(std::time::Duration::from_secs(10))?;
+                    client::repl::one_shot(&client, &prompt)
+                }),
+                None => ui::run_ratatui_repl_with_remote(&args, &url).map_err(Into::into),
+            };
+            if let Err(e) = result {
+                eprintln!("client error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::Default => {
+            // Start server in background, then launch TUI connected to it.
+            let addr = match start_daemon_background() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    eprintln!("daemon error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let url = format!("http://{addr}");
+            if let Err(e) = ui::run_ratatui_repl_with_remote(&args, &url) {
+                eprintln!("ui error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::OneShot { prompt } => {
+            if let Err(e) = run_one_shot(&prompt, &args) {
+                eprintln!("agent error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::Tool => {
+            run_interactive();
+        }
+        Mode::RunTool { name, args } => {
+            let parsed = match cli::parse_tool_args(&args) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            // Read-only tools pass unconditionally (approve_tool never asks
+            // for them), so stitching works from non-interactive scripts;
+            // write/shell still require interactive approval or trusted env.
+            let permission = load_file_config()
+                .and_then(|file| permission_from_env_or_file(&file))
+                .unwrap_or(PermissionMode::ReadOnly);
+            let input = serde_json::to_string(&parsed).unwrap_or_default();
+            if !approve_tool(
+                permission,
+                &name,
+                &input,
+                &crate::core::console::Console::none(),
+            ) {
+                eprintln!("Error: permission denied for tool '{name}'");
+                std::process::exit(1);
+            }
+            match execute(&name, &parsed, &GlobalCancellation) {
+                Ok(out) => print!("{out}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }

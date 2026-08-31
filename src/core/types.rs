@@ -13,12 +13,25 @@ pub(crate) struct Skill {
 /// A single streamed line destined for the UI transcript. Plain text (no
 /// ANSI) so the UI applies its own styling. Ratatui-agnostic.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SinkLine {
     Assistant(String),
     ToolInput(String),
-    ToolOutput { name: String, summary: String },
+    ToolOutput {
+        name: String,
+        summary: String,
+        /// Whether the tool call succeeded; rendered as ✓/✗ by the UIs.
+        success: bool,
+        /// A few informational output lines shown dim under the summary.
+        preview: Vec<String>,
+        /// Wall-clock seconds the tool took; 0 when unknown.
+        duration: f64,
+    },
     System(String),
     Error(String),
+    /// Prompt tokens reported by the provider after each LLM call, so the
+    /// status bar can track context usage live instead of once per turn.
+    Usage(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +144,7 @@ pub(crate) struct FunctionDef {
 
 #[derive(Deserialize)]
 pub(crate) struct StreamChunk {
+    #[serde(default)]
     pub(crate) choices: Vec<StreamChoice>,
     #[serde(default)]
     pub(crate) usage: Option<Usage>,
@@ -138,10 +152,11 @@ pub(crate) struct StreamChunk {
 
 #[derive(Deserialize)]
 pub(crate) struct StreamChoice {
+    #[serde(default)]
     pub(crate) delta: StreamDelta,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub(crate) struct StreamDelta {
     pub(crate) content: Option<String>,
     pub(crate) tool_calls: Option<Vec<StreamToolCall>>,

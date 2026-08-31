@@ -14,18 +14,22 @@ pub(crate) trait CancellationSource {
     fn take_cancelled(&self) -> bool;
 }
 
+/// Process-global cancellation (Ctrl+C) used by the non-TUI paths
+/// (`oye "prompt"` and `oye --tool`). The TUI/daemon paths use a per-session
+/// `CancellationToken` instead, so a cancel never leaks across sessions.
+#[derive(Clone)]
 pub(crate) struct GlobalCancellation;
 
 impl CancellationSource for GlobalCancellation {
     fn is_cancelled(&self) -> bool {
-        crate::core::console::cancel_requested()
+        crate::core::console::is_interrupted()
     }
     fn take_cancelled(&self) -> bool {
-        crate::core::console::take_cancel_requested()
+        crate::core::console::take_interrupt()
     }
 }
 
-pub(crate) const CACHE_FILE_NAME: &str = "ak-tool-cache.json";
+pub(crate) const CACHE_FILE_NAME: &str = "oye-tool-cache.json";
 
 pub(crate) fn cache_file_path() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
@@ -69,7 +73,7 @@ impl ToolState {
         let mut state = Self::default();
         // Cached tool output can contain source code or secrets. Keep caching
         // opt-in until a caller explicitly requests it.
-        if env::var("AK_TOOL_CACHE").as_deref() != Ok("1") {
+        if env::var("OYE_TOOL_CACHE").as_deref() != Ok("1") {
             return state;
         }
         if let Some(path) = cache_file_path() {
@@ -96,7 +100,7 @@ impl ToolState {
 
     /// Persist the cache to disk (best-effort; failures are ignored).
     pub(crate) fn save(&self) {
-        if !self.dirty || env::var("AK_TOOL_CACHE").as_deref() != Ok("1") {
+        if !self.dirty || env::var("OYE_TOOL_CACHE").as_deref() != Ok("1") {
             return;
         }
         if let Some(path) = cache_file_path() {

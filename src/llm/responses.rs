@@ -6,6 +6,7 @@ pub(crate) fn complete(
     messages: &[ChatMessage],
     with_tools: bool,
     sink: Option<::std::sync::mpsc::Sender<crate::core::types::SinkLine>>,
+    cancel: &dyn crate::agent::state::CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
-    crate::llm::client::call_responses(config, messages, with_tools, sink)
+    crate::llm::client::call_responses(config, messages, with_tools, sink, cancel)
 }

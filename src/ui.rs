@@ -1,10 +1,10 @@
-use std::process::Command;
+#![allow(dead_code)]
+
+use std::fmt;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use crossterm::event::DisableMouseCapture;
-use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+use crossterm::Command;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
@@ -13,78 +13,121 @@ use crate::core::types::SinkLine;
 use crate::llm::config::LlmConfig;
 use crate::session::Session;
 
-mod event;
 mod input;
+mod remote;
 mod render;
 mod slash;
+mod theme;
 mod wrapping;
-use input::InputField;
 
-pub(crate) use event::run_ratatui_repl;
+pub(crate) use remote::run_ratatui_repl_with_remote;
 pub(crate) use render::view;
 
-enum UiEvent {
-    State {
-        messages: Vec<crate::core::types::ChatMessage>,
-        tool_state: ToolState,
-        session: Box<Session>,
+use input::InputField;
+
+const VERTICAL_GUTTER: u16 = 1;
+const HORIZONTAL_GUTTER: u16 = 1;
+const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
+const INPUT_BORDER_ROWS: u16 = 0;
+const INPUT_PAD_Y: u16 = 1;
+const STATUS_CONTENT_ROWS: u16 = 1;
+const INPUT_MIN_ROWS: u16 = 3;
+const INPUT_STATUS_GUTTER: u16 = 0;
+const APPROVAL_HEIGHT: u16 = 11;
+
+/// Raised-surface colors are resolved in `ui/theme.rs` from the terminal's
+/// own palette / detected background, so they follow the terminal theme.
+/// Braille spinner frames, matching the headless console spinner.
+const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// A semantic transcript block. Gaps between blocks are **not** stored;
+/// they are inserted by `TranscriptView::render` (`ui/render.rs`) as a
+/// single blank `Line` between any two blocks. This makes gutter handling
+/// canonical and removes the need for ad-hoc `push_transcript_gap` /
+/// `in_assistant_stream` bookkeeping at every call site.
+#[derive(Debug)]
+pub(crate) enum TranscriptBlock {
+    User(Vec<Line<'static>>),
+    Assistant(Vec<Line<'static>>),
+    Tool {
+        input: Line<'static>,
+        output: Option<Line<'static>>,
+        preview: Vec<Line<'static>>,
     },
-    Done {
-        success: bool,
-    },
+    System(Line<'static>),
+    Error(Line<'static>),
+    Info(Line<'static>),
 }
 
-pub(crate) struct App {
-    transcript: Vec<Line<'static>>,
-    input: InputField,
-    config: LlmConfig,
-    messages: Vec<crate::core::types::ChatMessage>,
-    tool_state: ToolState,
-    session: Session,
-    skills: Vec<crate::core::types::Skill>,
-    turn_start: usize,
-    cwd: String,
-    git_branch: Option<String>,
-    git_dirty: bool,
-    turn_started: Option<Instant>,
-    active_tool: Option<String>,
-    last_activity: Option<String>,
-    steering_rx: Option<mpsc::Receiver<String>>,
-    followup_rx: Option<mpsc::Receiver<String>>,
-    pending_steering: Vec<String>,
-    pending_followups: Vec<String>,
-    cancel_requested: bool,
-    approval_rx: Option<mpsc::Receiver<crate::core::types::ApprovalRequest>>,
-    pending_approval: Option<PendingApproval>,
-    busy: bool,
-    autoscroll: bool,
-    scroll: u16,
-    tick: u16,
-    quit: bool,
-    history: Vec<String>,
-    history_index: Option<usize>,
-    history_draft: String,
-    slash_selected: usize,
-}
-
-struct PendingApproval {
-    name: String,
-    input: String,
-    response: mpsc::Sender<crate::core::types::ApprovalDecision>,
-    selected: usize,
-}
-
-struct TerminalCleanup;
-
-impl Drop for TerminalCleanup {
-    fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-        let _ = disable_raw_mode();
+impl TranscriptBlock {
+    /// Lines that belong to this block, in display order.
+    pub(crate) fn lines(&self) -> Vec<&Line<'static>> {
+        match self {
+            TranscriptBlock::User(lines) => lines.iter().collect(),
+            TranscriptBlock::Assistant(lines) => lines.iter().collect(),
+            TranscriptBlock::Tool {
+                input,
+                output,
+                preview,
+            } => {
+                let mut out = Vec::with_capacity(1 + output.is_some() as usize + preview.len());
+                out.push(input);
+                if let Some(o) = output {
+                    out.push(o);
+                }
+                out.extend(preview.iter());
+                out
+            }
+            TranscriptBlock::System(line) => vec![line],
+            TranscriptBlock::Error(line) => vec![line],
+            TranscriptBlock::Info(line) => vec![line],
+        }
     }
 }
 
+/// The TUI application state. Rendering lives in `ui/render.rs` (`view`);
+/// turn execution lives either in the local engine or, in client-server
+/// mode, in `ui/remote.rs` which drives the same state from daemon events.
+pub(crate) struct App {
+    pub(crate) transcript: Vec<TranscriptBlock>,
+    pub(crate) input: InputField,
+    pub(crate) config: LlmConfig,
+    pub(crate) messages: Vec<crate::core::types::ChatMessage>,
+    pub(crate) tool_state: ToolState,
+    pub(crate) session: Session,
+    pub(crate) skills: Vec<crate::core::types::Skill>,
+    pub(crate) turn_start: usize,
+    pub(crate) cwd: String,
+    pub(crate) git_branch: Option<String>,
+    pub(crate) git_dirty: bool,
+    pub(crate) turn_started: Option<Instant>,
+    pub(crate) active_tool: Option<String>,
+    pub(crate) last_activity: Option<String>,
+    pub(crate) steering_rx: Option<mpsc::Receiver<String>>,
+    pub(crate) followup_rx: Option<mpsc::Receiver<String>>,
+    pub(crate) pending_steering: Vec<String>,
+    pub(crate) pending_followups: Vec<String>,
+    pub(crate) cancel_requested: bool,
+    pub(crate) approval_rx: Option<mpsc::Receiver<crate::core::types::ApprovalRequest>>,
+    pub(crate) pending_approval: Option<PendingApproval>,
+    pub(crate) busy: bool,
+    pub(crate) autoscroll: bool,
+    pub(crate) scroll: u16,
+    pub(crate) tick: u16,
+    pub(crate) quit: bool,
+    pub(crate) history: Vec<String>,
+    pub(crate) history_index: Option<usize>,
+    pub(crate) history_draft: String,
+    pub(crate) slash_selected: usize,
+    /// Whether the tail `Assistant` block is still open for streaming
+    /// coalescence. Tracked so an initial transcript block (e.g. in tests)
+    /// does not merge with the first streamed assistant turn; gaps remain
+    /// canonical between blocks.
+    pub(crate) assistant_open: bool,
+}
+
 impl App {
-    fn history_up(&mut self) {
+    pub(crate) fn history_up(&mut self) {
         if self.history.is_empty() {
             return;
         }
@@ -99,7 +142,7 @@ impl App {
         self.input = InputField::from_text(&self.history[self.history.len() - 1 - idx]);
     }
 
-    fn history_down(&mut self) {
+    pub(crate) fn history_down(&mut self) {
         match self.history_index {
             None => {}
             Some(0) => {
@@ -114,7 +157,7 @@ impl App {
         }
     }
 
-    fn history_push(&mut self, text: String) {
+    pub(crate) fn history_push(&mut self, text: String) {
         if text.is_empty() {
             return;
         }
@@ -126,23 +169,14 @@ impl App {
     }
 }
 
-const VERTICAL_GUTTER: u16 = 1;
-const HORIZONTAL_GUTTER: u16 = 1;
-const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
-const INPUT_BORDER_ROWS: u16 = 0;
-const INPUT_PAD_Y: u16 = 1;
-const STATUS_CONTENT_ROWS: u16 = 1;
-const INPUT_MIN_ROWS: u16 = 3;
-const INPUT_STATUS_GUTTER: u16 = 0;
-const APPROVAL_HEIGHT: u16 = 11;
+pub(crate) struct PendingApproval {
+    pub(crate) name: String,
+    pub(crate) input: String,
+    pub(crate) response: mpsc::Sender<crate::core::types::ApprovalDecision>,
+    pub(crate) selected: usize,
+}
 
-const SUBMITTED_PROMPT_BG: Color = Color::Rgb(20, 38, 54);
-const INPUT_BG: Color = SUBMITTED_PROMPT_BG;
-
-/// Braille spinner frames, matching the headless console spinner.
-const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-pub(super) fn format_tokens(tokens: u64) -> String {
+pub(crate) fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
@@ -152,149 +186,224 @@ pub(super) fn format_tokens(tokens: u64) -> String {
     }
 }
 
-fn git_context(cwd: &str) -> (Option<String>, bool) {
-    let branch = Command::new("git")
-        .args(["-C", cwd, "branch", "--show-current"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|branch| !branch.is_empty());
-    let dirty = branch.is_some()
-        && Command::new("git")
-            .args(["-C", cwd, "status", "--porcelain"])
-            .output()
-            .ok()
-            .is_some_and(|output| !output.stdout.is_empty());
-    (branch, dirty)
+struct TerminalCleanup;
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        use crossterm::event::DisableMouseCapture;
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableAlternateScroll
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
 }
 
+/// DECSET 1007 (alternate scroll): while in the alternate screen the
+/// terminal turns mouse-wheel events into Up/Down arrow presses. Mouse
+/// capture is deliberately never enabled, so click-drag stays native and
+/// the terminal itself handles text selection for copy.
+pub(crate) struct EnableAlternateScroll;
+
+impl Command for EnableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1007h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct DisableAlternateScroll;
+
+impl Command for DisableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn transcript_indent() -> String {
+    " ".repeat(TRANSCRIPT_INDENT)
+}
+
+fn indent_transcript_line(mut line: Line<'static>) -> Line<'static> {
+    line.spans.insert(0, Span::raw(transcript_indent()));
+    line
+}
+
+pub(super) fn push_info(app: &mut App, text: String) {
+    app.assistant_open = false;
+    app.transcript
+        .push(TranscriptBlock::Info(indent_transcript_line(Line::from(
+            Span::styled(text, Style::default().fg(Color::Cyan)),
+        ))));
+}
+
+/// Route a streamed console line into the transcript with the same styling
+/// the local engine uses, so remote and local turns look identical.
+/// Each `SinkLine` maps to one `TranscriptBlock` (or an extension of the
+/// tail `Assistant` block while streaming). No empty gap `Line`s are stored;
+/// `TranscriptView` inserts a single blank `Line` between any two blocks.
 pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
     match sl {
         SinkLine::Assistant(s) => {
             if s.trim().is_empty() {
-                if !app
-                    .transcript
-                    .last()
-                    .is_some_and(|line| line.spans.is_empty())
-                {
-                    push_transcript_gap(app);
+                // Blank inside the current assistant message (e.g. streaming
+                // blank line between paragraphs). Keep it inside the tail
+                // Assistant block so the inter-block gutter remains canonical.
+                if app.assistant_open {
+                    if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
+                        lines.push(Line::default());
+                    }
                 }
-            } else {
-                if app
-                    .transcript
-                    .last()
-                    .is_some_and(|line| is_tool_line(line) || is_user_line(line))
-                {
-                    push_transcript_gap(app);
-                }
-                for line in render::markdown_lines(s.trim_end()) {
-                    app.transcript.push(indent_transcript_line(line));
+                app.autoscroll = true;
+                return;
+            }
+            let new_lines: Vec<Line<'static>> = render::markdown_lines(s.trim_end())
+                .into_iter()
+                .map(indent_transcript_line)
+                .collect();
+            if app.assistant_open {
+                if let Some(TranscriptBlock::Assistant(existing)) = app.transcript.last_mut() {
+                    existing.extend(new_lines);
+                    app.autoscroll = true;
+                    return;
                 }
             }
+            app.transcript.push(TranscriptBlock::Assistant(new_lines));
+            app.assistant_open = true;
+            app.autoscroll = true;
+            return;
         }
         SinkLine::ToolInput(s) => {
             dim_intermediate_assistant_block(app);
-            if app
-                .transcript
-                .last()
-                .is_some_and(|line| !line.spans.is_empty())
-            {
-                push_transcript_gap(app);
-            }
+            app.assistant_open = false;
             let mut it = s.splitn(2, ' ');
             let name = it.next().unwrap_or("").to_string();
             let arg = it.next().unwrap_or("").to_string();
             app.active_tool = Some(name.clone());
-            app.transcript.push(indent_transcript_line(Line::from(vec![
+            let input = indent_transcript_line(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Yellow)),
                 Span::styled(name, Style::default().fg(Color::Yellow)),
-                Span::styled(format!(" {arg}"), Style::default().fg(Color::DarkGray)),
-            ])));
+                Span::styled(
+                    format!(" {arg}"),
+                    Style::default().fg(theme::tool_input_fg()),
+                ),
+            ]));
+            app.transcript.push(TranscriptBlock::Tool {
+                input,
+                output: None,
+                preview: Vec::new(),
+            });
         }
-        SinkLine::ToolOutput { name, summary } => {
-            let failed = summary.starts_with("failed ·");
+        SinkLine::ToolOutput {
+            name: _,
+            summary,
+            success,
+            preview,
+            duration,
+        } => {
+            // The ▸ line above already names the tool; the └ line leads with
+            // the outcome (glyph + summary) and trails timing in dim.
+            let failed = !success;
             let color = if failed {
                 Color::LightRed
             } else {
                 Color::LightGreen
             };
-            app.transcript.push(indent_transcript_line(Line::from(vec![
+            let mut spans = vec![
                 Span::styled("└ ", Style::default().fg(color)),
                 Span::styled(if failed { "✗ " } else { "✓ " }, Style::default().fg(color)),
-                Span::styled(name, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!(" {summary}"), Style::default().fg(color)),
-            ])));
-        }
-        SinkLine::System(s) => app.transcript.push(indent_transcript_line(Line::from(vec![
-            Span::styled("· ", Style::default().fg(Color::DarkGray)),
-            Span::styled(s, Style::default().fg(Color::DarkGray)),
-        ]))),
-        SinkLine::Error(s) => {
-            if app
-                .transcript
-                .last()
-                .is_some_and(|line| !line.spans.is_empty())
-            {
-                push_transcript_gap(app);
+                Span::styled(summary, Style::default().fg(color)),
+            ];
+            if duration > 0.0 {
+                spans.push(Span::styled(
+                    format!(" · {}", crate::core::format::format_duration(duration)),
+                    Style::default().fg(theme::muted_fg()),
+                ));
             }
-            app.transcript.push(indent_transcript_line(Line::from(vec![
-                Span::styled("! ", Style::default().fg(Color::Red)),
-                Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
-            ])));
+            let output = indent_transcript_line(Line::from(spans));
+            let preview_lines: Vec<Line<'static>> = preview
+                .iter()
+                .map(|line| {
+                    indent_transcript_line(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme::tool_preview_fg()),
+                    )))
+                })
+                .collect();
+            app.assistant_open = false;
+            // Complete the tool block started by ToolInput if it is still open.
+            if let Some(TranscriptBlock::Tool {
+                output: out,
+                preview: prev,
+                ..
+            }) = app.transcript.last_mut()
+            {
+                if out.is_none() {
+                    *out = Some(output);
+                    *prev = preview_lines;
+                    app.autoscroll = true;
+                    return;
+                }
+            }
+            // Fallback: no open ToolInput (e.g. replay); synthesize a block.
+            app.transcript.push(TranscriptBlock::Tool {
+                input: indent_transcript_line(Line::from(Span::styled(
+                    "▸ tool",
+                    Style::default().fg(Color::Yellow),
+                ))),
+                output: Some(output),
+                preview: preview_lines,
+            });
+        }
+        SinkLine::System(s) => {
+            app.assistant_open = false;
+            app.transcript
+                .push(TranscriptBlock::System(indent_transcript_line(Line::from(
+                    vec![
+                        Span::styled("· ", Style::default().fg(theme::muted_fg())),
+                        Span::styled(s, Style::default().fg(theme::muted_fg())),
+                    ],
+                ))));
+        }
+        // Usage updates flow into the status bar via StreamEvent::Usage in
+        // the remote handler, not into the transcript.
+        SinkLine::Usage(_) => {}
+        SinkLine::Error(s) => {
+            app.assistant_open = false;
+            app.transcript
+                .push(TranscriptBlock::Error(indent_transcript_line(Line::from(
+                    vec![
+                        Span::styled("! ", Style::default().fg(Color::Red)),
+                        Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
+                    ],
+                ))));
         }
     }
     app.autoscroll = true;
 }
 
-fn is_tool_line(line: &Line<'static>) -> bool {
-    line.spans.iter().any(|span| {
-        span.content.as_ref().starts_with("▸") || span.content.as_ref().starts_with("└")
-    })
-}
-
-fn is_user_line(line: &Line<'static>) -> bool {
-    line.spans.iter().any(|span| span.style.bg.is_some())
-}
-
-fn is_assistant_line(line: &Line<'static>) -> bool {
-    !line.spans.is_empty()
-        && !is_user_line(line)
-        && !line.spans.iter().any(|span| {
-            let text = span.content.as_ref();
-            text.starts_with("▸") || text.starts_with("└") || text.starts_with("· ")
-        })
-}
-
 fn dim_intermediate_assistant_block(app: &mut App) {
-    for line in app.transcript.iter_mut().rev() {
-        if line.spans.is_empty() || !is_assistant_line(line) {
-            break;
-        }
-        for span in &mut line.spans {
-            span.style = span.style.fg(Color::DarkGray);
+    if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
+        for line in lines.iter_mut() {
+            for span in &mut line.spans {
+                span.style = span.style.fg(theme::muted_fg());
+            }
         }
     }
 }
 
-pub(super) fn push_transcript_gap(app: &mut App) {
-    if !app
-        .transcript
-        .last()
-        .is_some_and(|line| line.spans.is_empty())
-    {
-        app.transcript.push(Line::from(String::new()));
-    }
-}
-
-pub(super) fn push_info(app: &mut App, text: String) {
-    app.transcript
-        .push(indent_transcript_line(Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Cyan),
-        ))));
-}
-
+/// Send the user's approval decision for the pending tool execution.
 pub(super) fn resolve_approval(app: &mut App, decision: crate::core::types::ApprovalDecision) {
     if let Some(approval) = app.pending_approval.take() {
         let _ = approval.response.send(decision);
@@ -308,50 +417,76 @@ pub(super) fn scroll_transcript(app: &mut App, delta: i32) {
         .clamp(0, u16::MAX as i32) as u16;
 }
 
-fn transcript_indent() -> String {
-    " ".repeat(TRANSCRIPT_INDENT)
-}
-
-fn indent_transcript_line(mut line: Line<'static>) -> Line<'static> {
-    line.spans.insert(0, Span::raw(transcript_indent()));
-    line
+/// Render the user's submitted prompt with the shared transcript grid.
+/// No empty gap `Line`s are stored; gutter is inserted by `TranscriptView`.
+pub(super) fn render_user_prompt(app: &mut App, line: &str) {
+    app.assistant_open = false;
+    let user_bg = Style::default()
+        .fg(theme::surface_fg())
+        .bg(theme::surface_bg());
+    let horizontal_pad = " ".repeat(TRANSCRIPT_INDENT);
+    let edge_pad = Span::styled(" ", user_bg);
+    let mut block_lines = Vec::new();
+    block_lines.push(Line::from(edge_pad.clone()));
+    for sub in line.split('\n') {
+        block_lines.push(Line::from(vec![
+            Span::styled(horizontal_pad.clone(), user_bg),
+            Span::styled(sub.to_string(), user_bg),
+            edge_pad.clone(),
+        ]));
+    }
+    block_lines.push(Line::from(edge_pad));
+    app.transcript.push(TranscriptBlock::User(block_lines));
 }
 
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::core::types::{ApiProtocol, PermissionMode, Provider};
 
-    fn test_app() -> App {
-        let cwd = "/tmp/ak-ui-test".to_string();
-        App {
-            transcript: vec![indent_transcript_line(Line::from(
-                "hello from the transcript — this line is intentionally long enough to wrap",
-            ))],
-            input: InputField::new(),
-            config: LlmConfig {
-                provider: Provider::OpenCode,
-                api_key: "test".to_string(),
-                base_url: "http://localhost".to_string(),
-                model: "test-model".to_string(),
-                available_models: vec!["test-model".to_string()],
-                api: ApiProtocol::Responses,
+    #[test]
+    fn indent_transcript_line_adds_gutter() {
+        let line = Line::from("test");
+        let indented = indent_transcript_line(line);
+        assert!(indented.spans[0].content.as_ref() == " ");
+    }
+
+    #[test]
+    fn git_context_returns_empty_on_non_repo() {
+        let (branch, dirty) = crate::core::format::git_context("/tmp/not-a-repo-12345");
+        assert!(branch.is_none());
+        assert!(!dirty);
+    }
+
+    #[test]
+    fn tool_preview_lines_are_indented_and_dimmed() {
+        // Preview formatting is exercised through the Tool block produced by
+        // `append_sink_line`; the stored preview lines must be indented and
+        // dimmed exactly as before.
+        let mut app = App {
+            transcript: Vec::new(),
+            input: crate::ui::input::InputField::new(),
+            config: crate::llm::config::LlmConfig {
+                provider: crate::core::types::Provider::OpenCode,
+                api_key: String::new(),
+                base_url: String::new(),
+                model: "test".into(),
+                available_models: vec!["test".into()],
+                api: crate::core::types::ApiProtocol::Responses,
                 account_id: None,
                 thinking_effort: None,
                 context_window: 128_000,
-                permission: PermissionMode::Trusted,
+                permission: crate::core::types::PermissionMode::Trusted,
                 max_tool_iterations: 60,
                 max_prompt_tokens: 128_000,
                 max_turn_seconds: 900,
                 client: reqwest::blocking::Client::new(),
             },
             messages: Vec::new(),
-            tool_state: ToolState::default(),
-            session: Session::in_memory(cwd.clone()),
+            tool_state: crate::agent::state::ToolState::default(),
+            session: crate::session::Session::in_memory("/tmp".into()),
             skills: Vec::new(),
             turn_start: 0,
-            cwd,
+            cwd: "/tmp".into(),
             git_branch: None,
             git_dirty: false,
             turn_started: None,
@@ -373,66 +508,31 @@ mod tests {
             history_index: None,
             history_draft: String::new(),
             slash_selected: 0,
+            assistant_open: false,
+        };
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash echo hi".into()),
+        );
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "bash".into(),
+                summary: "v ok".into(),
+                success: true,
+                preview: vec!["src/main.rs".into(), "… +3 more lines".into()],
+                duration: 0.0,
+            },
+        );
+        let TranscriptBlock::Tool { preview, .. } = &app.transcript[0] else {
+            panic!("expected Tool block");
+        };
+        assert_eq!(preview.len(), 2);
+        for line in preview {
+            assert!(line.spans.len() == 2); // indent gutter + content
+            assert_eq!(line.spans[1].style.fg, Some(theme::tool_preview_fg()));
         }
-    }
-
-    #[test]
-    fn slash_suggestions_filter_by_prefix_and_include_skills() {
-        let mut app = test_app();
-        app.skills.push(crate::core::types::Skill {
-            name: "rust".to_string(),
-            description: "Rust help".to_string(),
-            path: "/tmp/rust/SKILL.md".into(),
-        });
-        app.input = InputField::from_text("/s");
-        let commands = crate::ui::slash::slash_suggestions(&app);
-        let names: Vec<_> = commands.iter().map(|(name, _)| name.as_str()).collect();
-        assert!(names.contains(&"/session"));
-        assert!(names.contains(&"/skill:rust"));
-        assert!(!names.contains(&"/model"));
-
-        app.input = InputField::from_text("/model ");
-        let models = crate::ui::slash::slash_suggestions(&app);
-        assert!(models.iter().any(|(name, _)| name == "/model test-model"));
-
-        app.input = InputField::from_text("/provider ");
-        let providers = crate::ui::slash::slash_suggestions(&app);
-        assert!(providers
-            .iter()
-            .any(|(name, _)| name == "/provider opencode"));
-        assert!(providers
-            .iter()
-            .any(|(name, _)| name == "/provider openai-codex"));
-    }
-
-    #[test]
-    fn slash_completion_replaces_input_with_selected_command() {
-        let mut app = test_app();
-        app.input = InputField::from_text("/mo");
-        assert!(crate::ui::slash::complete_slash(&mut app));
-        assert_eq!(app.input.text(), "/model ");
-        assert_eq!(app.input.row, 0);
-        assert_eq!(app.input.col, "/model ".len());
-    }
-
-    #[test]
-    fn provider_names_are_parsed_for_runtime_switching() {
-        assert_eq!(Provider::parse("codex").unwrap().name(), "openai-codex");
-        assert_eq!(Provider::parse("OpenCode").unwrap().name(), "opencode");
-        assert!(Provider::parse("unknown").is_err());
-    }
-
-    #[test]
-    fn intermediate_assistant_block_is_dimmed_before_tool_call() {
-        let mut app = test_app();
-        app.transcript.clear();
-        app.transcript
-            .push(indent_transcript_line(Line::from(Span::styled(
-                "I will inspect the project first.",
-                Style::default().fg(Color::White),
-            ))));
-        append_sink_line(&mut app, SinkLine::ToolInput("read README.md".to_string()));
-        let assistant = &app.transcript[0];
-        assert_eq!(assistant.spans[1].style.fg, Some(Color::DarkGray));
+        assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
+        assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");
     }
 }

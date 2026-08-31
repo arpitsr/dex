@@ -1,3 +1,4 @@
+use crate::agent::state::CancellationSource;
 use crate::core::format::*;
 use crate::core::types::*;
 use crate::llm::client::*;
@@ -39,6 +40,7 @@ pub(crate) fn message_to_transcript(msg: &ChatMessage) -> String {
 pub(crate) fn summarize_old_messages(
     config: &LlmConfig,
     old: &[ChatMessage],
+    cancel: &dyn CancellationSource,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let transcript: String = old
         .iter()
@@ -68,13 +70,14 @@ pub(crate) fn summarize_old_messages(
             name: None,
         },
     ];
-    let (summary, _) = call_llm(config, &prompt, false, None)?;
+    let (summary, _) = call_llm(config, &prompt, false, None, cancel)?;
     Ok(summary.content.unwrap_or_default())
 }
 
 pub(crate) fn compact_history(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
+    cancel: &dyn CancellationSource,
 ) -> Result<(), String> {
     // Find where the protected recent window begins (never split a
     // tool_call/tool pairing, so back up to the last non-tool message).
@@ -95,7 +98,7 @@ pub(crate) fn compact_history(
 
     // Summarize the old segment (between the first user message and cutoff).
     let old: Vec<ChatMessage> = messages[1..cutoff].to_vec();
-    let summarized = match summarize_old_messages(config, &old) {
+    let summarized = match summarize_old_messages(config, &old, cancel) {
         Ok(s) => s,
         Err(e) => {
             return Err(format!(

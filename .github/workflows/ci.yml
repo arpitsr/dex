@@ -5,6 +5,10 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      security-events: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -14,4 +18,6 @@ jobs:
       - run: cargo test --all-targets
       - run: cargo test --all-targets --features network-tests
       - run: cargo clippy --all-targets -- -D warnings
-      - uses: actions-rust-lang/audit-check@v1
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
