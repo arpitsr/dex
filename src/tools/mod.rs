@@ -236,6 +236,19 @@ fn shell_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(120))
 }
 
+/// Expose the running binary to shell commands as $OYE_BIN so a script can
+/// call tools locally (`"$OYE_BIN" run read path=src/main.rs`) and stitch a
+/// whole read-only pipeline in one call — intermediate output stays out of
+/// the conversation and only the distilled result reaches the model.
+/// ponytail: shell stitching only — if JSON routing in pipelines gets
+/// painful, embed rquickjs and expose tools as functions (same $OYE_BIN mechanism).
+fn tool_runner_env() -> Vec<(String, String)> {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| vec![("OYE_BIN".to_string(), exe.display().to_string())])
+        .unwrap_or_default()
+}
+
 /// Read up to `limit` bytes; reports whether more output remained after the
 /// limit was hit (the distinguishing extra read happens after EOF-or-limit,
 /// so a stream that ends exactly at the limit is not flagged truncated).
@@ -279,6 +292,7 @@ fn run_bash_with_limits(
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
+        .envs(tool_runner_env())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1118,6 +1132,22 @@ mod tests {
     #[test]
     fn shell_escape_handles_quotes_and_commands() {
         assert_eq!(shell_escape("a'b; echo hacked"), "'a'\"'\"'b; echo hacked'");
+    }
+
+    #[test]
+    fn bash_exposes_the_binary_for_local_stitching() {
+        let (output, code) = run_bash_with_limits(
+            "printf '%s' \"$OYE_BIN\"",
+            Duration::from_secs(5),
+            4096,
+            &GlobalCancellation,
+        )
+        .unwrap();
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            output,
+            std::env::current_exe().unwrap().display().to_string()
+        );
     }
     #[test]
     fn metadata_classifies_tools() {

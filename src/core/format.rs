@@ -112,7 +112,10 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
 /// confirmation for the REPL transcript instead of the full output.
 pub(crate) fn one_line_summary(text: &str) -> String {
     let stripped = strip_ansi(text);
-    let line = stripped.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let line = stripped
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
     let line = line.trim();
     let limit = line
         .char_indices()

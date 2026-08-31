@@ -1,3 +1,4 @@
+use serde_json::{Map, Value};
 use std::env;
 use std::path::PathBuf;
 
@@ -29,6 +30,9 @@ pub(crate) enum Mode {
     OneShot { prompt: String },
     /// Raw tool mode (`oye --tool`).
     Tool,
+    /// One-shot tool execution (`oye run <tool> <args...>`) so scripts can
+    /// call tools locally and stitch pipelines without model round trips.
+    RunTool { name: String, args: Vec<String> },
 }
 
 pub(crate) fn parse_args() -> Args {
@@ -95,6 +99,10 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
             Mode::Connect { url }
         }
         Some("--tool") => Mode::Tool,
+        Some("run") if args.rest.len() >= 2 => Mode::RunTool {
+            name: args.rest[1].clone(),
+            args: args.rest[2..].to_vec(),
+        },
         Some(prompt) if !prompt.starts_with('-') => Mode::OneShot {
             prompt: args.rest.join(" "),
         },
@@ -108,6 +116,30 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
     }
 }
 
+/// Parse `run` arguments: either a single JSON object string
+/// (`'{"path":"a.rs"}'`) or key=value pairs (`path=a.rs limit=5`).
+/// Values that parse as JSON numbers/booleans are coerced, so `limit=5` and
+/// `replaceAll=true` arrive typed; anything else stays a string (a string
+/// value can always be forced by quoting it as JSON: `path='"2024"'`).
+pub(crate) fn parse_tool_args(raw: &[String]) -> Result<Map<String, Value>, String> {
+    let mut map = Map::new();
+    if raw.len() == 1 && raw[0].trim_start().starts_with('{') {
+        return serde_json::from_str::<Value>(&raw[0])
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .ok_or_else(|| "invalid JSON arguments".to_string());
+    }
+    for pair in raw {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            format!("argument '{pair}' must be key=value (or a single JSON object)")
+        })?;
+        let value = serde_json::from_str::<Value>(value)
+            .unwrap_or_else(|_| Value::String(value.to_string()));
+        map.insert(key.to_string(), value);
+    }
+    Ok(map)
+}
+
 fn required(input: &mut impl Iterator<Item = String>, flag: &str) -> String {
     input
         .next()
@@ -117,4 +149,31 @@ fn required(input: &mut impl Iterator<Item = String>, flag: &str) -> String {
 fn fail(message: &str) -> ! {
     eprintln!("error: {}", message);
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_args_parse_json_object_or_key_value_pairs() {
+        let args = parse_tool_args(&["{\"path\":\"a.rs\",\"limit\":5}".to_string()]).unwrap();
+        assert_eq!(args.get("path").and_then(Value::as_str), Some("a.rs"));
+        assert_eq!(args.get("limit").and_then(Value::as_u64), Some(5));
+
+        let args = parse_tool_args(&[
+            "path=a.rs".to_string(),
+            "limit=5".to_string(),
+            "replaceAll=true".to_string(),
+            "pattern=fn main".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args.get("limit").and_then(Value::as_u64), Some(5));
+        assert_eq!(args.get("replaceAll").and_then(Value::as_bool), Some(true));
+        assert_eq!(args.get("pattern").and_then(Value::as_str), Some("fn main"));
+        assert_eq!(args.get("path").and_then(Value::as_str), Some("a.rs"));
+
+        assert!(parse_tool_args(&["path".to_string()]).is_err());
+        assert!(parse_tool_args(&["{broken".to_string()]).is_err());
+    }
 }

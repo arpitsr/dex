@@ -269,5 +269,37 @@ fn main() {
         Mode::Tool => {
             run_interactive();
         }
+        Mode::RunTool { name, args } => {
+            let parsed = match cli::parse_tool_args(&args) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            // Read-only tools pass unconditionally (approve_tool never asks
+            // for them), so stitching works from non-interactive scripts;
+            // write/shell still require interactive approval or trusted env.
+            let permission = load_file_config()
+                .and_then(|file| permission_from_env_or_file(&file))
+                .unwrap_or(PermissionMode::ReadOnly);
+            let input = serde_json::to_string(&parsed).unwrap_or_default();
+            if !approve_tool(
+                permission,
+                &name,
+                &input,
+                &crate::core::console::Console::none(),
+            ) {
+                eprintln!("Error: permission denied for tool '{name}'");
+                std::process::exit(1);
+            }
+            match execute(&name, &parsed, &GlobalCancellation) {
+                Ok(out) => print!("{out}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
