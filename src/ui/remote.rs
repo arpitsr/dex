@@ -177,6 +177,23 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // take over; surface colors are resolved from this once.
     super::theme::detect_background();
     enable_raw_mode()?;
+    // Correct fix: consume any OSC 10/11 reply that arrived late.
+    // terminal_colorsaurus writes `\x1b]10;?` / `\x1b]11;?` and reads the
+    // reply; on timeout the reply (`\x1b]10;rgb:…\x07`) stays in the tty
+    // queue and crossterm parses it as Alt+`]` + plain chars + Ctrl-G.
+    // Drain with a short deadline so the full burst is consumed before the
+    // event loop starts. No input hack — just consume at the source.
+    {
+        let drain_deadline = Instant::now() + Duration::from_millis(80);
+        while Instant::now() < drain_deadline {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if event::poll(remaining)? {
+                let _ = event::read();
+            } else {
+                break;
+            }
+        }
+    }
     let _cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
     // No mouse capture: capturing the mouse makes the terminal hand over
@@ -224,8 +241,18 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                     handle_key_event(&mut remote, key, &mut pending)?;
                 }
                 Event::Paste(s) => {
+                    // Tabs would render as tab stops and desync the frame;
+                    // expand them and drop other control characters.
                     for c in s.chars() {
-                        remote.app.input.insert_char(c);
+                        match c {
+                            '\t' => {
+                                for _ in 0..4 {
+                                    remote.app.input.insert_char(' ');
+                                }
+                            }
+                            c if !c.is_control() => remote.app.input.insert_char(c),
+                            _ => {}
+                        }
                     }
                 }
                 Event::Resize(..) => {} // frame recomputed each draw

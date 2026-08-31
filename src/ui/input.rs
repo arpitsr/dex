@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A small UTF-8-aware multiline editor used by the terminal UI.
 pub(crate) struct InputField {
@@ -56,7 +56,14 @@ impl InputField {
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char(c) => self.insert_char(c),
+            KeyCode::Char(c)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if !c.is_control() {
+                    self.insert_char(c);
+                }
+            }
+            KeyCode::Char(_) => {}
             KeyCode::Enter => self.insert_char('\n'),
             KeyCode::Backspace => {
                 if self.col == 0 {
@@ -133,5 +140,58 @@ impl InputField {
     fn clamp_col(&mut self) {
         let max = self.lines[self.row].len();
         self.col = self.col.min(max);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEventKind, KeyEventState};
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn alt_and_ctrl_modified_chars_are_dropped() {
+        // Correct behavior: Alt/Ctrl-modified chars must never land in the
+        // composer. `\x1b]10;rgb:…\x07` is parsed by crossterm as Alt+`]` +
+        // plain `10;rgb:…` + Ctrl-G. The Alt/Ctrl wrappers are dropped here;
+        // the plain middle is consumed at the source by the timed drain in
+        // `remote.rs` before the event loop starts, so it never reaches
+        // `handle_key`. This test verifies the input guard only.
+        let mut f = InputField::new();
+        f.handle_key(key(KeyCode::Char(']'), KeyModifiers::ALT));
+        assert_eq!(f.text(), "", "Alt+] must be dropped");
+        f.handle_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(f.text(), "", "Ctrl-G (BEL) must be dropped");
+        f.handle_key(key(KeyCode::Char('\\'), KeyModifiers::ALT));
+        assert_eq!(f.text(), "", "Alt+\\ (ST) must be dropped");
+        // Plain burst would reach input only if drain failed — input itself
+        // correctly inserts plain, drain is the source fix.
+        for c in "10;rgb:f6f6/dcdc/acac".chars() {
+            f.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert!(f.text().contains("10;rgb:"), "plain is inserted when it reaches input");
+    }
+
+    #[test]
+    fn normal_typing_still_works() {
+        let mut f = InputField::new();
+        for c in "hello".chars() {
+            f.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert_eq!(f.text(), "hello");
+        // Shift+letter (uppercase) must still insert.
+        f.handle_key(key(KeyCode::Char('W'), KeyModifiers::SHIFT));
+        assert_eq!(f.text(), "helloW");
+        // Ctrl+C must not insert.
+        f.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(f.text(), "helloW");
     }
 }

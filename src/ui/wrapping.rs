@@ -5,6 +5,8 @@ use unicode_width::UnicodeWidthChar;
 /// Greedily wrap an input line and locate the cursor in the resulting rows.
 /// `col` and the returned cursor position use bytes and display cells
 /// respectively, matching the input editor and ratatui.
+const TAB_WIDTH: usize = 8;
+
 pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u16, u16) {
     let width = width.max(1);
     let col = col.min(line.len());
@@ -23,10 +25,27 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
         let begin = bounds[index];
         let end = bounds[index + 1];
         let ch = line[begin..end].chars().next().unwrap();
-        let char_width = ch.width().unwrap_or(0).max(1);
+        let char_width = if ch == '\t' {
+            TAB_WIDTH - (row_width % TAB_WIDTH)
+        } else if ch.is_control() {
+            0
+        } else {
+            ch.width().unwrap_or(0).max(1)
+        };
 
         if ch.is_whitespace() {
             last_space_end = Some(end);
+        }
+        if ch.is_control() && ch != '\t' {
+            // Drop other C0 controls entirely (\r, BEL, etc.) — they would
+            // otherwise desync the model vs terminal. Tabs are kept with
+            // tabstop-aware width above.
+            if begin < col {
+                // col points into original line; dropping a control before
+                // it doesn't affect display column, so no cursor adjustment
+                // needed beyond not counting its width.
+            }
+            continue;
         }
         if row_width + char_width > width && begin > start {
             // Wrap at the last whitespace inside the current row, if any; a
@@ -35,10 +54,17 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
             if let Some(space_end) = last_space_end.filter(|end| *end > start && *end <= begin) {
                 segments.push((start, space_end));
                 start = space_end;
-                row_width = line[start..begin]
-                    .chars()
-                    .map(|c| c.width().unwrap_or(0).max(1))
-                    .sum();
+                row_width = {
+                    let mut w = 0;
+                    for c in line[start..begin].chars() {
+                        if c == '\t' {
+                            w += TAB_WIDTH - (w % TAB_WIDTH);
+                        } else if !c.is_control() {
+                            w += c.width().unwrap_or(0).max(1);
+                        }
+                    }
+                    w
+                };
             } else {
                 segments.push((start, begin));
                 start = begin;
@@ -60,10 +86,15 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
     for (index, &(start, end)) in segments.iter().enumerate() {
         if col >= start && col < end || (col == end && index == segments.len() - 1) {
             cursor_segment = index as u16;
-            cursor_x = line[start..col]
-                .chars()
-                .map(|c| c.width().unwrap_or(0).max(1))
-                .sum::<usize>() as u16;
+            let mut w = 0;
+            for c in line[start..col].chars() {
+                if c == '\t' {
+                    w += TAB_WIDTH - (w % TAB_WIDTH);
+                } else if !c.is_control() {
+                    w += c.width().unwrap_or(0).max(1);
+                }
+            }
+            cursor_x = w as u16;
             break;
         }
     }
