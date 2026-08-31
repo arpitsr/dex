@@ -13,6 +13,8 @@ use crate::core::types::ApprovalDecision;
 pub(crate) struct PendingApproval {
     pub(crate) session_id: String,
     pub(crate) response: mpsc::Sender<ApprovalDecision>,
+    pub(crate) name: String,
+    pub(crate) input: String,
 }
 
 /// Shared state for the daemon. Plain mutexes are fine here: every critical

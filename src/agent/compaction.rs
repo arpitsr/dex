@@ -47,17 +47,24 @@ pub(crate) fn summarize_old_messages(
         .map(message_to_transcript)
         .collect::<Vec<_>>()
         .join("\n");
+    // Preserve orientation anchors verbatim so compaction never erases the task.
+    let has_plan = old.iter().any(|m| m.name.as_deref() == Some("plan"));
+    let has_verify = old.iter().any(|m| m.name.as_deref() == Some("verify"));
+    let extra = if has_plan || has_verify {
+        " Preserve the current goal and plan verbatim and any recent verification failures."
+    } else {
+        ""
+    };
     let prompt = vec![
         ChatMessage {
             role: "system".to_string(),
-            content: Some(
+            content: Some(format!(
                 "Summarize the following conversation excerpt between a coding agent and \
                  the user. Preserve: the user's goals and requests, key facts learned about \
                  the codebase (files, paths, important symbols), decisions made, actions \
-                 already taken and their outcomes, and any unresolved tasks. Be concise — \
+                 already taken and their outcomes, and any unresolved tasks.{extra} Be concise — \
                  at most 15 lines. Output only the summary."
-                    .to_string(),
-            ),
+            )),
             tool_calls: None,
             tool_call_id: None,
             name: None,

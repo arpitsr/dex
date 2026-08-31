@@ -1,3 +1,4 @@
+#![allow(clippy::doc_lazy_continuation)]
 use serde_json::{Map, Value};
 use std::env;
 use std::fs;
@@ -821,9 +822,38 @@ fn language_tab_width(path: &Path) -> usize {
     if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
         return 8;
     }
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    {
         Some(ext) if matches!(ext.as_str(), "go") => 4, // gofmt uses tabs but 4 is readable; 8 is terminal-faithful, choose 4 for preview density like pi
-        Some(ext) if matches!(ext.as_str(), "py" | "rs" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "java" | "json" | "toml" | "yaml" | "yml" | "md" | "sh" | "bash" | "rb" | "php") => 4,
+        Some(ext)
+            if matches!(
+                ext.as_str(),
+                "py" | "rs"
+                    | "js"
+                    | "ts"
+                    | "jsx"
+                    | "tsx"
+                    | "c"
+                    | "cpp"
+                    | "h"
+                    | "hpp"
+                    | "java"
+                    | "json"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "md"
+                    | "sh"
+                    | "bash"
+                    | "rb"
+                    | "php"
+            ) =>
+        {
+            4
+        }
         _ => 4,
     }
 }
@@ -1426,7 +1456,10 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.text);
         // Line numbers are now right-aligned with two spaces (no raw tab) and file
         // tabs are expanded per tab_width, so the separator is stable.
-        assert_eq!(outcome.text, "   1  one\n   2  two\n   3  three\n   4  four");
+        assert_eq!(
+            outcome.text,
+            "   1  one\n   2  two\n   3  three\n   4  four"
+        );
 
         args.insert("offset".into(), Value::Number(2.into()));
         args.insert("limit".into(), Value::Number(1.into()));
@@ -1528,8 +1561,8 @@ mod tests {
         let root = std::env::current_dir()
             .unwrap()
             // Prefix must NOT match .gitignore entries: the chain's grep respects
-        // ignore files, so an ignored fixture dir is invisible to it.
-        .join(format!("dex-chain-fx-{}", std::process::id()));
+            // ignore files, so an ignored fixture dir is invisible to it.
+            .join(format!("dex-chain-fx-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("one.rs"), format!("{needle} in one\n")).unwrap();
         fs::write(root.join("two.rs"), "nothing here\n").unwrap();

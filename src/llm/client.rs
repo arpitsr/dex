@@ -23,9 +23,14 @@ pub(crate) struct ModelCapabilities {
 }
 
 pub(crate) fn discover_capabilities(config: &LlmConfig) -> ModelCapabilities {
+    // Static per-provider table — no runtime probing.
+    let (streaming, tools) = match config.provider {
+        crate::core::types::Provider::OpenCode => (true, true),
+        crate::core::types::Provider::OpenAiCodex => (true, true),
+    };
     ModelCapabilities {
-        streaming: true,
-        tools: true,
+        streaming,
+        tools,
         responses_api: matches!(config.api, crate::core::types::ApiProtocol::Responses),
     }
 }

@@ -124,6 +124,7 @@ pub(crate) struct App {
     /// does not merge with the first streamed assistant turn; gaps remain
     /// canonical between blocks.
     pub(crate) assistant_open: bool,
+    pub(crate) plan: crate::core::types::Plan,
 }
 
 impl App {
@@ -379,6 +380,9 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
         // Usage updates flow into the status bar via StreamEvent::Usage in
         // the remote handler, not into the transcript.
         SinkLine::Usage(_) => {}
+        SinkLine::Plan(plan) => {
+            app.plan = plan;
+        }
         SinkLine::Error(s) => {
             app.assistant_open = false;
             app.transcript
@@ -463,6 +467,7 @@ mod tests {
                 max_tool_iterations: 60,
                 max_prompt_tokens: 128_000,
                 max_turn_seconds: 900,
+                verify_command: None,
                 client: reqwest::blocking::Client::new(),
             },
             messages: Vec::new(),
@@ -493,6 +498,7 @@ mod tests {
             history_draft: String::new(),
             slash_selected: 0,
             assistant_open: false,
+            plan: crate::core::types::Plan::default(),
         }
     }
 

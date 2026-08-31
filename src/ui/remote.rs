@@ -73,6 +73,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         max_tool_iterations: 0,
         max_prompt_tokens: 0,
         max_turn_seconds: 0,
+        verify_command: None,
         client: reqwest::blocking::Client::new(),
     }
 }
@@ -115,6 +116,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             PermissionMode::AskShell => "ask-shell".to_string(),
             PermissionMode::Trusted => "trusted".to_string(),
         }),
+        plan: None,
     };
 
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>();
@@ -128,6 +130,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         messages: Vec::new(),
         tool_state: crate::agent::state::ToolState::default(),
         session: Session::in_memory(info.cwd.clone()),
+        plan: crate::core::types::Plan::default(),
         skills: Vec::new(),
         turn_start: 0,
         cwd: info.cwd.clone(),
@@ -340,6 +343,9 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
         }
         StreamEvent::Error(msg) => {
             append_sink_line(&mut remote.app, SinkLine::Error(msg));
+        }
+        StreamEvent::Plan { goal, steps } => {
+            remote.app.plan = crate::core::types::Plan { goal, steps };
         }
     }
 }
@@ -600,7 +606,10 @@ fn submit_prompt(remote: &mut RemoteApp) {
     // overlay resolves them via the decision channel.
     let client = remote.client.clone();
     let session_id = remote.session_id.clone();
-    let options = remote.options.clone();
+    let mut options = remote.options.clone();
+    if !remote.app.plan.is_empty() && options.plan.is_none() {
+        options.plan = Some(remote.app.plan.to_json());
+    }
     let prompt = line;
     let event_tx = remote.worker_tx.clone();
     let decision_rx = remote.take_decision_receiver();
@@ -699,8 +708,9 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
         _ => {
             let had_model = app.config.model.clone();
             let had_permission = app.config.permission;
+            let had_plan = app.plan.clone();
             let quit = handle_slash(app, line);
-            // Forward mutations made by handle_slash (model/permission)
+            // Forward mutations made by handle_slash (model/permission/plan)
             // so future turns use the same overrides. Base URL and skill dirs
             // are daemon-owned and not forwarded.
             if app.config.model != had_model {
@@ -713,6 +723,13 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     PermissionMode::AskShell => "ask-shell".to_string(),
                     PermissionMode::Trusted => "trusted".to_string(),
                 });
+            }
+            if app.plan != had_plan {
+                if app.plan.is_empty() {
+                    remote.options.plan = Some(String::new());
+                } else {
+                    remote.options.plan = Some(app.plan.to_json());
+                }
             }
             return quit;
         }

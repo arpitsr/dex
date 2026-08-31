@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-use crate::core::types::{ChatMessage, Provider};
+use crate::core::types::{ChatMessage, Plan, Provider};
 use crate::session::Session;
 
 use super::{push_info, App, InputField};
@@ -19,13 +19,38 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/name", "Rename the current session"),
     ("/model", "Show or switch the model"),
     ("/provider", "Show or switch the provider"),
+    ("/goal", "Set or show the task goal"),
+    ("/plan", "Show the plan"),
+    ("/plan add", "Add a plan step"),
+    ("/plan done", "Mark a plan step done"),
+    ("/plan clear", "Clear the plan"),
     ("/help", "Show available commands"),
 ];
+
+fn save_plan(app: &mut App) {
+    let json = app.plan.to_json();
+    let _ = app.session.set_state("plan", &json);
+}
 
 pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
     let input = app.input.text();
     if app.busy || !input.starts_with('/') || input.contains('\n') {
         return Vec::new();
+    }
+    if input.starts_with("/plan") {
+        let choices = ["/plan", "/plan add ", "/plan done ", "/plan clear"];
+        let q = input.to_ascii_lowercase();
+        return choices
+            .iter()
+            .filter(|c| c.starts_with(&q))
+            .map(|c| (c.to_string(), "Plan command".to_string()))
+            .collect();
+    }
+    if input.starts_with("/goal")
+        && !input.starts_with("/goal ")
+        && "/goal".starts_with(&input.to_ascii_lowercase())
+    {
+        return vec![("/goal ".to_string(), "Set the task goal".to_string())];
     }
     if let Some(query) = input.strip_prefix("/model ") {
         let query = query.to_ascii_lowercase();
@@ -209,10 +234,86 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 "available providers: opencode, openai-codex".to_string(),
             );
         }
+        "/goal" => {
+            if let Some(g) = app.plan.goal.clone() {
+                push_info(app, format!("goal: {g}"));
+            } else {
+                push_info(app, "no goal set; use /goal <text>".to_string());
+            }
+            if !app.plan.steps.is_empty() {
+                let steps = app.plan.steps.clone();
+                for (i, (s, done)) in steps.iter().enumerate() {
+                    push_info(
+                        app,
+                        format!("  {} {} {}", if *done { "[x]" } else { "[ ]" }, i + 1, s),
+                    );
+                }
+            }
+        }
+        _ if line.starts_with("/goal ") => {
+            let text = line["/goal ".len()..].trim().to_string();
+            if text.is_empty() {
+                push_info(app, "usage: /goal <text>".to_string());
+            } else {
+                app.plan.goal = Some(text.clone());
+                save_plan(app);
+                push_info(app, format!("goal set: {text}"));
+            }
+        }
+        "/plan" => {
+            if app.plan.is_empty() {
+                push_info(app, "no plan yet; use /goal and /plan add".to_string());
+            } else {
+                if let Some(g) = app.plan.goal.clone() {
+                    push_info(app, format!("Goal: {g}"));
+                }
+                let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
+                let total = app.plan.steps.len();
+                push_info(app, format!("Plan {done}/{total}"));
+                let steps = app.plan.steps.clone();
+                for (i, (s, done)) in steps.iter().enumerate() {
+                    push_info(
+                        app,
+                        format!("  {} {} {}", if *done { "[x]" } else { "[ ]" }, i + 1, s),
+                    );
+                }
+            }
+        }
+        _ if line.starts_with("/plan add ") => {
+            let text = line["/plan add ".len()..].trim().to_string();
+            if text.is_empty() {
+                push_info(app, "usage: /plan add <step>".to_string());
+            } else {
+                app.plan.steps.push((text.clone(), false));
+                save_plan(app);
+                push_info(app, format!("added step {}: {text}", app.plan.steps.len()));
+            }
+        }
+        _ if line.starts_with("/plan done ") => {
+            let n = line["/plan done ".len()..]
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
+            if n == 0 || n > app.plan.steps.len() {
+                push_info(
+                    app,
+                    format!("usage: /plan done <1..{}>", app.plan.steps.len()),
+                );
+            } else {
+                app.plan.steps[n - 1].1 = true;
+                save_plan(app);
+                push_info(app, format!("marked step {n} done"));
+            }
+        }
+        "/plan clear" => {
+            app.plan = Plan::default();
+            save_plan(app);
+            push_info(app, "plan cleared".to_string());
+        }
         "/help" => {
             push_info(
                 app,
-                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>]"
+                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>] /goal <text> /plan [add|done|clear]"
                     .to_string(),
             );
             push_info(
@@ -307,6 +408,20 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
                 app.config.available_models.push(model.clone());
             }
             push_info(app, format!("restored model: {}", model));
+        }
+    }
+    if let Some(plan_json) = state.get("plan") {
+        let plan = crate::core::types::Plan::from_json(plan_json);
+        if !plan.is_empty() {
+            app.plan = plan;
+            let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
+            push_info(
+                app,
+                format!("restored plan: {} / {} steps", done, app.plan.steps.len()),
+            );
+            if let Some(g) = &app.plan.goal {
+                push_info(app, format!("restored goal: {g}"));
+            }
         }
     }
 }
