@@ -43,6 +43,8 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub permission: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 /// Response to approve/deny a tool execution. `request_id` must match the
@@ -123,6 +125,13 @@ pub enum StreamEvent {
     /// An error occurred.
     #[serde(rename = "error")]
     Error(String),
+
+    /// Plan update for remote UI sync.
+    #[serde(rename = "plan")]
+    Plan {
+        goal: Option<String>,
+        steps: Vec<(String, bool)>,
+    },
 }
 
 /// Runtime info about the daemon, returned by `GET /api/config`. The client

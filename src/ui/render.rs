@@ -152,6 +152,30 @@ pub(super) fn compact_path(path: &str) -> String {
     path.to_string()
 }
 
+pub(super) fn plan_status(app: &App) -> Option<String> {
+    if app.plan.is_empty() {
+        return None;
+    }
+    let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
+    let total = app.plan.steps.len();
+    if let Some(g) = &app.plan.goal {
+        let short = if g.len() > 40 {
+            format!("{}…", &g[..40])
+        } else {
+            g.clone()
+        };
+        if total > 0 {
+            Some(format!("Goal: {} · Plan {}/{}", short, done, total))
+        } else {
+            Some(format!("Goal: {}", short))
+        }
+    } else if total > 0 {
+        Some(format!("Plan {}/{}", done, total))
+    } else {
+        None
+    }
+}
+
 pub(super) fn ui_status(app: &App) -> String {
     let cwd = compact_path(&app.cwd);
     let git = app
@@ -171,7 +195,7 @@ pub(super) fn ui_status(app: &App) -> String {
             .checked_div(app.config.context_window)
             .unwrap_or(0)
     };
-    format!(
+    let base = format!(
         "{} · {} / {}{} · {} / {} tokens ({}%)",
         cwd,
         app.config.provider.name(),
@@ -180,7 +204,12 @@ pub(super) fn ui_status(app: &App) -> String {
         format_tokens(tokens),
         format_tokens(app.config.context_window),
         context_pct
-    )
+    );
+    if let Some(plan) = plan_status(app) {
+        format!("{} · {}", base, plan)
+    } else {
+        base
+    }
 }
 
 pub(super) fn footer_text(app: &App, width: u16) -> String {
@@ -192,7 +221,14 @@ pub(super) fn footer_text(app: &App, width: u16) -> String {
     let cwd = compact_path(&app.cwd);
     let compact = format!("{} · {}", cwd, app.config.model);
     let model = app.config.model.clone();
-    let candidates = [ui_status(app), compact, model.clone()];
+    // Prefer full status with plan, but fall back to compact when narrow.
+    let with_plan = plan_status(app).map(|p| format!("{} · {}", compact, p));
+    let mut candidates = vec![ui_status(app)];
+    if let Some(wp) = with_plan {
+        candidates.push(wp);
+    }
+    candidates.push(compact);
+    candidates.push(model.clone());
     for status in candidates {
         let candidate = format!("{}{}", hint, status);
         if UnicodeWidthStr::width(candidate.as_str()) <= width as usize {
@@ -868,6 +904,7 @@ mod tests {
                 max_tool_iterations: 60,
                 max_prompt_tokens: 128_000,
                 max_turn_seconds: 900,
+                verify_command: None,
                 client: reqwest::blocking::Client::new(),
             },
             messages: Vec::new(),
@@ -898,6 +935,7 @@ mod tests {
             history_draft: String::new(),
             slash_selected: 0,
             assistant_open: false,
+            plan: crate::core::types::Plan::default(),
         }
     }
 
@@ -995,7 +1033,7 @@ mod tests {
         assert!(!symbols.contains('\t'), "tab must be expanded: {symbols}");
         // Indented preview: " " + "  35\tlet" -> indent 1 + 2 spaces + 2 chars = col 5 before tab => 3 spaces
         assert!(symbols.contains("35   let cwd"), "{symbols}");
-        assert!(symbols.contains("35      let cwd") == false || true); // raw cell_safe check above covers 6-space case without indent
+        assert!(!symbols.contains("35      let cwd") || true); // raw cell_safe check above covers 6-space case without indent
     }
 
     #[test]
@@ -1168,6 +1206,111 @@ mod tests {
             "expected a blank gap line before assistant text in rendered display, got {:?}",
             display[assistant_display_idx - 1]
         );
+    }
+
+    #[test]
+    fn input_shrink_does_not_leave_ghost() {
+        // Reproduce the ghost reported in screenshot: long wrapped input (2 rows)
+        // then short input (1 row) at same terminal size must not leave
+        // fragments of the long text in the frame (especially just above the
+        // new input). Without a full Clear of the old input rows, ratatui
+        // would leave trailing chars.
+        let long = ":override to make tests hermetic. Stage 0b (turn records) and S1-S5 not started. Remote trust gate (#12-#14) documented as gate-blocking but out of scope. 4) recovery (durable turn_complete/turn_failed, daemon rebuild for /resume) -> S5 evals. Effort ~15-18 days.";
+        let short = "try a different approach";
+        for (w, h) in [(80, 24), (120, 24), (100, 30), (70, 24)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+            let mut app = test_app();
+            app.input = InputField::from_text(long);
+            terminal.draw(|f| view(f, &mut app)).expect("frame1");
+            app.input = InputField::from_text(short);
+            terminal.draw(|f| view(f, &mut app)).expect("frame2");
+            let symbols: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                !symbols.contains("hermetic"),
+                "ghost at {w}x{h} after shrink"
+            );
+            assert!(!symbols.contains("recovery"), "ghost recovery at {w}x{h}");
+            assert!(symbols.contains(short), "new input not rendered at {w}x{h}");
+        }
+        // Also test expand short->long
+        for (w, h) in [(80, 24), (120, 24)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+            let mut app = test_app();
+            app.input = InputField::from_text(short);
+            terminal.draw(|f| view(f, &mut app)).expect("frame1");
+            app.input = InputField::from_text(long);
+            terminal.draw(|f| view(f, &mut app)).expect("frame2");
+            let symbols: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                symbols.contains("hermetic"),
+                "long not rendered after expand at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_ghost_with_transcript_interaction() {
+        // Long transcript that fills bottom of visible area plus long input,
+        // then input shrinks – ensure transcript ghost not left.
+        let long_input = ":override to make tests hermetic. Stage 0b (turn records) and S1-S5 not started. Remote trust gate (#12-#14) documented as gate-blocking but out of scope. 4) recovery (durable turn_complete/turn_failed, daemon rebuild for /resume) -> S5 evals. Effort ~15-18 days.";
+        let short_input = "try a different approach";
+        let (w, h) = (80, 24);
+        let backend = TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut app = test_app();
+        // Fill transcript with several blocks to make it scrollable
+        for i in 0..5 {
+            super::super::append_sink_line(&mut app, crate::core::types::SinkLine::Assistant(format!("Assistant message {i} with some long text that will wrap across multiple lines to fill the transcript area and test scrolling behavior. {}", long_input)));
+        }
+        app.input = InputField::from_text(long_input);
+        terminal.draw(|f| view(f, &mut app)).expect("frame1");
+        let symbols1: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(symbols1.contains("hermetic"));
+        app.input = InputField::from_text(short_input);
+        terminal.draw(|f| view(f, &mut app)).expect("frame2");
+        let symbols2: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // Count occurrences of long_input fragments after shrink: input ghost should be gone, but transcript still contains long_input as part of assistant messages (5 times). So we need to ensure at least the input area does not contain duplicate beyond transcript count.
+        // The input area is at bottom; transcript area is above. Ghost would be extra long_input fragment in the input area beyond transcript.
+        // Instead check that short_input is visible and that there is no duplicate line that contains both short and long at same row.
+        assert!(symbols2.contains(short_input), "short input missing");
+        // Ensure no row contains both long fragment and short fragment overlapping (ghost)
+        let rows: Vec<String> = symbols2
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(w as usize)
+            .map(|c| c.iter().collect())
+            .collect();
+        for row in rows {
+            if row.contains(short_input) && row.contains("hermetic") {
+                panic!("ghost overlap row: {:?}", row);
+            }
+        }
     }
 
     #[test]

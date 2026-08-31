@@ -24,6 +24,14 @@ pub(crate) struct FileConfig {
     pub(crate) max_turn_seconds: Option<u64>,
     pub(crate) http_connect_timeout_secs: Option<u64>,
     pub(crate) http_request_timeout_secs: Option<u64>,
+    pub(crate) verify_command: Option<String>,
+}
+
+pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
+    match provider {
+        Provider::OpenCode => 128_000,
+        Provider::OpenAiCodex => 128_000,
+    }
 }
 
 pub(crate) fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
@@ -65,6 +73,7 @@ pub(crate) struct LlmConfig {
     pub(crate) max_tool_iterations: usize,
     pub(crate) max_prompt_tokens: u64,
     pub(crate) max_turn_seconds: u64,
+    pub(crate) verify_command: Option<String>,
     pub(crate) client: reqwest::blocking::Client,
 }
 
@@ -162,12 +171,13 @@ impl LlmConfig {
             account_id,
             thinking_effort: file.thinking_effort,
             // Context window in tokens; configurable via file (`context_window`)
-            // or DEX_CONTEXT_WINDOW env, with a conservative default.
+            // or DEX_CONTEXT_WINDOW env, with a conservative default per provider.
             context_window: env::var("DEX_CONTEXT_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.context_window)
-                .unwrap_or(128_000),
+                .unwrap_or_else(|| provider_default_context_window(provider)),
+            verify_command: env::var("DEX_VERIFY").ok().or(file.verify_command.clone()),
             permission,
             max_tool_iterations: env::var("DEX_MAX_TOOL_ITERATIONS")
                 .ok()

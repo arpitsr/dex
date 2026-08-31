@@ -10,6 +10,7 @@ pub(crate) struct ChatOptions {
     pub(crate) base_url: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) permission: Option<String>,
+    pub(crate) plan: Option<String>,
 }
 
 /// HTTP client for communicating with the dex daemon.
@@ -131,6 +132,7 @@ impl DaemonClient {
                 base_url: options.base_url,
                 model: options.model,
                 permission: options.permission,
+                plan: options.plan,
             })
             .send()?
             .error_for_status()?;

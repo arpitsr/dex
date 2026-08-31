@@ -371,6 +371,19 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
     Ok(messages)
 }
 
+pub(crate) fn load_plan(path: &Path) -> crate::core::types::Plan {
+    load_session_state(path)
+        .ok()
+        .and_then(|m| m.get("plan").cloned())
+        .map(|s| crate::core::types::Plan::from_json(&s))
+        .unwrap_or_default()
+}
+
+#[allow(dead_code)]
+pub(crate) fn save_plan(session: &mut Session, plan: &crate::core::types::Plan) -> io::Result<()> {
+    session.set_state("plan", &plan.to_json())
+}
+
 pub(crate) fn load_session_state(
     path: &Path,
 ) -> io::Result<std::collections::HashMap<String, String>> {
@@ -409,7 +422,14 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("{}-{}-{}-{}-{}.jsonl", prefix, std::process::id(), tid, nanos, nonce))
+        std::env::temp_dir().join(format!(
+            "{}-{}-{}-{}-{}.jsonl",
+            prefix,
+            std::process::id(),
+            tid,
+            nanos,
+            nonce
+        ))
     }
 
     #[test]
@@ -433,7 +453,10 @@ mod tests {
         let provider = r#"{"type":"session_state","id":"4","timestamp":"2020-01-01T00:00:04Z","key":"provider","value":"openai-codex"}"#;
         fs::write(
             &path,
-            format!("{}\n{}\n{}\n{}\n{}\n", header, first, message, second, provider),
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n",
+                header, first, message, second, provider
+            ),
         )
         .unwrap();
         let state = load_session_state(&path).unwrap();

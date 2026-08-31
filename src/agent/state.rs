@@ -66,6 +66,7 @@ pub(crate) struct ToolState {
     pub(crate) dirty: bool,
     /// Last API-reported prompt token count for the main conversation.
     pub(crate) last_usage: Option<u64>,
+    pub(crate) verify_dirty: bool,
 }
 
 impl ToolState {

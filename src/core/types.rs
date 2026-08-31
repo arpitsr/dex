@@ -10,6 +10,45 @@ pub(crate) struct Skill {
     pub(crate) path: PathBuf,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub goal: Option<String>,
+    pub steps: Vec<(String, bool)>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.goal.is_none() && self.steps.is_empty()
+    }
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+    pub fn from_json(s: &str) -> Self {
+        serde_json::from_str(s).unwrap_or_default()
+    }
+    pub fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        if let Some(g) = &self.goal {
+            out.push_str(&format!("Goal: {}\n", g));
+        }
+        if !self.steps.is_empty() {
+            out.push_str("Plan:\n");
+            for (i, (text, done)) in self.steps.iter().enumerate() {
+                out.push_str(&format!(
+                    "{} {}. {}\n",
+                    if *done { "[x]" } else { "[ ]" },
+                    i + 1,
+                    text
+                ));
+            }
+        }
+        Some(out.trim_end().to_string())
+    }
+}
+
 /// A single streamed line destined for the UI transcript. Plain text (no
 /// ANSI) so the UI applies its own styling. Ratatui-agnostic.
 #[derive(Debug, Clone)]
@@ -32,6 +71,7 @@ pub enum SinkLine {
     /// Prompt tokens reported by the provider after each LLM call, so the
     /// status bar can track context usage live instead of once per turn.
     Usage(u64),
+    Plan(Plan),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +238,14 @@ impl PermissionMode {
                 "invalid permission mode '{}'; use read-only, ask-writes, ask-shell, or trusted",
                 other
             )),
+        }
+    }
+    pub(crate) fn permissiveness(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::AskWrites => 1,
+            Self::AskShell => 2,
+            Self::Trusted => 3,
         }
     }
 }

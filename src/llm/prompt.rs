@@ -25,6 +25,7 @@ pub(crate) fn system_prompt(skills: &[Skill]) -> String {
      When editing, oldText must match exactly one occurrence in the file. \
      Stop using tools once the requested work is complete. \
      Run relevant tests/checks, inspect the resulting diff, and report validation results. \
+     Maintain progress against the stated goal; state the current objective before non-obvious tool batches. \
      Be concise."
         .to_string();
     prompt.push_str("\n\nTool workflow: use `read` for known files, `grep` for known text, and `git` for repository state/diffs. Use `find` only for targeted filename discovery. Never begin with a repository-wide find using an empty path or pattern `*`; it is noisy and commonly includes build artifacts. If the user names a file, read it directly. For an unfamiliar repository, start with targeted discovery and then read only relevant files. Do not call tools merely to explore when the request can be answered from the conversation; after each result, make progress and avoid repeating identical calls.");

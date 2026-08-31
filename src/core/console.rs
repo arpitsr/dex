@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -198,20 +199,50 @@ impl Console {
         self.approval.as_ref()
     }
 
-    pub(crate) fn session_approved(&self, name: &str) -> bool {
+    pub(crate) fn approval_key(name: &str, input: &str) -> String {
+        // Scope approvals: write/edit -> path, bash -> command, else full input hash.
+        let relevant = if matches!(name, "write" | "edit") {
+            serde_json::from_str::<serde_json::Value>(input)
+                .ok()
+                .and_then(|v| {
+                    v.get("path")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| input.to_string())
+        } else if name == "bash" {
+            serde_json::from_str::<serde_json::Value>(input)
+                .ok()
+                .and_then(|v| {
+                    v.get("command")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| input.to_string())
+        } else {
+            input.to_string()
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        relevant.hash(&mut hasher);
+        format!("{}:{:016x}", name, hasher.finish())
+    }
+
+    pub(crate) fn session_approved(&self, name: &str, input: &str) -> bool {
+        let key = Self::approval_key(name, input);
         self.session_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|approved| approved.contains(name))
+            .is_some_and(|approved| approved.contains(&key))
     }
 
-    pub(crate) fn record_session_approval(&self, name: &str) {
+    pub(crate) fn record_session_approval(&self, name: &str, input: &str) {
+        let key = Self::approval_key(name, input);
         self.session_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(HashSet::new)
-            .insert(name.to_string());
+            .insert(key);
     }
 }
 

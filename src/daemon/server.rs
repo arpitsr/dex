@@ -329,8 +329,31 @@ fn run_turn_inner(
             .map_err(|e| format!("failed to create session: {e}"))?
     };
 
+    // Persist plan forwarded by the client (remote TUI slash commands). Empty string clears.
+    if let Some(plan_json) = &req.plan {
+        if plan_json.is_empty() {
+            let _ = session.set_state("plan", &crate::core::types::Plan::default().to_json());
+        } else {
+            let _ = session.set_state("plan", plan_json);
+        }
+    }
+
+    // Permission ceiling: daemon policy (file/env) is max; client may only go stricter.
+    let daemon_perm = crate::llm::config::load_file_config()
+        .ok()
+        .and_then(|f| crate::llm::config::permission_from_env_or_file(&f).ok())
+        .unwrap_or(crate::core::types::PermissionMode::AskWrites);
+    if let Some(req_perm_str) = &req.permission {
+        let req_perm = crate::core::types::PermissionMode::parse(req_perm_str)?;
+        if req_perm.permissiveness() > daemon_perm.permissiveness() {
+            return Err(format!(
+                "permission escalation denied: daemon ceiling is {:?} (client requested {:?}); use a stricter mode or change daemon config",
+                daemon_perm, req_perm
+            ));
+        }
+    }
     // Build the config from the daemon's own environment/config file, with
-    // optional per-request overrides sent by the client.
+    // optional per-request overrides sent by the client (now validated).
     let config = LlmConfig::from_env(
         req.base_url.clone().filter(|v| !v.is_empty()),
         req.model.clone().filter(|v| !v.is_empty()),
@@ -408,6 +431,10 @@ fn run_turn_inner(
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
                     SinkLine::Usage(tokens) => StreamEvent::Usage { tokens },
+                    SinkLine::Plan(plan) => StreamEvent::Plan {
+                        goal: plan.goal,
+                        steps: plan.steps,
+                    },
                 };
                 let _ = stream_tx.blocking_send(event);
             }
@@ -431,9 +458,13 @@ fn run_turn_inner(
                     continue;
                 }
                 let request_id = uuid::Uuid::new_v4().to_string();
+                let name_clone = request.name.clone();
+                let input_clone = request.input.clone();
                 let parked = PendingApproval {
                     session_id: session_id.clone(),
                     response: request.response,
+                    name: name_clone,
+                    input: input_clone,
                 };
                 let replaced = state
                     .pending_approvals
@@ -490,6 +521,50 @@ async fn approve(
                 crate::protocol::ApprovalDecision::AllowSession => ApprovalDecision::Session,
                 crate::protocol::ApprovalDecision::Deny => ApprovalDecision::Deny,
             };
+            // Audit: best-effort, redacted input hash, actor, request_id
+            {
+                let Some(base) = std::env::var_os("XDG_DATA_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|h| std::path::PathBuf::from(h).join(".local/share"))
+                    })
+                else {
+                    let _ = pending.response.send(decision);
+                    return Ok(Json(json!({ "status": "ok" })));
+                };
+                let path = base.join("dex/audit.jsonl");
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&pending.input, &mut hasher);
+                use std::hash::Hasher;
+                let input_hash = format!("{:016x}", hasher.finish());
+                let decision_str = match decision {
+                    ApprovalDecision::Once => "once",
+                    ApprovalDecision::Session => "session",
+                    ApprovalDecision::Deny => "deny",
+                };
+                let record = serde_json::json!({
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "session_id": session_id,
+                    "request_id": req.request_id,
+                    "tool": pending.name,
+                    "input_hash": input_hash,
+                    "decision": decision_str,
+                    "actor": "remote",
+                });
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let mut line = record.to_string();
+                    line.push('\n');
+                    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+                }
+            }
             let _ = pending.response.send(decision);
             Ok(Json(json!({ "status": "ok" })))
         }

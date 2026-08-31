@@ -20,7 +20,13 @@ impl InputField {
         let lines: Vec<String> = if text.is_empty() {
             vec![String::new()]
         } else {
-            text.split('\n').map(str::to_string).collect()
+            text.split('\n')
+                .map(|s| {
+                    s.chars()
+                        .filter(|c| *c == '\t' || !c.is_control())
+                        .collect()
+                })
+                .collect()
         };
         let row = lines.len().saturating_sub(1);
         let col = lines[row].len();
@@ -177,7 +183,10 @@ mod tests {
         for c in "10;rgb:f6f6/dcdc/acac".chars() {
             f.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
         }
-        assert!(f.text().contains("10;rgb:"), "plain is inserted when it reaches input");
+        assert!(
+            f.text().contains("10;rgb:"),
+            "plain is inserted when it reaches input"
+        );
     }
 
     #[test]

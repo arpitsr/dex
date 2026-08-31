@@ -27,6 +27,69 @@ pub(crate) fn within_budget(deadline: Instant) -> bool {
 /// When this many iterations remain, nudge the model to wrap up.
 pub(crate) const WRAP_UP_THRESHOLD: usize = 5;
 
+fn load_plan(session: &Option<&mut Session>) -> crate::core::types::Plan {
+    session
+        .as_ref()
+        .and_then(|s| s.path().map(crate::session::load_plan))
+        .unwrap_or_default()
+}
+
+fn plan_injection(plan: &crate::core::types::Plan) -> Option<String> {
+    plan.summary().map(|s| format!("[Plan context]\n{s}"))
+}
+
+fn turn_start_context(
+    plan: &crate::core::types::Plan,
+    cancel: &dyn CancellationSource,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(p) = plan.summary() {
+        parts.push(p);
+    }
+    // Git snapshot — reuse tool_git via direct execute so timeout/cancellation applies.
+    for mode in ["status", "diff"] {
+        let mut args = serde_json::Map::new();
+        args.insert("mode".into(), serde_json::Value::String(mode.into()));
+        if let Ok(out) = crate::tools::execute("git", &args, cancel) {
+            let trimmed = out.trim();
+            if !trimmed.is_empty()
+                && !trimmed.contains("not a git repository")
+                && !trimmed.contains("fatal:")
+            {
+                let header = if mode == "status" {
+                    "git status:"
+                } else {
+                    "git diff --stat:"
+                };
+                parts.push(format!("{header}\n{trimmed}"));
+            }
+        }
+        if parts.join("\n").lines().count() >= 10 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut msg = parts.join("\n\n");
+    // Cap ~10 lines
+    let lines: Vec<&str> = msg.lines().collect();
+    if lines.len() > 10 {
+        msg = format!("{}\n[... truncated]", lines[..10].join("\n"));
+    }
+    Some(format!("[Turn context]\n{msg}"))
+}
+
+fn stuck_nudge(attempt: usize, reason: &str) -> String {
+    let guidance = match attempt {
+        1 => "Try a direct fix for the immediate error (check arguments, file paths, or exact oldText).",
+        2 => "Inspect surrounding architecture/files for context you may be missing.",
+        3 => "Question the assumption behind the approach — maybe the goal needs a different path.",
+        _ => "Propose a re-plan to the user: summarize progress, state what failed, and suggest the next steps.",
+    };
+    format!("[System] Stuck detected ({reason}) — escalation {attempt}: {guidance}")
+}
+
 pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<String> {
     let denied = match mode {
         PermissionMode::ReadOnly => !matches!(name, "read" | "grep" | "find" | "git"),
@@ -35,6 +98,42 @@ pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<Stri
         PermissionMode::Trusted => false,
     };
     denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure DEX_PERMISSION", name))
+}
+
+fn audit_approval(name: &str, input: &str, decision: &str) {
+    let Some(base) = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        })
+    else {
+        return;
+    };
+    let path = base.join("dex/audit.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&input, &mut hasher);
+    use std::hash::Hasher;
+    let input_hash = format!("{:016x}", hasher.finish());
+    let record = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+        "tool": name,
+        "input_hash": input_hash,
+        "decision": decision,
+        "actor": "local",
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
 }
 
 pub(crate) fn approve_tool(
@@ -61,7 +160,7 @@ pub(crate) fn approve_tool(
     if permission_denied(mode, name).is_none() {
         return true;
     }
-    if console.session_approved(name) {
+    if console.session_approved(name, input) {
         return true;
     }
     // Remote approval: daemon sends the request via SSE and blocks for the
@@ -78,12 +177,19 @@ pub(crate) fn approve_tool(
                 .is_ok()
             {
                 return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
-                    ApprovalDecision::Once => true,
-                    ApprovalDecision::Session => {
-                        console.record_session_approval(name);
+                    ApprovalDecision::Once => {
+                        audit_approval(name, input, "once");
                         true
                     }
-                    ApprovalDecision::Deny => false,
+                    ApprovalDecision::Session => {
+                        audit_approval(name, input, "session");
+                        console.record_session_approval(name, input);
+                        true
+                    }
+                    ApprovalDecision::Deny => {
+                        audit_approval(name, input, "deny");
+                        false
+                    }
                 };
             }
         }
@@ -104,12 +210,19 @@ pub(crate) fn approve_tool(
                 .is_ok()
             {
                 return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
-                    ApprovalDecision::Once => true,
-                    ApprovalDecision::Session => {
-                        console.record_session_approval(name);
+                    ApprovalDecision::Once => {
+                        audit_approval(name, input, "once");
                         true
                     }
-                    ApprovalDecision::Deny => false,
+                    ApprovalDecision::Session => {
+                        audit_approval(name, input, "session");
+                        console.record_session_approval(name, input);
+                        true
+                    }
+                    ApprovalDecision::Deny => {
+                        audit_approval(name, input, "deny");
+                        false
+                    }
                 };
             }
         }
@@ -263,9 +376,15 @@ pub(crate) fn process_turn(
     // Spins while the agent works; erased automatically on return.
     let _working = SpinnerGuard::start(console, "Working");
     let mut last_tools: Vec<String> = Vec::new();
+    let mut last_failed: Vec<String> = Vec::new();
+    let mut edit_paths: Vec<String> = Vec::new();
+    let mut search_streak: usize = 0;
+    let mut last_verify_hash: Option<u64> = None;
+    let mut escalation_count: usize = 0;
     let mut last_usage: Option<u64> = state.last_usage;
     let cancellation = cancel;
     let mut persisted_cursor = messages.len();
+    let mut turn_start_done = false;
 
     let limits = crate::agent::state::TurnLimits {
         elapsed_seconds: config.max_turn_seconds,
@@ -303,6 +422,42 @@ pub(crate) fn process_turn(
                     tool_call_id: None,
                     name: Some("steering".to_string()),
                 });
+            }
+        }
+        // Turn-start context injection (once): goal/plan + git snapshot.
+        if !turn_start_done {
+            turn_start_done = true;
+            let plan = load_plan(&session);
+            if let Some(ctx) = turn_start_context(&plan, cancel) {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(ctx),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("context".to_string()),
+                });
+                persist_pending(&mut session, messages, &mut persisted_cursor);
+            }
+            // Sync plan to UI once at turn start.
+            let plan = load_plan(&session);
+            if !plan.is_empty() {
+                if let Some(sink) = console.sink() {
+                    let _ = sink.send(SinkLine::Plan(plan));
+                }
+            }
+        }
+        // Plan injection before each model call.
+        {
+            let plan = load_plan(&session);
+            if let Some(text) = plan_injection(&plan) {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("plan".to_string()),
+                });
+                persist_pending(&mut session, messages, &mut persisted_cursor);
             }
         }
         // Nudge the model to finish as we approach the iteration budget.
@@ -466,7 +621,7 @@ pub(crate) fn process_turn(
                         }
                         cached.clone()
                     } else {
-                        state.insert(cache_key, outcome.text.clone());
+                        state.insert(cache_key.clone(), outcome.text.clone());
                         outcome.text
                     }
                 } else {
@@ -513,6 +668,140 @@ pub(crate) fn process_turn(
                     name: None,
                 });
                 persist_pending(&mut session, messages, &mut persisted_cursor);
+                // — stuck detection ledger —
+                if !ok {
+                    if last_failed.len() >= 6 {
+                        last_failed.remove(0);
+                    }
+                    last_failed.push(cache_key.clone());
+                }
+                if matches!(name.as_str(), "edit" | "write") {
+                    if let Ok(v) = serde_json::from_str::<Value>(&input) {
+                        if let Some(p) = v.get("path").and_then(Value::as_str) {
+                            if edit_paths.len() >= 6 {
+                                edit_paths.remove(0);
+                            }
+                            edit_paths.push(p.to_string());
+                        }
+                    }
+                }
+                if matches!(name.as_str(), "grep" | "find") {
+                    search_streak += 1;
+                } else if name == "read" {
+                    search_streak = 0;
+                }
+            }
+            if batch_has_mutation {
+                state.verify_dirty = true;
+            }
+            // — stuck detection — check patterns and escalate
+            let mut stuck_reason: Option<String> = None;
+            if last_failed
+                .iter()
+                .filter(|k| **k == last_failed.last().cloned().unwrap_or_default())
+                .count()
+                >= 3
+            {
+                stuck_reason = Some("identical failed tool calls".into());
+            } else if edit_paths.len() >= 3
+                && edit_paths[edit_paths.len() - 1] == edit_paths[edit_paths.len() - 2]
+                && edit_paths[edit_paths.len() - 2] == edit_paths[edit_paths.len() - 3]
+            {
+                stuck_reason = Some(format!(
+                    "repeated edits to {}",
+                    edit_paths.last().unwrap_or(&String::new())
+                ));
+            } else if search_streak >= 4 {
+                stuck_reason = Some("consecutive searches without a read".into());
+            }
+            if let Some(reason) = stuck_reason {
+                escalation_count += 1;
+                if escalation_count > 3 {
+                    return Err(format!(
+                        "stuck: {reason} — escalation limit reached; aborting turn. {}",
+                        "Partial progress preserved; please re-plan."
+                    )
+                    .into());
+                }
+                let nudge = stuck_nudge(escalation_count, &reason);
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(nudge),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("system-nudge".into()),
+                });
+                persist_pending(&mut session, messages, &mut persisted_cursor);
+                if escalation_count == 3 {
+                    search_streak = 0;
+                }
+            }
+            // — verification hook —
+            if let Some(cmd) = config.verify_command.clone() {
+                if state.verify_dirty
+                    && within_budget(turn_deadline)
+                    && iteration + 1 < config.max_tool_iterations
+                {
+                    if cancel.is_cancelled() {
+                        return Err("cancelled by user".into());
+                    }
+                    state.verify_dirty = false;
+                    let mut vargs = serde_json::Map::new();
+                    vargs.insert("command".into(), Value::String(cmd.clone()));
+                    let vres = crate::tools::execute_outcome(
+                        "bash",
+                        &vargs,
+                        cancel as &dyn CancellationSource,
+                    );
+                    let tail = vres
+                        .text
+                        .lines()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if vres.ok {
+                        if let Some(sink) = console.sink() {
+                            let _ = sink.send(SinkLine::System("verify \u{2713}".into()));
+                        }
+                    } else {
+                        let hash = {
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+                            let mut h = DefaultHasher::new();
+                            vres.text.lines().next().unwrap_or("").hash(&mut h);
+                            h.finish()
+                        };
+                        let same_sig = last_verify_hash == Some(hash);
+                        last_verify_hash = Some(hash);
+                        if same_sig {
+                            escalation_count += 1;
+                            if escalation_count > 3 {
+                                return Err("verification repeatedly failed with same error — aborting turn.".into());
+                            }
+                            let nudge =
+                                stuck_nudge(escalation_count, "verify failing with same signature");
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: Some(nudge),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: Some("system-nudge".into()),
+                            });
+                        }
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: Some(format!("[verify failed]\n{tail}")),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: Some("verify".into()),
+                        });
+                        persist_pending(&mut session, messages, &mut persisted_cursor);
+                    }
+                }
             }
             state.save();
         } else {
@@ -617,6 +906,7 @@ mod tests {
             max_tool_iterations: 8,
             max_prompt_tokens: 128_000,
             max_turn_seconds: 60,
+            verify_command: None,
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -768,5 +1058,84 @@ mod tests {
             })
             .collect();
         assert_eq!(usage_events, vec![1, 1]);
+    }
+
+    #[test]
+    fn plan_is_injected_before_first_model_call() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct CapturingMock {
+            captured: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+        impl ModelClient for CapturingMock {
+            fn complete(
+                &self,
+                messages: &[ChatMessage],
+                _with_tools: bool,
+                _sink: Option<mpsc::Sender<SinkLine>>,
+                _cancel: &dyn CancellationSource,
+            ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+                self.captured.lock().unwrap().push(messages.to_vec());
+                Ok((
+                    ChatMessage {
+                        role: "assistant".into(),
+                        content: Some("done".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    },
+                    Some(1),
+                ))
+            }
+        }
+        // Create a persisted session with a plan (no global cwd change — leaves parallel tests alone).
+        let cwd = format!(
+            "/tmp/dex-plan-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let mut session = Session::new(cwd.clone(), None).unwrap();
+        let plan = crate::core::types::Plan {
+            goal: Some("test goal".into()),
+            steps: vec![("step one".into(), false), ("step two".into(), true)],
+        };
+        crate::session::save_plan(&mut session, &plan).unwrap();
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let mut state = ToolState::default();
+        let captured: Arc<Mutex<Vec<Vec<ChatMessage>>>> = Arc::new(Mutex::new(Vec::new()));
+        let mock = CapturingMock {
+            captured: captured.clone(),
+        };
+        let config = test_config();
+        let session_path = session.path().map(|p| p.to_path_buf());
+        let res = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            Some(&mut session),
+            &mock,
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        );
+        if let Some(p) = session_path {
+            let _ = std::fs::remove_file(p);
+        }
+        assert!(res.is_ok());
+        let all = captured.lock().unwrap();
+        assert!(!all.is_empty());
+        let first = &all[0];
+        // First model call must contain the plan context.
+        assert!(first.iter().any(|m| m.name.as_deref() == Some("plan")
+            && m.content.as_deref().unwrap_or("").contains("test goal")));
+        // And the turn-start context (plan summary) as well.
+        assert!(first.iter().any(|m| m.name.as_deref() == Some("context")));
     }
 }

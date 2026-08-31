@@ -42,27 +42,27 @@ part of the area. `—` means the important gap is not currently planned.
 
 | # | Area | Pillar | Now | Planned |
 |---|------|--------|-----|---------|
-| 1 | Objective, acceptance & progress | Direction | **0** | P1 partial |
+| 1 | Objective, acceptance & progress | Direction | **1** | P1 partial ✓ |
 | 2 | Turn orchestration & stop semantics | Direction | **2** | — |
-| 3 | Failure recovery & re-planning | Direction | **1** | P4 |
+| 3 | Failure recovery & re-planning | Direction | **2** | P4 ✓ |
 | 4 | Instruction hierarchy & behavior policy | Knowledge | **1** | — |
-| 5 | Context lifecycle | Knowledge | **1** | P3 |
-| 6 | Repository & environment intelligence | Knowledge | **1** | P2/P3 partial |
-| 7 | Memory & session continuity | Knowledge | **1** | P0 partial |
+| 5 | Context lifecycle | Knowledge | **2** | P3 ✓ |
+| 6 | Repository & environment intelligence | Knowledge | **1** | P2/P3 partial (P2 verify ✓, repo map still pending) |
+| 7 | Memory & session continuity | Knowledge | **1** | P0 partial ✓ (plan restore ✓, registry still in-memory) |
 | 8 | Tool protocol & reliability | Action | **2** | — |
 | 9 | Change control & artifact integrity | Action | **1** | — |
-| 10 | Verification & completion evidence | Action | **0** | P2 |
+| 10 | Verification & completion evidence | Action | **1** | P2 ✓ |
 | 11 | Parallelism & delegation | Action | **1** | Deferred |
-| 12 | Authorization, approvals & audit | Trust | **1** | — |
+| 12 | Authorization, approvals & audit | Trust | **2** | P6 ✓ |
 | 13 | Isolation & resource containment | Trust | **1** | — |
-| 14 | Secrets, privacy & remote access security | Trust | **0** | — |
+| 14 | Secrets, privacy & remote access security | Trust | **0** | P7 |
 | 15 | Durability & effect recovery | Trust | **1** | — |
-| 16 | Interactive UX & human control | Interface | **2** | P1–P3 partial |
+| 16 | Interactive UX & human control | Interface | **2** | P1–P3 partial ✓ (goal/plan+verify in bar) |
 | 17 | Automation & protocol contracts | Interface | **1** | — |
 | 18 | Extensibility & integrations | Interface | **1** | — |
-| 19 | Model/provider portability | Platform | **2** | P5 |
+| 19 | Model/provider portability | Platform | **2** | P5 ✓ |
 | 20 | Observability, usage & cost | Platform | **1** | — |
-| 21 | Performance & token economy | Platform | **2** | P3/P5 partial |
+| 21 | Performance & token economy | Platform | **2** | P3/P5 partial ✓ |
 | 22 | Quality evaluation | Platform | **1** | — |
 | 23 | Operations, configuration & compatibility | Operations | **1** | — |
 | 24 | Remote use & collaboration | Operations | **1** | — |
@@ -72,17 +72,13 @@ part of the area. `—` means the important gap is not currently planned.
 
 ## Pillar A — Direction
 
-### 1. Objective, acceptance & progress — **0**
+### 1. Objective, acceptance & progress — **1**
 
 **Owns:** the durable task contract: goal, constraints, acceptance criteria,
 plan, current step, completion state, and the user's ability to correct them.
 
-- **Evidence now:** the request exists only in conversation history. The
-  wrap-up nudge asks the model to reconsider the goal, but stores no task
-  state.
-- **Material gap:** there is no inspectable goal, definition of done, progress
-  ledger, or harness stop condition beyond “the model returned text.” P1 adds
-  goal and steps, but should also preserve constraints and acceptance evidence.
+- **Evidence now:** `core/types::Plan{goal,steps}` persisted via `session.set_state("plan",json)` (`ui/slash` `/goal` `/plan add|done|clear` + `session::load_plan` + `session::save_plan`), re-injected every turn as `system name:plan` (`agent/loop::plan_injection` + `persist_pending`), synced to remote via `SinkLine::Plan`/`StreamEvent::Plan` (`ui/remote`, `daemon/server`, `protocol::ChatRequest.plan`, `client/http::ChatOptions.plan`), shown as `Goal:…·Plan 3/7` in `ui/render::plan_status`/`footer_text`, restored on `/resume` (`ui/slash::apply_session_state` reads `plan` key). Acceptance `cargo test --all-targets plan_is_injected_before_first_model_call`.
+- **Material gap:** still no `constraints`/`acceptance criteria` ledger or harness stop condition linking completion to evidence. `P1` shipped goal+steps only; constraints + acceptance evidence remain partial. Resource/turn budgets are not part of the task contract.
 - **Level 3 bar:** task state survives compaction, process restart, and client
   reconnect; the user can edit it; completion links every acceptance criterion
   to a result or an explicit waiver.
@@ -104,16 +100,14 @@ cancellation, backpressure, and clean terminal outcomes.
   calls, retries, approvals, tools, and event delivery; disconnects and panics
   end in a deterministic terminal state; chaos tests prove no wedged turn.
 
-### 3. Failure recovery & re-planning — **1**
+### 3. Failure recovery & re-planning — **2**
 
 **Owns:** recognizing that an approach is failing, changing strategy, and
 escalating to the user instead of looping.
 
 - **Evidence now:** provider retry/backoff, structured tool failures, malformed
-  call handling, repeated-successful-call blocking, and the late wrap-up nudge.
-- **Material gap:** the harness does not detect repeated failed calls, unchanged
-  failures, edit churn, search loops, or lack of progress. It has no staged
-  re-plan or failure ledger.
+  call handling, repeated-successful-call blocking, late wrap-up nudge, plus `P4` ledger in `agent/loop.rs`: `last_failed` (identical failed `cache_key` ≥3), `edit_paths` (same path 3×), `search_streak` (`grep`/`find` ≥4 without `read`), `last_verify_hash` (first-line hash of `verify` failure unchanged), `escalation_count` capped 3 via `stuck_nudge` 1:direct fix 2:arch 3:question assumption 4:re-plan → abort `stuck:…escalation limit` . Verified by code path, not yet by `stuck-agent` eval suite.
+- **Material gap:** ledger is per-turn in-memory only, not a durable `failure ledger`; no staged `re-plan` object, no eval harness proving `1→2→3→re-plan` terminates with preserved partial work. `Level 3` eval still missing.
 - **Level 3 bar:** deterministic failure signatures trigger bounded escalation;
   recovery attempts are visible; scripted stuck-agent evals terminate with a
   useful re-plan and preserved partial work.
@@ -138,19 +132,15 @@ retrieved content are ordered, bounded, attributed, and inspected.
   policy tests cover conflicting and malicious repository instructions; users
   can inspect exactly which instructions affected a turn.
 
-### 5. Context lifecycle — **1**
+### 5. Context lifecycle — **2**
 
 **Owns:** selecting, ordering, compressing, invalidating, and restoring what the
 model sees at each call.
 
 - **Evidence now:** full session replay, usage/estimate-driven summarization,
-  recent tool-call/result pair protection, output caps, and bounded read/search
-  tools. Shell stitching can keep deliberately discarded intermediate output
-  outside the transcript.
-- **Material gap:** context is still a mostly static transcript. There is no
-  per-turn working set of relevant files, decisions, failures, or recent
-  changes; summaries have no factual invariant beyond a prompt; compaction and
-  incremental-session recovery are not tested together end to end.
+  recent tool-call/result pair protection, output caps, bounded read/search
+  tools, shell stitching, plus `P3` `agent/loop::turn_start_context` (once/turn `system name:context` = `Plan` summary + `git status --short` + `git diff --stat` via `tool_git`, capped 10 lines, silent outside repo) and per-turn `plan_injection`, and `agent/compaction::summarize_old_messages` now preserves `goal/plan` verbatim + recent `name:verify` failures. Test `plan_is_injected_before_first_model_call` asserts `name:context`+`name:plan` present.
+- **Material gap:** still no provenance-bearing `context manifest` of relevant files/decisions/failures, no stale-fact invalidation, no eval tracking answer quality/tokens across growth. Manifest + invalidation remain for `Level 3`.
 - **Level 3 bar:** a provenance-bearing context manifest is rebuilt per turn,
   stale facts are invalidated, required task facts survive compaction, and evals
   track answer quality and tokens as sessions grow.
@@ -162,12 +152,8 @@ modules, conventions, dependency shape, build/test commands, and change-aware
 refresh.
 
 - **Evidence now:** project instruction discovery; `read`, `grep`, `find`, and
-  read-only `git`; plus branch/dirty state in the UI. The model discovers the
-  rest manually.
-- **Material gap:** no cached repo map, toolchain or package-manager detection,
-  verification-command discovery, symbol/diagnostic index, or environment
-  readiness check. The workspace is simply the daemon process's current
-  directory.
+  read-only `git`; plus branch/dirty state in the UI, plus `P2` explicit `verify_command` (no auto-detection) and `P3` turn-start `git status/diff --stat` snapshot. The model still discovers the rest manually.
+- **Material gap:** no cached repo map, toolchain or package-manager detection, *auto* verification-command discovery, symbol/diagnostic index, or environment readiness check. The workspace is still the daemon process's current directory.
 - **Level 3 bar:** a small inspectable map is built once, invalidated by actual
   changes, and supplies correct build/test commands and navigation with less
   re-exploration than the baseline.
@@ -179,12 +165,10 @@ turns, compaction, reconnects, and new processes.
 
 - **Evidence now:** append-only session files and replay exist; local one-shot
   mode can continue a supplied session path; state, clear, and rename record
-  types exist.
+  types exist. `P0` wired: `session::load_session_state` + `load_plan`/`save_plan` (`plan` JSON via `session_state`), `ui/slash::apply_session_state` restores `model`+`provider`+`plan` on `/resume` (one-shot/local), remote plan sync via `ChatRequest.plan`/`ChatOptions.plan` persisted on daemon. Test `apply_session_state_restores_model` + `plan_is_injected`.
 - **Material gap:** the default daemon keeps its session registry only in
   memory, always creates a new TUI session, and cannot attach to a persisted
-  session after restart. `/resume`, `/name`, `/provider`, and `/skill` are not
-  supported by the active remote path. `session_state` is written but never
-  restored. There is no explicit project memory.
+  session after restart. `/resume`, `/name`, `/provider`, and `/skill` are still not supported by the active *remote* path (local/one-shot only). Daemon registry not rebuilt; no explicit project memory.
 - **Level 3 bar:** all active paths restore the same task/model/skill/session
   state after restart; remembered facts are user-visible, editable, scoped,
   attributable, and removable.
@@ -225,16 +209,13 @@ and handing off agent changes.
   preconditions and before/after evidence; concurrent user edits are never
   overwritten silently; cancellation can reconcile or roll back partial work.
 
-### 10. Verification & completion evidence — **0**
+### 10. Verification & completion evidence — **1**
 
 **Owns:** deciding which checks are relevant, running them after changes,
 feeding failures back, and defining “done.”
 
-- **Evidence now:** only the system prompt asks the model to run checks and
-  inspect the diff. The harness neither triggers nor records verification.
-- **Material gap:** no dirty-state verification hook, command detection,
-  pass/fail event, result artifact, completion gate, or explicit “not
-  applicable/waived” state.
+- **Evidence now:** `P2` dirty-state hook: `ToolState::verify_dirty` set on `is_mutating` batch, runs `verify_command` (`DEX_VERIFY`/`config.sample.json`) via `tools::execute_outcome("bash")` (same timeout/caps/cancel), deduped (skip if no mutation). Pass → `SinkLine::System "verify ✓"`/`StreamEvent::System`, fail → `user name:verify` tail (hash of first line for `stuck` dedup) fed to next model call. Prompt asks model to run checks. One test path exists (`ToolThenAnswer`); no auto-detection yet.
+- **Material gap:** no auto-detection of `cargo test`/`go test`/etc., no `pass/fail` event/artifact gate, no `waived/not applicable` state, no enforced final diff review. `verify_command` must be set manually.
 - **Level 3 bar:** every change has a verification disposition; relevant
   build/test/lint/diagnostic checks run against the final state; failures return
   to the loop; the final response links claims to recorded results.
@@ -258,18 +239,14 @@ and synthesis.
 
 ## Pillar D — Trust
 
-### 12. Authorization, approvals & audit — **1**
+### 12. Authorization, approvals & audit — **2**
 
 **Owns:** who may request an effect, what may be done, approval scope and
 expiry, policy enforcement, and an attributable decision record.
 
 - **Evidence now:** four permission modes, TUI allow-once/allow-session/deny,
-  daemon-side approval parking, and a best-effort tool execution audit log.
-- **Material gap:** the client request can override the daemon permission mode,
-  including to `trusted`; session approval is remembered by tool name, so one
-  approval can authorize unrelated future shell commands; approvals have no
-  computed diff or policy rules. Approval decisions/denials and caller identity
-  are not in the audit log.
+  daemon-side approval parking keyed by `Console::approval_key(name,input)` (`write`/`edit`→path hash, `bash`→command hash, else input hash), per-turn expiry (console drop), best-effort `audit.jsonl` + daemon `approve` audit with `actor`/`request_id`/`input_hash`/`decision`, and **daemon permission ceiling**: `daemon_perm.permissiveness()` from file/env is max, `ChatRequest.permission` may only be stricter (`read-only 0 < ask-writes 1 < ask-shell 2 < trusted 3`), escalation returns `403` (`daemon/server::run_turn_inner`). Tested by `cargo test` (63) + manual `DEX_PERMISSION=ask-writes` client `trusted` → `permission escalation denied`.
+- **Material gap:** approvals still lack computed `diff` + policy rules (e.g. `diff` hash for `edit`), expiry is only per-turn not 10m wall-clock, actor is `local`/`remote` not token-principal, audit is best-effort not tamper-evident.
 - **Level 3 bar:** the daemon owns a non-bypassable permission ceiling; clients
   may only request equal or stricter policy unless authorized; approvals are
   scoped to concrete paths/commands/diffs with expiry; every decision has an
@@ -339,12 +316,8 @@ user timely steer/cancel/correct controls without exposing hidden reasoning.
 
 - **Evidence now:** streaming markdown TUI, tool summaries/previews/durations,
   live usage, approval overlay, cancellation, scroll/history/autocomplete,
-  branch/dirty status, and terminal cleanup.
-- **Material gap:** the active daemon path does not wire mid-turn steering or
-  follow-ups—`process_turn` receives no steering channel and Enter is ignored
-  while busy—despite dormant fields and documentation claiming otherwise.
-  Goal/plan and verification state are absent, and several slash commands are
-  rejected remotely.
+  branch/dirty status, terminal cleanup, plus `P1–P3` `Goal:…·Plan 3/7` in `ui/render::plan_status`/`footer_text` + `plan`/`context` system messages + `verify ✓`/`name:verify` feedback. Remote `SinkLine::Plan`→`StreamEvent::Plan` keeps bar in sync.
+- **Material gap:** the active daemon path still does not wire mid-turn `steering`/`follow-ups` — `process_turn` `steering_rx=None` in `daemon/server` and Enter ignored while busy — despite dormant fields/docs. Several slash commands (`/resume` with args, provider auto) still rejected remotely; accessibility not proven.
 - **Level 3 bar:** the UI truthfully shows task/step, current action, queued
   input, change set, and verification; reconnect preserves control; all help
   text is exercised against the active path; accessibility is keyboard-complete
@@ -390,13 +363,8 @@ external systems without forking the harness.
 **Owns:** wire adaptation, capabilities, authentication, streaming/tool-call
 normalization, limits, retries, fallback, and model switching.
 
-- **Evidence now:** a `ModelClient` boundary, Chat Completions and Responses
-  translators/readers, OpenCode and Codex credential paths, streaming,
-  retry/backoff, usage extraction, and configurable reasoning effort.
-- **Material gap:** capability discovery hardcodes streaming/tools support;
-  context limits and model quirks are manual; provider coverage remains
-  OpenAI-shaped; retry pacing ignores provider hints and has no cancellable
-  sleep or fallback policy.
+- **Evidence now:** `ModelClient` boundary, Chat Completions/Responses translators, OpenCode/Codex credential paths, streaming, retry/backoff, usage extraction, configurable reasoning effort, plus `P5` static `llm/config::provider_default_context_window` + `llm/client::discover_capabilities` table (streaming/tools per-provider honest, no probing) driving `context_window/2` compaction without manual config. `LlmConfig::from_env` falls back to provider default.
+- **Material gap:** context limits still static not probed, model quirks manual, provider coverage OpenAI-shaped, retry pacing ignores `Retry-After` and has cancellable sleep but no fallback policy.
 - **Level 3 bar:** data-backed capabilities and conformance fixtures normalize
   supported providers; switching models preserves harness semantics; fallback
   is explicit, bounded, and measured rather than silently changing behavior.
@@ -424,11 +392,8 @@ resource use, and cost per successful task.
 
 - **Evidence now:** batched read guidance, concurrent read-only calls, bounded
   fan-out, `chain` to reduce model round trips, `$DEX_BIN` shell-side
-  distillation, output clamps, summarization, and opt-in tool caching.
-- **Material gap:** there is no task-level benchmark, so improvements are not
-  tied to success rate, latency, or cost. Context selection is transcript-based,
-  compaction costs another model call, and cache correctness is not strong
-  enough to enable by default for all searches.
+  distillation, output clamps, summarization, opt-in tool caching, plus `P3/P5` honest per-provider `context_window` driving `compact_history` thresholds (`est > context_window/2`) without manual `DEX_CONTEXT_WINDOW`.
+- **Material gap:** still no task-level benchmark tying improvements to success/latency/cost. Context selection transcript+plan+git only, compaction costs a model call, cache correctness not strong enough to enable by default for all searches.
 - **Level 3 bar:** fixed evals report p50/p95 latency, calls, tokens, and cost per
   successful task; optimizations must preserve quality and correctness; cache
   invalidation is proved before default enablement.

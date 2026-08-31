@@ -76,9 +76,26 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
     }
     segments.push((start, line.len()));
 
-    let strings = segments
+    let strings: Vec<String> = segments
         .iter()
-        .map(|&(start, end)| line[start..end].to_string())
+        .map(|&(start, end)| {
+            let raw = &line[start..end];
+            let mut out = String::with_capacity(raw.len());
+            let mut col = 0usize;
+            for c in raw.chars() {
+                if c == '\t' {
+                    let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+                    out.push_str(&" ".repeat(spaces));
+                    col += spaces;
+                } else if c.is_control() {
+                    // drop C0 controls (\r, BEL, etc.) – width 0, never rendered
+                } else {
+                    out.push(c);
+                    col += c.width().unwrap_or(0).max(1);
+                }
+            }
+            out
+        })
         .collect();
 
     let mut cursor_segment = segments.len().saturating_sub(1) as u16;
