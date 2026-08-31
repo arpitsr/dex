@@ -294,7 +294,10 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let input = indent_transcript_line(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Yellow)),
                 Span::styled(name, Style::default().fg(Color::Yellow)),
-                Span::styled(format!(" {arg}"), Style::default().fg(theme::tool_input_fg())),
+                Span::styled(
+                    format!(" {arg}"),
+                    Style::default().fg(theme::tool_input_fg()),
+                ),
             ]));
             app.transcript.push(TranscriptBlock::Tool {
                 input,

@@ -131,6 +131,22 @@ echo '{"name":"read","args":{"path":"Cargo.toml"}}' | oye --tool
 
 An empty line quits raw tool mode.
 
+### One-shot tool mode
+
+`oye run <tool> <key>=<value>...` executes a single tool and prints the raw
+result (errors go to stderr with exit code 1). Values that look like JSON
+numbers/booleans are coerced (`limit=5`, `replaceAll=true`); a single JSON
+object string is also accepted. Inside agent shell commands the binary is
+available as `$OYE_BIN`, so ONE bash call can stitch a whole read-only
+pipeline — search locally, read excerpts, print only the distilled result —
+while intermediate output never enters the conversation:
+
+```sh
+"$OYE_BIN" run grep pattern=TODO output_mode=files | while IFS= read -r f; do
+  "$OYE_BIN" run read "path=$f" limit=3
+done
+```
+
 ### Client–server mode
 
 The TUI is a pure HTTP client; all agent work (LLM calls, tools, sessions)
