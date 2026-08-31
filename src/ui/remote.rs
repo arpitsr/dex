@@ -101,6 +101,19 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         .create_session(&info.cwd, args.session_name.as_deref())
         .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
 
+    // Skills live on the daemon (its workspace). Fetch once for autocomplete
+    // and for local `/skill:` handling; a stale list is harmless — the load
+    // call re-discovers on the daemon side.
+    let daemon_skills = client.list_skills().unwrap_or_default();
+    let tui_skills: Vec<crate::core::types::Skill> = daemon_skills
+        .into_iter()
+        .map(|info| crate::core::types::Skill {
+            name: info.name,
+            description: info.description,
+            path: std::path::PathBuf::from(""),
+        })
+        .collect();
+
     // Per-request overrides so client flags keep working in remote mode.
     let options = ChatOptions {
         skill_dirs: args
@@ -131,7 +144,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         tool_state: crate::agent::state::ToolState::default(),
         session: Session::in_memory(info.cwd.clone()),
         plan: crate::core::types::Plan::default(),
-        skills: Vec::new(),
+        skills: tui_skills,
         turn_start: 0,
         cwd: info.cwd.clone(),
         git_branch: info.git_branch.clone(),
@@ -656,79 +669,117 @@ impl RemoteApp {
 /// here; everything else defers to the shared `slash` module. Returns true
 /// when the app should quit.
 fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
-    let app = &mut remote.app;
     match line {
         "/quit" => return true,
         "/clear" | "/new" => {
-            // History lives on the daemon: start a fresh session so the next
-            // turn begins with an empty conversation.
-            match remote.client.create_session(&app.cwd, None) {
+            let cwd = remote.app.cwd.clone();
+            match remote.client.create_session(&cwd, None) {
                 Ok(session) => {
                     remote.session_id = session.session_id;
-                    push_info(app, "new session started.".to_string());
+                    push_info(&mut remote.app, "new session started.".to_string());
                 }
-                Err(e) => push_info(app, format!("could not start new session: {e}")),
+                Err(e) => push_info(&mut remote.app, format!("could not start new session: {e}")),
             }
         }
         "/session" => {
-            push_info(app, format!("session: {} (on daemon)", remote.session_id));
+            let id = remote.session_id.clone();
+            push_info(&mut remote.app, format!("session: {id} (on daemon)"));
         }
         "/help" => {
             push_info(
-                app,
-                "commands: /quit /clear /new /session /permissions /model [<m>]".to_string(),
+                &mut remote.app,
+                "commands: /quit /clear /new /session /permissions /model [<m>] /skill:<name>"
+                    .to_string(),
             );
             push_info(
-                app,
+                &mut remote.app,
                 "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll"
                     .to_string(),
             );
             push_info(
-                app,
+                &mut remote.app,
                 "mouse: drag to select text and copy · wheel scrolls".to_string(),
             );
             push_info(
-                app,
+                &mut remote.app,
                 "while working: Esc/Ctrl+C cancels the turn".to_string(),
             );
         }
-        l if l.starts_with("/provider ")
-            || l.starts_with("/resume")
-            || l.starts_with("/name ")
-            || l.starts_with("/skill:") =>
-        {
-            // Provider/session management runs on the daemon host; the
-            // in-memory client session cannot represent it.
+        _ if line.starts_with("/skill:") => {
+            let name = line["/skill:".len()..].trim().to_string();
+            if name.is_empty() {
+                push_info(&mut remote.app, "usage: /skill:<name>".to_string());
+            } else {
+                let sid = remote.session_id.clone();
+                let dirs = remote.options.skill_dirs.clone();
+                let res = remote.client.load_skill(&sid, &name, &dirs);
+                match res {
+                    Ok(resp) => {
+                        push_info(&mut remote.app, format!("loaded skill: {}", resp.name));
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("404") {
+                            push_info(&mut remote.app, format!("skill not found: {name}"));
+                            let needs_refresh = remote.app.skills.is_empty();
+                            if needs_refresh {
+                                if let Ok(fresh) = remote.client.list_skills() {
+                                    remote.app.skills = fresh
+                                        .into_iter()
+                                        .map(|info| crate::core::types::Skill {
+                                            name: info.name,
+                                            description: info.description,
+                                            path: std::path::PathBuf::from(""),
+                                        })
+                                        .collect();
+                                }
+                            }
+                            let names: Vec<String> =
+                                remote.app.skills.iter().map(|s| s.name.clone()).collect();
+                            if !names.is_empty() {
+                                push_info(&mut remote.app, "available skills:".to_string());
+                                for n in names {
+                                    push_info(&mut remote.app, format!("  - {n}"));
+                                }
+                            }
+                        } else {
+                            push_info(
+                                &mut remote.app,
+                                format!("could not load skill '{name}': {e}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        l if l.starts_with("/provider ") || l.starts_with("/resume") || l.starts_with("/name ") => {
             push_info(
-                app,
+                &mut remote.app,
                 "this command is managed on the daemon host; not supported from a remote client yet"
                     .to_string(),
             );
         }
         _ => {
-            let had_model = app.config.model.clone();
-            let had_permission = app.config.permission;
-            let had_plan = app.plan.clone();
-            let quit = handle_slash(app, line);
-            // Forward mutations made by handle_slash (model/permission/plan)
-            // so future turns use the same overrides. Base URL and skill dirs
-            // are daemon-owned and not forwarded.
-            if app.config.model != had_model {
-                remote.options.model = Some(app.config.model.clone());
+            let had_model = remote.app.config.model.clone();
+            let had_permission = remote.app.config.permission;
+            let had_plan = remote.app.plan.clone();
+            let quit = handle_slash(&mut remote.app, line);
+            if remote.app.config.model != had_model {
+                remote.options.model = Some(remote.app.config.model.clone());
             }
-            if app.config.permission != had_permission {
-                remote.options.permission = Some(match app.config.permission {
+            if remote.app.config.permission != had_permission {
+                remote.options.permission = Some(match remote.app.config.permission {
                     PermissionMode::ReadOnly => "read-only".to_string(),
                     PermissionMode::AskWrites => "ask-writes".to_string(),
                     PermissionMode::AskShell => "ask-shell".to_string(),
                     PermissionMode::Trusted => "trusted".to_string(),
                 });
             }
-            if app.plan != had_plan {
-                if app.plan.is_empty() {
+            if remote.app.plan != had_plan {
+                if remote.app.plan.is_empty() {
                     remote.options.plan = Some(String::new());
                 } else {
-                    remote.options.plan = Some(app.plan.to_json());
+                    remote.options.plan = Some(remote.app.plan.to_json());
                 }
             }
             return quit;

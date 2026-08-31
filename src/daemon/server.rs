@@ -20,7 +20,8 @@ use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLin
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
-    ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, StreamEvent,
+    ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, LoadSkillRequest, SkillInfo,
+    StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills, skill_dirs};
@@ -31,10 +32,12 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/config", get(get_config))
+        .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
         .route("/api/sessions/{id}/approve", post(approve))
         .route("/api/sessions/{id}/cancel", post(cancel))
+        .route("/api/sessions/{id}/skill", post(load_skill))
         .with_state(state)
 }
 
@@ -117,6 +120,88 @@ async fn get_config() -> Json<DaemonInfo> {
             git_dirty: false,
         });
     Json(info)
+}
+
+async fn list_skills() -> Json<serde_json::Value> {
+    let skills = tokio::task::spawn_blocking(|| {
+        let dirs = skill_dirs();
+        discover_skills(&dirs)
+    })
+    .await
+    .unwrap_or_default();
+    let infos: Vec<SkillInfo> = skills
+        .into_iter()
+        .map(|s| SkillInfo {
+            name: s.name,
+            description: s.description,
+        })
+        .collect();
+    Json(json!({ "skills": infos }))
+}
+
+async fn load_skill(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<LoadSkillRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if req.name.is_empty()
+        || !req
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let entry = {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(&session_id).cloned()
+    }
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let skill_name = req.name.clone();
+    let extra_dirs = req.skill_dirs.clone();
+    let (skill, content) = tokio::task::spawn_blocking(move || {
+        let mut dirs = skill_dirs();
+        dirs.extend(extra_dirs.iter().map(std::path::PathBuf::from));
+        let skills = discover_skills(&dirs);
+        let skill = skills.into_iter().find(|s| s.name == skill_name)?;
+        let content = std::fs::read_to_string(&skill.path).ok()?;
+        Some((skill, content))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let skill_for_msg = skill.clone();
+    let content_for_msg = content.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut session = if entry.path.exists() {
+            Session::from_path(&entry.path).map_err(|e| format!("load session: {e}"))?
+        } else {
+            Session::new(entry.cwd.clone(), entry.name.clone())
+                .map_err(|e| format!("create session: {e}"))?
+        };
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: Some(format!(
+                "--- Skill: {} ---\n{}",
+                skill_for_msg.name, content_for_msg
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            name: Some("skill".to_string()),
+        };
+        session
+            .append_message(msg)
+            .map_err(|e| format!("append: {e}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({
+        "name": skill.name,
+        "description": skill.description,
+        "content": content,
+    })))
 }
 
 async fn create_session(
