@@ -216,4 +216,46 @@ impl DaemonClient {
             .error_for_status()?;
         Ok(())
     }
+
+    /// List skills discovered on the daemon (its workspace).
+    pub fn list_skills(&self) -> Result<Vec<SkillInfo>, Box<dyn std::error::Error>> {
+        let resp: serde_json::Value = self
+            .http
+            .get(format!("{}/api/skills", self.base_url))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let skills = resp["skills"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(skills)
+    }
+
+    /// Load a skill by name into the daemon's session history.
+    pub fn load_skill(
+        &self,
+        session_id: &str,
+        name: &str,
+        skill_dirs: &[String],
+    ) -> Result<LoadSkillResponse, Box<dyn std::error::Error>> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/api/sessions/{}/skill",
+                self.base_url, session_id
+            ))
+            .json(&LoadSkillRequest {
+                name: name.to_string(),
+                skill_dirs: skill_dirs.to_vec(),
+            })
+            .send()?
+            .error_for_status()?
+            .json::<LoadSkillResponse>()?;
+        Ok(resp)
+    }
 }

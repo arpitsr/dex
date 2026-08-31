@@ -134,6 +134,30 @@ pub enum StreamEvent {
     },
 }
 
+/// A single skill entry advertised by the daemon (discovered from its
+/// workspace). The body is fetched on demand via `POST /api/sessions/{id}/skill`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// Request to load a skill into the current session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadSkillRequest {
+    pub name: String,
+    #[serde(default)]
+    pub skill_dirs: Vec<String>,
+}
+
+/// Response after loading a skill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadSkillResponse {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
 /// Runtime info about the daemon, returned by `GET /api/config`. The client
 /// TUI uses it for the status footer and slash-command suggestions; the
 /// daemon resolves provider/model/permission from its own environment.
