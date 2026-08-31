@@ -42,7 +42,7 @@ pub(crate) fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error
 pub(crate) fn permission_from_env_or_file(
     file: &FileConfig,
 ) -> Result<PermissionMode, Box<dyn std::error::Error>> {
-    let value = env::var("AK_PERMISSION")
+    let value = env::var("OYE_PERMISSION")
         .ok()
         .or_else(|| file.permission.clone())
         .unwrap_or_else(|| "ask-writes".to_string());
@@ -76,7 +76,7 @@ impl LlmConfig {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let file = load_file_config()?;
         crate::tools::set_output_limit(
-            env::var("AK_TOOL_OUTPUT_BYTES")
+            env::var("OYE_TOOL_OUTPUT_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_tool_output_bytes)
@@ -86,7 +86,7 @@ impl LlmConfig {
             Some(mode) => mode,
             None => permission_from_env_or_file(&file)?,
         };
-        let provider_name = env::var("AK_PROVIDER")
+        let provider_name = env::var("OYE_PROVIDER")
             .ok()
             .or(file.provider)
             .unwrap_or_else(|| "opencode".to_string());
@@ -98,7 +98,7 @@ impl LlmConfig {
                 Provider::OpenCode => "gpt-5.6-luna".to_string(),
                 Provider::OpenAiCodex => "gpt-5.6-luna".to_string(),
             });
-        let mut available_models = env::var("AK_MODELS")
+        let mut available_models = env::var("OYE_MODELS")
             .ok()
             .map(|value| {
                 value
@@ -162,38 +162,41 @@ impl LlmConfig {
             account_id,
             thinking_effort: file.thinking_effort,
             // Context window in tokens; configurable via file (`context_window`)
-            // or AK_CONTEXT_WINDOW env, with a conservative default.
-            context_window: env::var("AK_CONTEXT_WINDOW")
+            // or OYE_CONTEXT_WINDOW env, with a conservative default.
+            context_window: env::var("OYE_CONTEXT_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.context_window)
                 .unwrap_or(128_000),
             permission,
-            max_tool_iterations: env::var("AK_MAX_TOOL_ITERATIONS")
+            max_tool_iterations: env::var("OYE_MAX_TOOL_ITERATIONS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_tool_iterations)
                 .unwrap_or(60),
-            max_prompt_tokens: env::var("AK_MAX_PROMPT_TOKENS")
+            max_prompt_tokens: env::var("OYE_MAX_PROMPT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_prompt_tokens)
                 .unwrap_or(128_000),
-            max_turn_seconds: env::var("AK_MAX_TURN_SECONDS")
+            max_turn_seconds: env::var("OYE_MAX_TURN_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_turn_seconds)
-                .unwrap_or(900),
+                .unwrap_or(3600),
             client: reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(
-                    env::var("AK_HTTP_CONNECT_TIMEOUT_SECS")
+                    env::var("OYE_HTTP_CONNECT_TIMEOUT_SECS")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .or(file.http_connect_timeout_secs)
                         .unwrap_or(10),
                 ))
+                // Note: for the blocking client this deadline applies to the
+                // connect and to each individual body read (not to the whole
+                // streamed response), so long-lived SSE streams are safe.
                 .timeout(Duration::from_secs(
-                    env::var("AK_HTTP_REQUEST_TIMEOUT_SECS")
+                    env::var("OYE_HTTP_REQUEST_TIMEOUT_SECS")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .or(file.http_request_timeout_secs)

@@ -90,6 +90,7 @@ impl StreamPrinter {
 pub(crate) fn read_stream(
     response: reqwest::blocking::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &dyn crate::agent::state::CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
@@ -100,12 +101,12 @@ pub(crate) fn read_stream(
     let mut usage_tokens: Option<u64> = None;
 
     loop {
-        if take_interrupt() || take_cancel_requested() {
-            // Ctrl+C during generation: stop consuming the stream and
+        if cancel.take_cancelled() {
+            // Cancellation during generation: stop consuming the stream and
             // unwind so control returns to the prompt.
             with_console(sink.is_some(), || println!());
             io::stdout().flush()?;
-            return Err("interrupted".into());
+            return Err("cancelled".into());
         }
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -118,7 +119,12 @@ pub(crate) fn read_stream(
         if data == "[DONE]" {
             break;
         }
-        let chunk: StreamChunk = serde_json::from_str(data)?;
+        // Providers interleave non-chunk payloads (keep-alives, error
+        // notices); skipping one unshapely line beats aborting a
+        // multi-minute generation.
+        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+            continue;
+        };
         if let Some(usage) = &chunk.usage {
             usage_tokens = Some(usage.prompt_tokens);
         }
@@ -166,6 +172,7 @@ pub(crate) fn read_stream(
 pub(crate) fn read_responses_stream(
     response: reqwest::blocking::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &dyn crate::agent::state::CancellationSource,
 ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
@@ -178,10 +185,10 @@ pub(crate) fn read_responses_stream(
     let mut usage_tokens = None;
 
     loop {
-        if take_interrupt() || take_cancel_requested() {
+        if cancel.take_cancelled() {
             with_console(sink.is_some(), || println!());
             io::stdout().flush()?;
-            return Err("interrupted".into());
+            return Err("cancelled".into());
         }
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -194,7 +201,10 @@ pub(crate) fn read_responses_stream(
         if data == "[DONE]" || data.is_empty() {
             continue;
         }
-        let event: Value = serde_json::from_str(data)?;
+        let event: Value = match serde_json::from_str(data) {
+            Ok(event) => event,
+            Err(_) => continue,
+        };
         let event_type = event
             .get("type")
             .and_then(Value::as_str)
@@ -226,7 +236,9 @@ pub(crate) fn read_responses_stream(
                     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
                         response_items.insert(item_id.to_string(), index);
                         if let Some(arguments) = pending_arguments.remove(item_id) {
-                            tool_calls[index].function.arguments.push_str(&arguments);
+                            if let Some(call) = tool_calls.get_mut(index) {
+                                call.function.arguments.push_str(&arguments);
+                            }
                         }
                     }
                 }
@@ -251,7 +263,9 @@ pub(crate) fn read_responses_stream(
                         .and_then(Value::as_str)
                         .and_then(|id| response_items.get(id).copied())
                     {
-                        tool_calls[index].function.arguments.push_str(delta);
+                        if let Some(call) = tool_calls.get_mut(index) {
+                            call.function.arguments.push_str(delta);
+                        }
                     } else {
                         pending_arguments.entry(key).or_default().push_str(delta);
                     }
@@ -272,7 +286,9 @@ pub(crate) fn read_responses_stream(
                     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
                         response_items.insert(item_id.to_string(), index);
                         if let Some(arguments) = pending_arguments.remove(item_id) {
-                            tool_calls[index].function.arguments.push_str(&arguments);
+                            if let Some(call) = tool_calls.get_mut(index) {
+                                call.function.arguments.push_str(&arguments);
+                            }
                         }
                     }
                 }

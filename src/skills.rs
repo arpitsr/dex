@@ -92,13 +92,16 @@ pub(crate) fn skill_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     // Project-level skills
     if let Ok(cwd) = env::current_dir() {
-        dirs.push(cwd.join(".ak/skills"));
+        dirs.push(cwd.join(".oye/skills"));
         dirs.push(cwd.join(".agents/skills"));
     }
-    // User-level skills
+    // User-level skills, including the pre-rename `ak` location so existing
+    // setups keep working.
     if let Some(cfg) = env::var_os("XDG_CONFIG_HOME") {
+        dirs.push(PathBuf::from(&cfg).join("oye/skills"));
         dirs.push(PathBuf::from(cfg).join("ak/skills"));
     } else if let Some(home) = env::var_os("HOME") {
+        dirs.push(PathBuf::from(&home).join(".config/oye/skills"));
         dirs.push(PathBuf::from(home).join(".config/ak/skills"));
     }
     dirs

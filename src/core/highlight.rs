@@ -45,7 +45,7 @@ pub(crate) fn print_ansi_highlighted_code(lang: &str, body: &str) {
     const KEYWORD: &str = "\x1b[1;35m";
     const STRING: &str = "\x1b[0;32m";
     const NUMBER: &str = "\x1b[0;33m";
-    const COMMENT: &str = "\x1b[2;37m";
+    const COMMENT: &str = "\x1b[0;90m";
     const PUNCT: &str = "\x1b[0;36m";
     let lang = lang.to_ascii_lowercase();
     let hash_comments = matches!(

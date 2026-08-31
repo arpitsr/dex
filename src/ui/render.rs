@@ -11,9 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::slash;
 use super::wrapping::wrap_line;
-use super::{
-    format_tokens, transcript_indent, App, InputField, SUBMITTED_PROMPT_BG, TRANSCRIPT_INDENT,
-};
+use super::{format_tokens, theme, transcript_indent, App, InputField, TRANSCRIPT_INDENT};
 
 pub(super) fn surface_padding() -> Padding {
     Padding {
@@ -32,7 +30,7 @@ pub(super) fn input_block() -> Block<'static> {
             top: super::INPUT_PAD_Y,
             bottom: super::INPUT_PAD_Y,
         })
-        .style(Style::default().bg(super::INPUT_BG))
+        .style(Style::default().bg(theme::surface_bg()))
 }
 
 pub(super) fn input_outer_height(content_rows: u16) -> u16 {
@@ -305,8 +303,18 @@ impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let visible = area.height as usize;
         let mut display: Vec<Line<'static>> = Vec::new();
-        for line in &app.transcript {
-            display.extend(wrap_line_display(line, area.width));
+        for (idx, block) in app.transcript.iter().enumerate() {
+            if idx > 0 {
+                // Single canonical gutter between any two semantic blocks.
+                display.push(Line::default());
+            }
+            for line in block.lines() {
+                display.extend(wrap_line_display(line, area.width));
+                // User block lines carry a background; the wrapping routine
+                // fills the remainder of the row with that background. As
+                // with the pre-block transcript (`Line::from(edge_pad)`), the
+                // visual result is one row per logical line, no extra wraps.
+            }
         }
         let total = display.len();
         let max_scroll = (total.saturating_sub(visible)) as u16;
@@ -330,6 +338,10 @@ struct ActivityView;
 
 impl ActivityView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
+        // Always clear the rect first: ratatui only repaints cells the
+        // widget writes, so a shorter "worked for …" line would otherwise
+        // leave trailing chars from the previous spinner text.
+        f.render_widget(Clear, area);
         if !(app.busy || app.last_activity.is_some()) {
             return;
         }
@@ -343,7 +355,7 @@ impl ActivityView {
                 .unwrap_or_default();
             (
                 truncate_display(&format!("{} working…{}", frame, tool), content_width),
-                Color::DarkGray,
+                theme::muted_fg(),
             )
         } else {
             (
@@ -407,10 +419,15 @@ struct ComposerView;
 
 impl ComposerView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+        f.render_widget(Clear, area);
         let input_style = if app.busy || app.pending_approval.is_some() {
-            Style::default().fg(Color::DarkGray).bg(SUBMITTED_PROMPT_BG)
+            Style::default()
+                .fg(theme::muted_fg())
+                .bg(theme::surface_bg())
         } else {
-            Style::default().fg(Color::White).bg(SUBMITTED_PROMPT_BG)
+            Style::default()
+                .fg(theme::surface_fg())
+                .bg(theme::surface_bg())
         };
         let block = input_block();
         let inner = block.inner(area);
@@ -471,7 +488,9 @@ impl SlashSuggestionsView {
                 let row_style = if selected {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else {
-                    Style::default().fg(Color::White).bg(Color::Rgb(18, 25, 38))
+                    Style::default()
+                        .fg(theme::surface_fg())
+                        .bg(theme::popup_bg())
                 };
                 let command_style = if selected {
                     Style::default()
@@ -485,7 +504,7 @@ impl SlashSuggestionsView {
                 let description_style = if selected {
                     Style::default().fg(Color::Black)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(theme::secondary_fg())
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{command:<20}"), command_style),
@@ -500,7 +519,7 @@ impl SlashSuggestionsView {
                     .title(" Slash commands ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue))
-                    .style(Style::default().bg(Color::Rgb(18, 25, 38))),
+                    .style(Style::default().bg(theme::popup_bg())),
             ),
             popup,
         );
@@ -534,8 +553,11 @@ impl ApprovalOverlay {
         let block = Block::default()
             .title(" Approval required ")
             .borders(Borders::TOP | Borders::BOTTOM)
+            // Keep the overlay's text in the same left gutter as the
+            // transcript and composer instead of flush with the screen edge.
+            .padding(Padding::horizontal(super::HORIZONTAL_GUTTER))
             .border_style(Style::default().fg(Color::Yellow))
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(theme::surface_bg()));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -544,10 +566,7 @@ impl ApprovalOverlay {
             inner.width.saturating_sub(2),
         );
         let header = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "The agent wants to run:",
-                Style::default().fg(Color::White),
-            )),
+            Line::from(Span::styled("The agent wants to run:", theme::surface_fg())),
             Line::from(Span::styled(command, Style::default().fg(Color::Cyan))),
             Line::from(""),
         ])
@@ -576,7 +595,7 @@ impl ApprovalOverlay {
             let style = if approval.selected == index {
                 Style::default().fg(Color::Black).bg(Color::Yellow)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::surface_fg())
             };
             ListItem::new(format!("{marker} {label}  [{key}]")).style(style)
         });
@@ -591,7 +610,7 @@ impl ApprovalOverlay {
         );
         f.render_widget(
             Paragraph::new("↑/↓ select · Enter confirm · Esc deny")
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(theme::muted_fg())),
             Rect {
                 x: inner.x,
                 y: inner.y + 8,
@@ -604,6 +623,10 @@ impl ApprovalOverlay {
 
 pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
+    // Ratatui only repaints cells the widget touches; without a full clear,
+    // a shorter line (e.g. "worked for …" replacing the spinner, or a
+    // shrunken input) would leave trailing chars from the previous frame.
+    f.render_widget(Clear, area);
     let input_rows = render_input(&app.input, input_content_width(area.width))
         .0
         .len() as u16;
@@ -761,11 +784,13 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn test_app() -> super::super::App {
-        let cwd = "/tmp/ak-ui-test".to_string();
+        let cwd = "/tmp/oye-ui-test".to_string();
         super::super::App {
-            transcript: vec![super::super::indent_transcript_line(Line::from(
-                "hello from the transcript — this line is intentionally long enough to wrap",
-            ))],
+            transcript: vec![super::super::TranscriptBlock::Assistant(vec![
+                super::super::indent_transcript_line(Line::from(
+                    "hello from the transcript — this line is intentionally long enough to wrap",
+                )),
+            ])],
             input: InputField::new(),
             config: super::super::LlmConfig {
                 provider: Provider::OpenCode,
@@ -810,6 +835,7 @@ mod tests {
             history_index: None,
             history_draft: String::new(),
             slash_selected: 0,
+            assistant_open: false,
         }
     }
 
@@ -938,6 +964,24 @@ mod tests {
         assert!(symbols.contains("bash cargo test"));
         assert!(symbols.contains("Allow for this session"));
         assert!(symbols.contains("Esc deny"));
+        // Tool/why text sits in the app's one-column left gutter, aligned
+        // with the rest of the UI instead of flush with the screen edge.
+        let width = 100;
+        let rows: Vec<String> = symbols
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(width)
+            .map(|c| c.iter().collect())
+            .collect();
+        let at_gutter = |needle: &str| {
+            rows.iter().any(|r| {
+                r.find(needle)
+                    .is_some_and(|byte| r[..byte].chars().count() == 1)
+            })
+        };
+        assert!(at_gutter("The agent"), "header not in gutter");
+        assert!(at_gutter("bash cargo"), "command not in gutter");
+        assert!(at_gutter("\u{2191}/\u{2193} select"), "hint not in gutter");
     }
 
     #[test]
@@ -957,5 +1001,104 @@ mod tests {
             .0
             .len();
         assert_eq!(measured, rendered, "wrapped row counts must agree");
+    }
+
+    #[test]
+    fn assistant_text_is_gapped_after_tool_preview() {
+        // Gaps are now rendered between TranscriptBlocks, not stored as
+        // empty Lines. Verify the Tool and final Assistant are separate blocks
+        // and the rendered display (block gaps) contains a blank line between
+        // them – the exact bug that was missing before.
+        let mut app = test_app();
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash grep foo src".into()),
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "bash".into(),
+                summary: "v 1 match".into(),
+                success: true,
+                preview: vec!["src/main.rs:1:foo".into()],
+                duration: 0.0,
+            },
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("Looked at src/main.rs.".into()),
+        );
+
+        // Transcript: [Assistant(hello), Tool, Assistant(Looked at)]
+        assert_eq!(app.transcript.len(), 3);
+        assert!(matches!(
+            app.transcript[1],
+            super::super::TranscriptBlock::Tool { .. }
+        ));
+        assert!(matches!(
+            app.transcript[2],
+            super::super::TranscriptBlock::Assistant(_)
+        ));
+
+        // Build the same flattened display TranscriptView uses and assert a
+        // single blank Line between the tool and assistant blocks.
+        let mut display: Vec<Line<'static>> = Vec::new();
+        for (idx, block) in app.transcript.iter().enumerate() {
+            if idx > 0 {
+                display.push(Line::default());
+            }
+            for line in block.lines() {
+                display.extend(wrap_line_display(line, 100));
+            }
+        }
+        let assistant_display_idx = display
+            .iter()
+            .position(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("Looked at")
+            })
+            .expect("assistant in display");
+        assert!(
+            display[assistant_display_idx - 1].spans.is_empty(),
+            "expected a blank gap line before assistant text in rendered display, got {:?}",
+            display[assistant_display_idx - 1]
+        );
+    }
+
+    #[test]
+    fn consecutive_assistant_chunks_do_not_add_gaps() {
+        // Streaming coalesces consecutive Assistant SinkLines into the tail
+        // Assistant block; no inter-block gap must appear inside that block.
+        let mut app = test_app();
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("first".into()),
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("second".into()),
+        );
+        // [Assistant(hello)] + streamed Assistant => two blocks, tail holds both.
+        assert_eq!(app.transcript.len(), 2);
+        let tail = match &app.transcript[1] {
+            super::super::TranscriptBlock::Assistant(lines) => lines,
+            other => panic!("expected tail Assistant block, got {other:?}"),
+        };
+        let first_pos = tail
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("first")))
+            .expect("first");
+        let second_pos = tail
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("second")))
+            .expect("second");
+        assert_eq!(
+            second_pos,
+            first_pos + 1,
+            "streamed assistant chunks must stay flush inside one block"
+        );
     }
 }

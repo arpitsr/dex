@@ -1,10 +1,12 @@
+#![allow(dead_code)]
+
 use std::env;
 use std::fs;
 
 use crate::core::types::{ChatMessage, Provider};
 use crate::session::Session;
 
-use super::{push_info, push_transcript_gap, App, InputField};
+use super::{push_info, App, InputField};
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "Exit the REPL"),
@@ -96,10 +98,6 @@ pub(super) fn complete_slash(app: &mut App) -> bool {
 }
 
 pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
-    // Gap before command output so it reads as its own turn (pi-style).
-    if app.transcript.len() > 1 {
-        push_transcript_gap(app);
-    }
     match line {
         "/quit" => return true,
         "/clear" => {
@@ -216,8 +214,12 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/mouse scroll"
+                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll"
                     .to_string(),
+            );
+            push_info(
+                app,
+                "mouse: drag to select text and copy · wheel scrolls".to_string(),
             );
             push_info(app, "while working: Enter queues steer · Alt+Enter queues follow-up · Esc/Ctrl+C cancels and restores queued input".to_string());
         }
