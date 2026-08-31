@@ -442,27 +442,11 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
-    #[test]
-    fn indent_transcript_line_adds_gutter() {
-        let line = Line::from("test");
-        let indented = indent_transcript_line(line);
-        assert!(indented.spans[0].content.as_ref() == " ");
-    }
-
-    #[test]
-    fn git_context_returns_empty_on_non_repo() {
-        let (branch, dirty) = crate::core::format::git_context("/tmp/not-a-repo-12345");
-        assert!(branch.is_none());
-        assert!(!dirty);
-    }
-
-    #[test]
-    fn tool_preview_lines_are_indented_and_dimmed() {
-        // Preview formatting is exercised through the Tool block produced by
-        // `append_sink_line`; the stored preview lines must be indented and
-        // dimmed exactly as before.
-        let mut app = App {
+    fn test_app() -> App {
+        App {
             transcript: Vec::new(),
             input: crate::ui::input::InputField::new(),
             config: crate::llm::config::LlmConfig {
@@ -509,7 +493,29 @@ mod tests {
             history_draft: String::new(),
             slash_selected: 0,
             assistant_open: false,
-        };
+        }
+    }
+
+    #[test]
+    fn indent_transcript_line_adds_gutter() {
+        let line = Line::from("test");
+        let indented = indent_transcript_line(line);
+        assert!(indented.spans[0].content.as_ref() == " ");
+    }
+
+    #[test]
+    fn git_context_returns_empty_on_non_repo() {
+        let (branch, dirty) = crate::core::format::git_context("/tmp/not-a-repo-12345");
+        assert!(branch.is_none());
+        assert!(!dirty);
+    }
+
+    #[test]
+    fn tool_preview_lines_are_indented_and_dimmed() {
+        // Preview formatting is exercised through the Tool block produced by
+        // `append_sink_line`; the stored preview lines must be indented and
+        // dimmed exactly as before.
+        let mut app = test_app();
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolInput("bash echo hi".into()),
@@ -534,5 +540,68 @@ mod tests {
         }
         assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
         assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");
+    }
+
+    /// Write a minimal persisted session JSONL (same entry shapes
+    /// `Session::new`/`set_state` produce) so `apply_session_state` can be
+    /// exercised without touching the real session directory.
+    fn write_session_file(state_lines: &[&str]) -> PathBuf {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let mut h = DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        let tid = h.finish();
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "dex-apply-state-{}-{}-{}-{}.jsonl",
+            std::process::id(),
+            tid,
+            nanos,
+            nonce
+        ));
+        let mut lines = vec![r#"{"type":"session","version":1,"id":"statetest","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#.to_string()];
+        lines.extend(state_lines.iter().map(|l| l.to_string()));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn apply_session_state_restores_model_from_session_file() {
+        let path = write_session_file(&[
+            r#"{"type":"session_state","id":"1","timestamp":"2020-01-01T00:00:01Z","key":"model","value":"restored-model"}"#,
+        ]);
+
+        let mut app = test_app();
+        crate::ui::slash::apply_session_state(&mut app, Some(&path));
+
+        assert_eq!(app.config.model, "restored-model");
+        assert!(app
+            .config
+            .available_models
+            .contains(&"restored-model".to_string()));
+    }
+
+    #[test]
+    fn apply_session_state_keeps_config_when_file_has_no_state_entries() {
+        let path = write_session_file(&[]);
+
+        let mut app = test_app();
+        crate::ui::slash::apply_session_state(&mut app, Some(&path));
+
+        assert_eq!(app.config.model, "test");
+    }
+
+    #[test]
+    fn apply_session_state_is_noop_without_a_session_path() {
+        let mut app = test_app();
+        crate::ui::slash::apply_session_state(&mut app, None);
+
+        assert_eq!(app.config.model, "test");
     }
 }

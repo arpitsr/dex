@@ -359,7 +359,8 @@ fn run_bash_with_limits(
     Ok((result, status.code()))
 }
 
-/// `read` returns line-numbered content (`line\\ttext`) so subsequent `edit`
+/// `read` returns line-numbered content (right-aligned number + two-space gap
+/// + tab-expanded content per .editorconfig/language) so subsequent `edit`
 /// oldText anchors are cheap to construct. Default: first 2000 lines, capped
 /// by a byte budget; paginate with offset/limit. Binary files are refused
 /// rather than dumped into the context window.
@@ -449,12 +450,16 @@ fn read_file_numbered(
             path.display()
         )));
     }
+    let tab_width = detect_tab_width(path);
     let numbered: Vec<String> = lines
         .iter()
         .skip(offset - 1)
         .take(limit)
         .enumerate()
-        .map(|(index, line)| format!("{}\t{line}", offset + index))
+        .map(|(index, line)| {
+            let expanded = expand_tabs(line, tab_width);
+            format!("{:>4}  {}", offset + index, expanded)
+        })
         .collect();
     let mut out = clamp_lines(&numbered.join("\n"), READ_MAX_LINES, READ_MAX_BYTES);
     let shown = numbered.len();
@@ -700,6 +705,128 @@ fn apply_edit(
 /// can be gigabytes) enough to cause spurious tool timeouts when searched.
 const SKIP_DIRS: &str = "--exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules";
 const SKIP_GLOBS: &str = "--glob '!target' --glob '!node_modules' --glob '!.git'";
+
+fn expand_tabs(line: &str, width: usize) -> String {
+    let width = width.clamp(1, 16);
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + width);
+    let mut col: usize = 0;
+    for ch in line.chars() {
+        if ch == '\t' {
+            let spaces = width - (col % width);
+            out.push_str(&" ".repeat(spaces));
+            col += spaces;
+        } else {
+            // use display width for tabstop tracking (CJK etc.), but at
+            // tool layer we only need byte-column for indentation; unicode
+            // width keeps generic correctness for any file.
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            out.push(ch);
+            col += w;
+        }
+    }
+    out
+}
+
+fn detect_tab_width(path: &Path) -> usize {
+    if let Ok(raw) = env::var("DEX_TAB_WIDTH") {
+        if let Ok(v) = raw.parse::<usize>() {
+            if (1..=16).contains(&v) {
+                return v;
+            }
+        }
+    }
+    if let Some(v) = editorconfig_tab_width(path) {
+        return v;
+    }
+    language_tab_width(path)
+}
+
+fn editorconfig_tab_width(path: &Path) -> Option<usize> {
+    let root = workspace_root().ok()?.canonicalize().ok()?;
+    let mut dir = path.parent()?.canonicalize().ok()?;
+    loop {
+        let cfg = dir.join(".editorconfig");
+        if let Ok(text) = fs::read_to_string(&cfg) {
+            // Minimal parser: last matching indent_size/tab_width wins.
+            // Handles `[*]`, `[*.rs]`, `[*.{js,ts}]` via simple substring/glob.
+            let file_name = path.file_name()?.to_string_lossy().to_string();
+            let ext = path.extension()?.to_string_lossy().to_string();
+            let mut best: Option<usize> = None;
+            let mut in_matching_section = true; // global pre-section
+            for raw_line in text.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                    continue;
+                }
+                if line.starts_with('[') && line.ends_with(']') {
+                    let pat = line[1..line.len() - 1].trim().to_ascii_lowercase();
+                    // very small glob: * matches all, *.ext matches extension,
+                    // otherwise substring check
+                    in_matching_section = if pat == "*" || pat == "[*]" {
+                        true
+                    } else if pat.contains('*') {
+                        // crude: check extension or substring
+                        pat.contains(&ext.to_ascii_lowercase())
+                            || pat.contains(&file_name.to_ascii_lowercase())
+                    } else {
+                        file_name.eq_ignore_ascii_case(&pat)
+                    };
+                    continue;
+                }
+                if !in_matching_section {
+                    continue;
+                }
+                let lower = line.to_ascii_lowercase();
+                for key in ["tab_width", "indent_size", "tabwidth"] {
+                    if lower.starts_with(key) {
+                        if let Some(eq) = line.find('=') {
+                            let val = line[eq + 1..].trim();
+                            if let Ok(v) = val.parse::<usize>() {
+                                if (1..=16).contains(&v) {
+                                    best = Some(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(v) = best {
+                return Some(v);
+            }
+        }
+        if dir == root {
+            break;
+        }
+        let parent = dir.parent()?;
+        if !parent.starts_with(&root) && dir != root {
+            // also check one level above root for repo-level config
+            // then stop
+            if parent == root.parent().unwrap_or(Path::new("/")) {
+                break;
+            }
+        }
+        dir = parent.to_path_buf();
+        if dir.parent().is_none() {
+            break;
+        }
+    }
+    None
+}
+
+fn language_tab_width(path: &Path) -> usize {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
+        return 8;
+    }
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+        Some(ext) if matches!(ext.as_str(), "go") => 4, // gofmt uses tabs but 4 is readable; 8 is terminal-faithful, choose 4 for preview density like pi
+        Some(ext) if matches!(ext.as_str(), "py" | "rs" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "java" | "json" | "toml" | "yaml" | "yml" | "md" | "sh" | "bash" | "rb" | "php") => 4,
+        _ => 4,
+    }
+}
 
 fn has_ripgrep() -> bool {
     static RG: OnceLock<bool> = OnceLock::new();
@@ -1297,12 +1424,14 @@ mod tests {
         args.insert("path".into(), Value::String(path.display().to_string()));
         let outcome = execute_outcome("read", &args, &GlobalCancellation);
         assert!(outcome.ok, "{}", outcome.text);
-        assert_eq!(outcome.text, "1\tone\n2\ttwo\n3\tthree\n4\tfour");
+        // Line numbers are now right-aligned with two spaces (no raw tab) and file
+        // tabs are expanded per tab_width, so the separator is stable.
+        assert_eq!(outcome.text, "   1  one\n   2  two\n   3  three\n   4  four");
 
         args.insert("offset".into(), Value::Number(2.into()));
         args.insert("limit".into(), Value::Number(1.into()));
         let outcome = execute_outcome("read", &args, &GlobalCancellation);
-        assert_eq!(outcome.text, "2\ttwo");
+        assert_eq!(outcome.text, "   2  two");
 
         args.insert("offset".into(), Value::Number(9.into()));
         let outcome = execute_outcome("read", &args, &GlobalCancellation);
@@ -1346,8 +1475,8 @@ mod tests {
         let outcome = execute_outcome("read", &args, &GlobalCancellation);
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("==> "), "{}", outcome.text);
-        assert!(outcome.text.contains("1\talpha"), "{}", outcome.text);
-        assert!(outcome.text.contains("1\tbeta"), "{}", outcome.text);
+        assert!(outcome.text.contains("   1  alpha"), "{}", outcome.text);
+        assert!(outcome.text.contains("   1  beta"), "{}", outcome.text);
         assert!(outcome.text.contains("error:"), "{}", outcome.text);
 
         // Glob fan-out, sorted, capped.

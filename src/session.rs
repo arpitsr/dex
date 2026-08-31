@@ -371,7 +371,6 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
     Ok(messages)
 }
 
-#[allow(dead_code)]
 pub(crate) fn load_session_state(
     path: &Path,
 ) -> io::Result<std::collections::HashMap<String, String>> {
@@ -396,15 +395,61 @@ pub(crate) fn load_session_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unique_path(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let mut h = DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        let tid = h.finish();
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}-{}-{}-{}-{}.jsonl", prefix, std::process::id(), tid, nanos, nonce))
+    }
+
     #[test]
     fn clear_marker_removes_messages_during_recovery() {
-        let path =
-            std::env::temp_dir().join(format!("dex-session-test-{}.jsonl", std::process::id()));
+        let path = unique_path("dex-session-test");
         let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
         let message = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"old"}"#;
         let clear = r#"{"type":"clear","id":"2","timestamp":"2020-01-01T00:00:00Z"}"#;
         fs::write(&path, format!("{}\n{}\n{}\n", header, message, clear)).unwrap();
         assert!(load_messages_from_session(&path).unwrap().is_empty());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_state_last_write_wins_and_ignores_other_entries() {
+        let path = unique_path("dex-session-state");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        let first = r#"{"type":"session_state","id":"1","timestamp":"2020-01-01T00:00:01Z","key":"model","value":"old-model"}"#;
+        let message = r#"{"type":"message","id":"2","timestamp":"2020-01-01T00:00:02Z","role":"user","content":"hi"}"#;
+        let second = r#"{"type":"session_state","id":"3","timestamp":"2020-01-01T00:00:03Z","key":"model","value":"new-model"}"#;
+        let provider = r#"{"type":"session_state","id":"4","timestamp":"2020-01-01T00:00:04Z","key":"provider","value":"openai-codex"}"#;
+        fs::write(
+            &path,
+            format!("{}\n{}\n{}\n{}\n{}\n", header, first, message, second, provider),
+        )
+        .unwrap();
+        let state = load_session_state(&path).unwrap();
+        assert_eq!(state.get("model").map(String::as_str), Some("new-model"));
+        assert_eq!(
+            state.get("provider").map(String::as_str),
+            Some("openai-codex")
+        );
+        assert_eq!(state.len(), 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_state_missing_file_is_an_error() {
+        let path = unique_path("dex-session-state-missing");
+        let _ = fs::remove_file(&path);
+        assert!(load_session_state(&path).is_err());
     }
 }

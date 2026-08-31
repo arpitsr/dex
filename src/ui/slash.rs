@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::path::Path;
 
 use crate::core::types::{ChatMessage, Provider};
 use crate::session::Session;
@@ -153,7 +154,9 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     if let Some(system) = system {
                         app.messages.insert(0, system);
                     }
+                    let session_path = session.path().map(|p| p.to_path_buf());
                     app.session = session;
+                    apply_session_state(app, session_path.as_deref());
                     push_info(
                         app,
                         format!("resumed session: {}", app.session.display_name()),
@@ -261,4 +264,49 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         _ => push_info(app, format!("unknown command: {}", line)),
     }
     false
+}
+
+/// Re-apply provider/model overrides that were persisted with the session
+/// (`/model` and `/provider` write `session_state` entries; later entries in
+/// the JSONL win, matching the append-order semantics used for messages).
+/// Each applied switch is reported to the transcript so the user can see why
+/// their model changed on resume. Silently keeps the current config when the
+/// session predates state entries, or when a persisted provider is no longer
+/// resolvable in this environment.
+pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
+    let Some(path) = session_path else {
+        return;
+    };
+    let state = match crate::session::load_session_state(path) {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+    if let Some(name) = state.get("provider") {
+        match Provider::parse(name) {
+            Ok(provider) if provider != app.config.provider => {
+                match app.config.switch_provider(provider) {
+                    Ok(()) => push_info(app, format!("restored provider: {}", provider.name())),
+                    Err(error) => push_info(
+                        app,
+                        format!("could not restore provider '{}': {}", name, error),
+                    ),
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(model) = state.get("model") {
+        if app.config.model != *model {
+            app.config.model = model.clone();
+            if !app
+                .config
+                .available_models
+                .iter()
+                .any(|candidate| candidate == model)
+            {
+                app.config.available_models.push(model.clone());
+            }
+            push_info(app, format!("restored model: {}", model));
+        }
+    }
 }

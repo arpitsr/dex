@@ -33,7 +33,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "read".to_string(),
-                description: "Read file(s) with line numbers (line\\tcontent), which you can reference in edits. Returns at most 2000 lines; paginate with offset/limit. To avoid extra round trips, pass `paths` (up to 10 files) or `glob` to read several files in ONE call; sections are returned per file.".to_string(),
+                description: "Read file(s) with line numbers (right-aligned number + two spaces + expanded content, tabs expanded per .editorconfig/language), which you can reference in edits. Returns at most 2000 lines; paginate with offset/limit. To avoid extra round trips, pass `paths` (up to 10 files) or `glob` to read several files in ONE call; sections are returned per file.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
