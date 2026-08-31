@@ -60,7 +60,7 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
-    println!("oye daemon listening on {addr}");
+    println!("dex daemon listening on {addr}");
 
     // tokio refuses blocking fds; the std listener must be non-blocking
     // before registration.

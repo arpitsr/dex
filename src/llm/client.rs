@@ -78,7 +78,7 @@ pub(crate) fn provider_log(event: &str, detail: &str) {
     else {
         return;
     };
-    let path = base.join("oye/provider.jsonl");
+    let path = base.join("dex/provider.jsonl");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }

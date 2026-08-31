@@ -1,301 +1,524 @@
-# Harness Canvas
+# Harness Capability Map
 
-The complete map of what a best-in-class coding-agent harness must own. This
-is the product view: every aspect of agent quality, how it is covered today,
-and what world-class looks like — so each can be built up deliberately and
-tracked over time. Execution order lives in `PLAN.md`; this file is the
-board, not the backlog.
+A coding-agent harness is the runtime around the model that turns user intent
+into controlled, inspectable workspace changes. It owns the task contract,
+instructions and context, model and tool execution, change integrity,
+verification, recovery, interfaces, security, and the evidence used to improve
+all of them.
+
+This is a current-state capability map, not a feature list or backlog.
+`PLAN.md` sequences planned work; this file defines the surface that must not be
+forgotten.
+
+## Assessment rules
+
+- **Score the supported end-to-end path.** Today that is `dex` → daemon →
+  HTTP/SSE TUI. Code not wired into that path, or available only in local
+  one-shot mode, is called out but does not earn a full score.
+- **Evidence beats intent.** Prompts, comments, and README claims are not
+  harness guarantees. A capability counts when the active runtime enforces it.
+- **Trust uses the weakest exposed path.** A safe file tool does not make an
+  unrestricted shell safe; a durable JSONL file does not make daemon resume
+  work; remote transport is not collaboration.
+- **No aggregate score.** A zero in authorization, containment, verification,
+  or recovery can block a release regardless of strengths elsewhere.
 
 ## Maturity scale
 
 | Level | Meaning |
 |-------|---------|
-| **0** | Absent |
-| **1** | Basic — works, model carries the quality |
-| **2** | Solid — harness adds real intelligence or guarantees |
-| **3** | World-class — differentiating; competitors copy it |
+| **0** | Absent, unsafe for the stated use, or not wired into a supported path |
+| **1** | Partial/happy-path; relies materially on the model, user, or manual recovery |
+| **2** | End-to-end harness behavior with explicit failure handling and tests |
+| **3** | Measured, resilient, policy-ready, and protected by behavioral regressions |
+
+A level-3 claim must name a runnable acceptance check, eval, or service-level
+objective. “Best in class” without evidence is not a maturity level.
 
 ## Board
 
-| # | Area | Pillar | Now |
-|---|------|--------|-----|
-| 1 | Turn loop & orchestration | Cognition | **2** |
-| 2 | Goal & task state | Cognition | **0** |
-| 3 | Context engineering | Cognition | **1** |
-| 4 | Repository understanding | Cognition | **1** |
-| 5 | Failure recovery & re-planning | Cognition | **1** |
-| 6 | Memory (within & across sessions) | Cognition | **1** |
-| 7 | Tool design & reliability | Action | **2** |
-| 8 | Verification | Action | **0** |
-| 9 | Parallelism & delegation | Action | **1** |
-| 10 | Safety, permissions & audit | Trust | **2** |
-| 11 | Persistence & crash recovery | Trust | **2** |
-| 12 | Terminal UX | Interface | **2** |
-| 13 | Non-interactive & CI use | Interface | **2** |
-| 14 | Extensibility (skills/hooks/MCP) | Interface | **1** |
-| 15 | Model independence | Platform | **2** |
-| 16 | Observability & cost | Platform | **1** |
-| 17 | Performance & token efficiency | Platform | **2** |
-| 18 | Quality measurement (evals) | Platform | **1** |
-| 19 | Long-running autonomy | Platform | **0** |
-| 20 | Remote & collaboration | Platform | **2** |
+`P0`–`P5` refer to phases in `PLAN.md`; “partial” means that phase covers only
+part of the area. `—` means the important gap is not currently planned.
+
+| # | Area | Pillar | Now | Planned |
+|---|------|--------|-----|---------|
+| 1 | Objective, acceptance & progress | Direction | **0** | P1 partial |
+| 2 | Turn orchestration & stop semantics | Direction | **2** | — |
+| 3 | Failure recovery & re-planning | Direction | **1** | P4 |
+| 4 | Instruction hierarchy & behavior policy | Knowledge | **1** | — |
+| 5 | Context lifecycle | Knowledge | **1** | P3 |
+| 6 | Repository & environment intelligence | Knowledge | **1** | P2/P3 partial |
+| 7 | Memory & session continuity | Knowledge | **1** | P0 partial |
+| 8 | Tool protocol & reliability | Action | **2** | — |
+| 9 | Change control & artifact integrity | Action | **1** | — |
+| 10 | Verification & completion evidence | Action | **0** | P2 |
+| 11 | Parallelism & delegation | Action | **1** | Deferred |
+| 12 | Authorization, approvals & audit | Trust | **1** | — |
+| 13 | Isolation & resource containment | Trust | **1** | — |
+| 14 | Secrets, privacy & remote access security | Trust | **0** | — |
+| 15 | Durability & effect recovery | Trust | **1** | — |
+| 16 | Interactive UX & human control | Interface | **2** | P1–P3 partial |
+| 17 | Automation & protocol contracts | Interface | **1** | — |
+| 18 | Extensibility & integrations | Interface | **1** | — |
+| 19 | Model/provider portability | Platform | **2** | P5 |
+| 20 | Observability, usage & cost | Platform | **1** | — |
+| 21 | Performance & token economy | Platform | **2** | P3/P5 partial |
+| 22 | Quality evaluation | Platform | **1** | — |
+| 23 | Operations, configuration & compatibility | Operations | **1** | — |
+| 24 | Remote use & collaboration | Operations | **1** | — |
+| 25 | Long-running autonomy | Operations | **0** | Deferred |
 
 ---
 
-## Pillar A — Cognition
+## Pillar A — Direction
 
-### 1. Turn loop & orchestration — **2**
-The engine: budgets, cancellation, streaming, tool dispatch.
+### 1. Objective, acceptance & progress — **0**
 
-- **Have:** iteration/time/token budgets, wrap-up nudge, cancellation at
-  every layer (HTTP, tool process groups), steering mid-turn, parallel
-  read-only dispatch with conflict serialization, per-message persistence.
-- **World-class:** the loop is boring — every failure mode (provider hang,
-  tool panic, timeout storm) ends in a clean, resumable state; batching and
-  pacing adapt to model behavior.
-- **To close:** mostly polish. Adaptive pacing (slow down on repeated
-  failures) arrives free with #5.
+**Owns:** the durable task contract: goal, constraints, acceptance criteria,
+plan, current step, completion state, and the user's ability to correct them.
 
-### 2. Goal & task state — **0**
-The anchor against drift: what are we doing and why.
+- **Evidence now:** the request exists only in conversation history. The
+  wrap-up nudge asks the model to reconsider the goal, but stores no task
+  state.
+- **Material gap:** there is no inspectable goal, definition of done, progress
+  ledger, or harness stop condition beyond “the model returned text.” P1 adds
+  goal and steps, but should also preserve constraints and acceptance evidence.
+- **Level 3 bar:** task state survives compaction, process restart, and client
+  reconnect; the user can edit it; completion links every acceptance criterion
+  to a result or an explicit waiver.
 
-- **Have:** nothing. The objective exists only as conversation history.
-- **World-class:** goal + plan persist across turns, compaction, crashes,
-  and resumes; the model always answers "current objective"; user can
-  inspect/correct it any time; status visible at a glance.
-- **To close:** `PLAN.md` Phase 1. Biggest single quality lever in the repo.
+### 2. Turn orchestration & stop semantics — **2**
 
-### 3. Context engineering — **1**
-What the model sees, when, and at what token price.
+**Owns:** model/tool iteration, event ordering, budgets, deadlines,
+cancellation, backpressure, and clean terminal outcomes.
 
-- **Have:** summarization compaction (tool-pair safe), usage-driven
-  triggering, AGENTS.md injection, skills, `chain` tool that keeps
-  intermediate output out of context, opt-in tool cache.
-- **World-class:** dynamic working set over a static transcript — relevant
-  files, recent changes, git state, failures, and decisions selected per
-  turn; compaction preserves orientation facts; token spend proportional to
-  task complexity, not session age.
-- **To close:** `PLAN.md` Phases 0 and 3 (state restore, turn-start
-  snapshot, compaction preserves goal). Later: retrieval beyond grep,
-  recently-changed-file awareness.
+- **Evidence now:** `agent/loop.rs` provides iteration, prompt-token, and
+  elapsed-time limits; streaming model calls; tool dispatch; a wrap-up nudge;
+  and cancellation polling. The daemon permits one active turn per session and
+  emits terminal SSE events.
+- **Material gap:** the turn deadline is checked between model rounds, not
+  across every blocking boundary. Approval waits and retry sleeps have no
+  shared deadline; an SSE disconnect does not define cancel-or-continue and
+  reattach behavior. A mixed batch is wholly serialized when any call mutates.
+- **Level 3 bar:** one deadline and cancellation contract covers provider
+  calls, retries, approvals, tools, and event delivery; disconnects and panics
+  end in a deterministic terminal state; chaos tests prove no wedged turn.
 
-### 4. Repository understanding — **1**
-Knowing the codebase shape without being told.
+### 3. Failure recovery & re-planning — **1**
 
-- **Have:** project instruction files (AGENTS.md/CLAUDE.md), grep/find/git
-  tools, workflow discipline in the system prompt.
-- **World-class:** harness-level map of the repo — language/toolchain
-  detection, test/build commands, module layout, conventions — built once,
-  refreshed on change, injected instead of re-explored every session.
-- **To close:** start with toolchain + verify-command detection (feeds #8).
-  Repo map is Tier 3; `chain` covers most retrieval until then.
+**Owns:** recognizing that an approach is failing, changing strategy, and
+escalating to the user instead of looping.
 
-### 5. Failure recovery & re-planning — **1**
-What happens when the model is wrong, repeatedly.
-
-- **Have:** identical-call blocking, wrap-up nudge, explicit compaction
-  failure, HTTP retry/backoff, useful budget-exhaustion message.
-- **World-class:** failure patterns are detected (same file, unchanged test
-  failure, endless search) and trigger staged strategy escalation; a
-  re-plan is proposed to the user, not improvised silently.
-- **To close:** `PLAN.md` Phase 4 (failure ledger + escalation nudges).
-
-### 6. Memory (within & across sessions) — **1**
-What survives beyond the current turn.
-
-- **Have:** append-only JSONL sessions, resume, durable `/clear`, session
-  naming. (Slash state persists but is never restored — `PLAN.md` Phase 0.)
-- **World-class:** decisions and discovered facts survive compaction;
-  optional cross-session project memory ("we use pnpm, tests via just")
-  with user-visible, user-editable storage; nothing remembered silently.
-- **To close:** Phase 0 first. Cross-session memory is a deliberate product
-  decision — not started, not urgent.
+- **Evidence now:** provider retry/backoff, structured tool failures, malformed
+  call handling, repeated-successful-call blocking, and the late wrap-up nudge.
+- **Material gap:** the harness does not detect repeated failed calls, unchanged
+  failures, edit churn, search loops, or lack of progress. It has no staged
+  re-plan or failure ledger.
+- **Level 3 bar:** deterministic failure signatures trigger bounded escalation;
+  recovery attempts are visible; scripted stuck-agent evals terminate with a
+  useful re-plan and preserved partial work.
 
 ---
 
-## Pillar B — Action
+## Pillar B — Knowledge
 
-### 7. Tool design & reliability — **2**
-The model's hands. Abstraction level and edge-case behavior.
+### 4. Instruction hierarchy & behavior policy — **1**
 
-- **Have:** paginated multi-file `read`, ripgrep `grep` with modes,
-  bounded `find`, exact-match `edit` with fuzzy fallback, `bash` with
-  timeout/output-cap/process-group kill, `git`, `chain` pipelines,
-  structured tool errors, malformed-call handling, metadata (read-only/
-  mutating) driving scheduling.
-- **World-class:** every tool validates at the trust boundary, fails with
-  messages that tell the model what to do instead, and never truncates
-  silently. Symbol-level navigation and diagnostics are enhancements, not
-  the bar.
-- **To close:** incremental. Add tools only when a concrete task class
-  fails without them.
+**Owns:** how system policy, project instructions, skills, user requests, and
+retrieved content are ordered, bounded, attributed, and inspected.
 
-### 8. Verification — **0**
-The difference between "implemented" and "works".
+- **Evidence now:** `llm/prompt.rs` builds a static system prompt, injects the
+  first `AGENTS.md`/`CLAUDE.md` found while walking upward, and advertises
+  discovered skill names/descriptions.
+- **Material gap:** precedence and provenance are implicit; project instruction
+  size is unbounded; there is no effective-prompt inspection or explicit
+  instruction/data boundary. The active remote TUI cannot load a skill body
+  with `/skill:<name>`, although the prompt advertises it.
+- **Level 3 bar:** deterministic precedence, source labels, token budgets, and
+  policy tests cover conflicting and malicious repository instructions; users
+  can inspect exactly which instructions affected a turn.
 
-- **Have:** a system-prompt request that the model verify itself. Nothing
-  harness-side.
-- **World-class:** every mutation triggers relevant verification
-  (build/test/lint), results become first-class observations, verification
-  status is visible in the UX, and "done" means verified.
-- **To close:** `PLAN.md` Phase 2 (explicit `verify_command` first, toolchain
-  detection later).
+### 5. Context lifecycle — **1**
 
-### 9. Parallelism & delegation — **1**
-Doing independent work at once without corruption.
+**Owns:** selecting, ordering, compressing, invalidating, and restoring what the
+model sees at each call.
 
-- **Have:** parallel read-only tool batches, serialized mutations with
-  path-conflict detection, global mutation lock.
-- **World-class:** controlled subagents for separable work (explore,
-  mass-refactor) with result synthesis in the main loop; safe because the
-  single-agent loop underneath is already excellent.
-- **To close:** deliberately deferred (see `PLAN.md`). Correct call — a bad
-  multi-agent system is worse than none.
+- **Evidence now:** full session replay, usage/estimate-driven summarization,
+  recent tool-call/result pair protection, output caps, and bounded read/search
+  tools. Shell stitching can keep deliberately discarded intermediate output
+  outside the transcript.
+- **Material gap:** context is still a mostly static transcript. There is no
+  per-turn working set of relevant files, decisions, failures, or recent
+  changes; summaries have no factual invariant beyond a prompt; compaction and
+  incremental-session recovery are not tested together end to end.
+- **Level 3 bar:** a provenance-bearing context manifest is rebuilt per turn,
+  stale facts are invalidated, required task facts survive compaction, and evals
+  track answer quality and tokens as sessions grow.
 
----
+### 6. Repository & environment intelligence — **1**
 
-## Pillar C — Trust
+**Owns:** the project map and execution environment: languages, toolchains,
+modules, conventions, dependency shape, build/test commands, and change-aware
+refresh.
 
-### 10. Safety, permissions & audit — **2**
-The harness is running arbitrary code against arbitrary repos.
+- **Evidence now:** project instruction discovery; `read`, `grep`, `find`, and
+  read-only `git`; plus branch/dirty state in the UI. The model discovers the
+  rest manually.
+- **Material gap:** no cached repo map, toolchain or package-manager detection,
+  verification-command discovery, symbol/diagnostic index, or environment
+  readiness check. The workspace is simply the daemon process's current
+  directory.
+- **Level 3 bar:** a small inspectable map is built once, invalidated by actual
+  changes, and supplies correct build/test commands and navigation with less
+  re-exploration than the baseline.
 
-- **Have:** workspace confinement, four permission modes (read-only /
-  ask-writes / ask-shell / trusted), per-session approval memory, remote
-  approval flow, audit logging of commands, mutations, approvals, failures.
-- **World-class:** the same, plus diffs shown *before* approval, and
-  policy-as-config for teams (allowlists per path/tool).
-- **To close:** small. Pre-approval diff preview is the one visible gap.
+### 7. Memory & session continuity — **1**
 
-### 11. Persistence & crash recovery — **2**
-A crash must never lose completed work or corrupt state.
+**Owns:** what conversation, task, decision, and preference state survives
+turns, compaction, reconnects, and new processes.
 
-- **Have:** append-only JSONL, incremental event writes, crash loses at most
-  the in-flight operation, durable `/clear`, session versioning and
-  validation, malformed-line tolerance, resume by index/path.
-- **World-class:** this. Any further work belongs to #6 (memory), not
-  durability.
-- **To close:** maintenance only.
-
----
-
-## Pillar D — Interface
-
-### 12. Terminal UX — **2**
-Agent cognition made inspectable without noise.
-
-- **Have:** streaming markdown + syntax highlight, per-tool summaries with
-  previews and durations, usage in status bar, approval cards, spinner,
-  steering/follow-up queue, mouse/scroll, clean terminal restore on
-  panic/cancel.
-- **World-class:** user sees intent, progress, verification status —
-  never raw chain-of-thought. Goal/plan line, verify ✓/✗, cost per turn.
-- **To close:** rides along with `PLAN.md` Phases 1–3 (plan row, verify
-  line, snapshot).
-
-### 13. Non-interactive & CI use — **2**
-Same agent, scriptable.
-
-- **Have:** one-shot prompt mode, raw JSON tool mode, trusted
-  non-interactive approval policy, stdin-terminal guard on approvals,
-  exit codes from shell errors.
-- **World-class:** stable machine-readable output contract, pipeline
-  composition (`oye "fix" | verify`), headless daemon already exists.
-- **To close:** define the output contract once, document it.
-
-### 14. Extensibility — **1**
-Letting users teach the harness without forking it.
-
-- **Have:** skills (SKILL.md discovery, dedup, on-demand load, persisted in
-  session), deterministic discovery.
-- **World-class:** hooks (pre/post tool, post turn) so users add policy and
-  automation; MCP or a custom-tool seam so external tools join the runtime;
-  skills stay the low-effort path.
-- **To close:** not in `PLAN.md` yet. Hooks first (they also serve #10 and
-  #8); MCP when a concrete integration demands it.
+- **Evidence now:** append-only session files and replay exist; local one-shot
+  mode can continue a supplied session path; state, clear, and rename record
+  types exist.
+- **Material gap:** the default daemon keeps its session registry only in
+  memory, always creates a new TUI session, and cannot attach to a persisted
+  session after restart. `/resume`, `/name`, `/provider`, and `/skill` are not
+  supported by the active remote path. `session_state` is written but never
+  restored. There is no explicit project memory.
+- **Level 3 bar:** all active paths restore the same task/model/skill/session
+  state after restart; remembered facts are user-visible, editable, scoped,
+  attributable, and removable.
 
 ---
 
-## Pillar E — Platform
+## Pillar C — Action
 
-### 15. Model independence — **2**
-The model is replaceable; the harness carries the intelligence.
+### 8. Tool protocol & reliability — **2**
 
-- **Have:** `ModelClient` trait, Chat Completions + Responses wire
-  protocols, streaming parsers with fixtures for both, provider auth
-  (OpenCode, Codex/ChatGPT), retry/backoff, provider debug log,
-  thinking-effort config.
-- **World-class:** capabilities and limits come from data, not guesses;
-  per-model tool-format and reasoning quirks normalized in one place;
-  switching models never changes harness behavior.
-- **To close:** `PLAN.md` Phase 5 (static capability table feeding
-  compaction). Normalization grows on demand.
+**Owns:** model-facing schemas, argument validation, result/error contracts,
+timeouts, output shaping, cancellation, and truthful side-effect metadata.
 
-### 16. Observability & cost — **1**
-Debugging the agent and knowing what it spends.
+- **Evidence now:** bounded `read`, `grep`, `find`, `git`, and `chain`; `bash`
+  with timeout/output capture/process-group kill; exact/fuzzy `edit`; `write`;
+  structured internal errors; malformed-call handling; and read/mutate/
+  permission metadata. Independent read-only calls can execute concurrently.
+- **Material gap:** truncation and fan-out limits are not consistently
+  machine-readable, the search stack assumes host Unix tools, and metadata is
+  not yet a proved side-effect contract. Symbol navigation or diagnostics
+  should be added only for demonstrated task failures.
+- **Level 3 bar:** contract/property tests cover every argument, truncation,
+  cancellation, and side-effect claim; failures always prescribe a valid next
+  action; no result is silently incomplete.
 
-- **Have:** per-call usage in status bar, provider log for API issues,
-  audit log for actions.
-- **World-class:** one structured trace per turn (calls, tools, tokens,
-  cost, timing) that answers "why did it do that" and "what did this task
-  cost" without config.
-- **To close:** not in `PLAN.md` yet. Cheap version: extend the existing
-  provider log into a per-turn JSON trace file.
+### 9. Change control & artifact integrity — **1**
 
-### 17. Performance & token efficiency — **2**
-Speed and spend per completed task.
+**Owns:** preserving user work while applying, reviewing, grouping, reverting,
+and handing off agent changes.
 
-- **Have:** `chain` stitching (intermediate output free), batching
-  discipline in prompt, output caps, parallel reads, cache-by-fingerprint
-  (opt-in), usage-driven compaction.
-- **World-class:** token cost per task trends down over time; caching safe
-  by default; latency dominated by model, not harness (already true —
-  blocking reqwest is fine at this scale).
-- **To close:** measure first (needs #16), then optimize what the trace
-  shows.
+- **Evidence now:** unique-match edits, workspace path checks for file tools,
+  serialized mutation batches, and read-only git status/diff inspection.
+- **Material gap:** writes are not transactional or guarded by an expected file
+  version; there is no before/after hash ledger, patch preview before approval,
+  baseline separating pre-existing changes, checkpoint/undo, rollback, or
+  enforced final diff review. Shell mutations bypass file-level accounting.
+- **Level 3 bar:** every mutation belongs to a reviewable change set with
+  preconditions and before/after evidence; concurrent user edits are never
+  overwritten silently; cancellation can reconcile or roll back partial work.
 
-### 18. Quality measurement (evals) — **1**
-Knowing changes make the agent better, not just different.
+### 10. Verification & completion evidence — **0**
 
-- **Have:** strong unit/integration suite for *infrastructure* (parsers,
-  tools, loop with mock model, permissions, recovery) — zero regressions in
-  mechanics. No measurement of *agent behavior*.
-- **World-class:** a small fixed task suite (seeded repos, scripted mock
-  models for determinism + a handful of live-model smoke tasks) run on every
-  change to loop/prompt/tool behavior, with pass rate and token cost
-  tracked.
-- **To close:** not in `PLAN.md` yet. Start tiny: 5 tasks, 1 script. Without
-  this, prompt and nudge changes (#2, #5) are unreviewable.
+**Owns:** deciding which checks are relevant, running them after changes,
+feeding failures back, and defining “done.”
 
-### 19. Long-running autonomy — **0**
-Hours-scale work without babysitting.
+- **Evidence now:** only the system prompt asks the model to run checks and
+  inspect the diff. The harness neither triggers nor records verification.
+- **Material gap:** no dirty-state verification hook, command detection,
+  pass/fail event, result artifact, completion gate, or explicit “not
+  applicable/waived” state.
+- **Level 3 bar:** every change has a verification disposition; relevant
+  build/test/lint/diagnostic checks run against the final state; failures return
+  to the loop; the final response links claims to recorded results.
 
-- **Have:** nothing turn-scoped beyond budgets; remote daemon is the seed
-  (an agent that outlives its terminal).
-- **World-class:** durable task queue, progress resumable across restarts,
-  periodic verification, user check-ins instead of silent drift — all
-  built on #2, #5, #8 being solid first.
-- **To close:** intentionally last. Every prerequisite is on this board.
+### 11. Parallelism & delegation — **1**
 
-### 20. Remote & collaboration — **2**
-The agent is not chained to one terminal.
+**Owns:** dependency-aware concurrent work, conflict isolation, subtask budgets,
+and synthesis.
 
-- **Have:** daemon/client split over HTTP+SSE, `oye connect` to attach a
-  TUI anywhere, server-side approval parking, remote cancellation, headless
-  `serve`.
-- **World-class:** this, plus multiple clients on one daemon and session
-  sharing. Rare among harnesses; protect this differentiator while building
-  the rest.
-- **To close:** multi-client only if a real user appears.
+- **Evidence now:** independent read-only calls in one model response run in
+  parallel. Mutating batches are serialized under a process-global lock, and
+  separate daemon sessions may run concurrently.
+- **Material gap:** no dependency DAG or normalized path locking; any mutation
+  serializes its whole batch; there are no subagents, worktrees, delegated
+  budgets, result contracts, or merge/review step.
+- **Level 3 bar:** separable subtasks show lower wall time without reducing eval
+  pass rate; each worker is isolated, budgeted, cancellable, and merged through
+  the same verification and change-control gates.
 
 ---
 
-## How to use this board
+## Pillar D — Trust
 
-- **Read the table** for health: anything at 0 or 1 under Cognition/Action
-  is where agent quality is actually lost today.
-- **`PLAN.md`** owns the what-next; this file owns the what-exists and
-  what-world-class-means.
-- **When an area reaches 3**, write down the bar it met — that becomes the
-  regression standard (feeds #18).
-- Re-score after each `PLAN.md` phase lands. Levels drop on drift, too:
-  infrastructure rot (#7, #10, #11) is how harnesses die quietly.
+### 12. Authorization, approvals & audit — **1**
+
+**Owns:** who may request an effect, what may be done, approval scope and
+expiry, policy enforcement, and an attributable decision record.
+
+- **Evidence now:** four permission modes, TUI allow-once/allow-session/deny,
+  daemon-side approval parking, and a best-effort tool execution audit log.
+- **Material gap:** the client request can override the daemon permission mode,
+  including to `trusted`; session approval is remembered by tool name, so one
+  approval can authorize unrelated future shell commands; approvals have no
+  computed diff or policy rules. Approval decisions/denials and caller identity
+  are not in the audit log.
+- **Level 3 bar:** the daemon owns a non-bypassable permission ceiling; clients
+  may only request equal or stricter policy unless authorized; approvals are
+  scoped to concrete paths/commands/diffs with expiry; every decision has an
+  actor and tamper-evident record.
+
+### 13. Isolation & resource containment — **1**
+
+**Owns:** the blast radius of tools across filesystem, process, network,
+environment, CPU, memory, disk, and time.
+
+- **Evidence now:** direct file tools canonicalize paths and reject symlink
+  escapes; shell output/time are bounded and descendants are killed as a Unix
+  process group; `chain` rejects mutating tools.
+- **Material gap:** `bash` runs as the daemon user with inherited environment
+  and unrestricted filesystem, process, and network access. Starting in the
+  workspace is not workspace confinement. There are no CPU, memory, disk, PID,
+  or egress limits.
+- **Level 3 bar:** untrusted turns execute in a tested sandbox with explicit
+  mounts, environment allowlists, network policy, quotas, and reliable process
+  teardown; trusted escape hatches are conspicuous and auditable.
+
+### 14. Secrets, privacy & remote access security — **0**
+
+**Owns:** daemon authentication, transport security, credential boundaries,
+redaction, data retention, provider egress, and session ownership.
+
+- **Evidence now:** provider credentials can come from environment/config,
+  Responses requests set `store: false`, tool caching is opt-in, and binding to
+  all interfaces prints a warning.
+- **Material gap — release blocker for remote use:** the HTTP daemon has no
+  authentication or TLS. An unauthenticated chat request can override both
+  `base_url` and permission, combining daemon credential exposure risk with
+  trusted shell execution. Sessions, tool arguments, write contents, and
+  provider error bodies are stored in plaintext logs without redaction,
+  retention policy, or explicit restrictive file modes.
+- **Level 3 bar:** authenticated principals and session ownership are enforced;
+  provider endpoints and permission ceilings are server policy; remote traffic
+  uses a trusted secure channel; secrets never enter prompts/logs by default;
+  retention/export/delete behavior is testable.
+
+### 15. Durability & effect recovery — **1**
+
+**Owns:** reconstructing conversation and side-effect state after crashes,
+partial writes, disconnects, and retries without duplicating effects.
+
+- **Evidence now:** versioned append-only JSONL, incremental message appends,
+  malformed-line tolerance, clear markers, and one active turn per session.
+- **Material gap:** daemon turns record `turn_start` but not durable
+  `turn_complete`/`turn_failed`; the daemon registry is not rebuilt; persistence
+  errors are commonly ignored. A mutation can complete before its tool call and
+  result are durably recorded, so restart cannot distinguish not-started,
+  completed, and unknown effects. Approval and compaction recovery invariants
+  are untested.
+- **Level 3 bar:** intent, approval, effect start, result, and final artifact
+  hashes form a recoverable journal; restart reconciles unknown effects and
+  cannot repeat a non-idempotent action silently; session migrations and
+  corruption recovery are tested.
+
+---
+
+## Pillar E — Interface
+
+### 16. Interactive UX & human control — **2**
+
+**Owns:** showing intent, progress, actions, approvals, outcomes, and giving the
+user timely steer/cancel/correct controls without exposing hidden reasoning.
+
+- **Evidence now:** streaming markdown TUI, tool summaries/previews/durations,
+  live usage, approval overlay, cancellation, scroll/history/autocomplete,
+  branch/dirty status, and terminal cleanup.
+- **Material gap:** the active daemon path does not wire mid-turn steering or
+  follow-ups—`process_turn` receives no steering channel and Enter is ignored
+  while busy—despite dormant fields and documentation claiming otherwise.
+  Goal/plan and verification state are absent, and several slash commands are
+  rejected remotely.
+- **Level 3 bar:** the UI truthfully shows task/step, current action, queued
+  input, change set, and verification; reconnect preserves control; all help
+  text is exercised against the active path; accessibility is keyboard-complete
+  and does not depend on color alone.
+
+### 17. Automation & protocol contracts — **1**
+
+**Owns:** headless use, stable machine I/O, exit semantics, event schemas,
+reconnect/replay, and CI integration.
+
+- **Evidence now:** local one-shot prompting, JSON-lines raw tool mode,
+  one-shot `run <tool>`, and daemon HTTP/SSE with health, chat, approval, and
+  cancel endpoints.
+- **Material gap:** no versioned public API or final-result JSON contract;
+  events have no sequence/replay mechanism; clients cannot reattach to a
+  persisted session; disconnect behavior and idempotency are undefined. CI
+  cannot consume a structured task/change/verification result.
+- **Level 3 bar:** a versioned protocol has compatibility tests, deterministic
+  exit codes, resumable event streams, idempotency keys, and one structured
+  final record containing outcome, changes, checks, usage, and unresolved work.
+
+### 18. Extensibility & integrations — **1**
+
+**Owns:** adding instructions, policies, lifecycle automation, tools, and
+external systems without forking the harness.
+
+- **Evidence now:** deterministic skill discovery with frontmatter metadata and
+  configurable skill directories.
+- **Material gap:** skill bodies cannot be loaded on demand through the default
+  daemon/TUI path. There are no pre/post-tool or post-turn hooks, custom-tool
+  registration, MCP seam, extension capability declarations, or extension
+  isolation/versioning.
+- **Level 3 bar:** a small versioned extension contract covers lifecycle,
+  permissions, cancellation, errors, and testing; external tools cannot bypass
+  authorization or observability; plain `SKILL.md` remains the zero-code path.
+
+---
+
+## Pillar F — Platform
+
+### 19. Model/provider portability — **2**
+
+**Owns:** wire adaptation, capabilities, authentication, streaming/tool-call
+normalization, limits, retries, fallback, and model switching.
+
+- **Evidence now:** a `ModelClient` boundary, Chat Completions and Responses
+  translators/readers, OpenCode and Codex credential paths, streaming,
+  retry/backoff, usage extraction, and configurable reasoning effort.
+- **Material gap:** capability discovery hardcodes streaming/tools support;
+  context limits and model quirks are manual; provider coverage remains
+  OpenAI-shaped; retry pacing ignores provider hints and has no cancellable
+  sleep or fallback policy.
+- **Level 3 bar:** data-backed capabilities and conformance fixtures normalize
+  supported providers; switching models preserves harness semantics; fallback
+  is explicit, bounded, and measured rather than silently changing behavior.
+
+### 20. Observability, usage & cost — **1**
+
+**Owns:** correlated traces for model calls, tools, approvals, tokens, latency,
+cost, failures, and final outcomes—without recording chain-of-thought or
+secrets.
+
+- **Evidence now:** live prompt-token usage, tool durations in the UI, a tool
+  audit JSONL, and provider error JSONL.
+- **Material gap:** no turn/task correlation trace, completion-token or monetary
+  cost accounting, cache/retry metrics, redaction, log rotation, or queryable
+  outcome view. Current logs cannot reliably answer what one task cost or why
+  it failed.
+- **Level 3 bar:** redacted spans share task/turn/call IDs and record timing,
+  usage, price, approvals, effects, checks, and outcome; budgets and regressions
+  are visible without reconstructing raw logs.
+
+### 21. Performance & token economy — **2**
+
+**Owns:** latency, model round trips, prompt/tool-output size, cache correctness,
+resource use, and cost per successful task.
+
+- **Evidence now:** batched read guidance, concurrent read-only calls, bounded
+  fan-out, `chain` to reduce model round trips, `$DEX_BIN` shell-side
+  distillation, output clamps, summarization, and opt-in tool caching.
+- **Material gap:** there is no task-level benchmark, so improvements are not
+  tied to success rate, latency, or cost. Context selection is transcript-based,
+  compaction costs another model call, and cache correctness is not strong
+  enough to enable by default for all searches.
+- **Level 3 bar:** fixed evals report p50/p95 latency, calls, tokens, and cost per
+  successful task; optimizations must preserve quality and correctness; cache
+  invalidation is proved before default enablement.
+
+### 22. Quality evaluation — **1**
+
+**Owns:** proving that prompt, context, tool, loop, safety, and UX changes make
+real tasks better rather than merely different.
+
+- **Evidence now:** CI runs formatting, unit tests, Clippy, and dependency
+  audit. In-crate tests cover useful mechanics, especially tools and rendering.
+- **Material gap:** there is no seeded coding-task suite, behavioral harness
+  test across daemon/API/session recovery, live-model smoke set, safety/adversary
+  suite, or tracked quality/cost baseline. The declared `network-tests` feature
+  currently adds no tests, and infrastructure tests do not measure agent
+  success.
+- **Level 3 bar:** deterministic scenarios plus a small live-model set gate
+  relevant changes on task success, safety, latency, and cost; failures retain
+  replayable traces and accepted score changes are explicit.
+
+---
+
+## Pillar G — Operations
+
+### 23. Operations, configuration & compatibility — **1**
+
+**Owns:** startup/shutdown, readiness, config validation, deployment, quotas,
+upgrades, protocol/session migration, supportability, and platform scope.
+
+- **Evidence now:** JSON/environment configuration, a health endpoint,
+  startup readiness polling, localhost-by-default binding, configurable limits,
+  and CI.
+- **Material gap:** no authenticated deployment profile, graceful daemon
+  lifecycle, config schema/version, API compatibility policy, session migration
+  path, log retention, per-user/turn quotas, or restart reconstruction. Unix
+  process-group behavior is assumed rather than declared as a platform limit.
+- **Level 3 bar:** validated configuration and safe defaults fail closed;
+  supervised restart preserves supported sessions; upgrades pass protocol and
+  migration tests; health, capacity, and resource limits are observable.
+
+### 24. Remote use & collaboration — **1**
+
+**Owns:** operating away from the workspace host and, separately, sharing
+sessions, control, and review among people.
+
+- **Evidence now:** daemon/client separation over HTTP+SSE, remote streaming,
+  approvals, cancellation, and multiple independent daemon sessions.
+- **Material gap:** remote use is blocked on #12–#14. There is no persisted
+  attach/replay, user identity, ownership, shared-session concurrency model,
+  handoff, review link, or multi-client control of one session. Transport alone
+  is not collaboration.
+- **Level 3 bar:** authenticated users can discover and reattach to owned/shared
+  sessions, replay missed events, transfer control, and review the same change
+  and verification record without races.
+
+### 25. Long-running autonomy — **0**
+
+**Owns:** durable queued work lasting hours or restarts, bounded unattended
+execution, checkpoints, verification cadence, and user check-ins.
+
+- **Evidence now:** only per-turn budgets and a daemon process; there is no
+  durable task scheduler or resumable autonomous workflow.
+- **Material gap:** no queue, leases, checkpoint policy, restart continuation,
+  unattended approval policy, progress heartbeat, or spend/resource budget.
+  Building this before #1, #3, #10, and #12–#15 would amplify drift and risk.
+- **Level 3 bar:** restartable tasks make monotonic, verified progress under
+  explicit time/cost/effect budgets; risky boundaries pause for a user; stalled
+  tasks stop and report rather than improvising indefinitely.
+
+---
+
+## Cross-cutting release gates
+
+1. **Remote gate:** #12 authorization, #13 containment, and #14 remote security
+   must be solid before non-local daemon use is presented as safe.
+2. **Correctness gate:** #1 task acceptance, #9 change integrity, and #10
+   verification define whether “done” means anything.
+3. **Recovery gate:** #7 continuity and #15 effect recovery must precede
+   unattended or reconnectable work.
+4. **Scale gate:** #11 delegation and #25 autonomy require the same permission,
+   verification, trace, and recovery guarantees as the single-agent path.
+5. **Improvement gate:** #20 traces and #22 evals must exist before adaptive
+   context, recovery nudges, or performance work can claim a quality gain.
+
+## Maintaining this map
+
+- Cite active code and an acceptance check when raising a score.
+- Re-score after each `PLAN.md` phase and whenever the default execution path
+  changes.
+- Record path-specific differences instead of crediting one implementation to
+  every interface.
+- Lower scores when guarantees drift; a feature that exists but is no longer
+  wired, secure, or tested is not mature.

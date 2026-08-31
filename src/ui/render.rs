@@ -784,7 +784,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn test_app() -> super::super::App {
-        let cwd = "/tmp/oye-ui-test".to_string();
+        let cwd = "/tmp/dex-ui-test".to_string();
         super::super::App {
             transcript: vec![super::super::TranscriptBlock::Assistant(vec![
                 super::super::indent_transcript_line(Line::from(

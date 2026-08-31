@@ -1,6 +1,6 @@
-# oye
+# dex
 
-A terminal-based coding agent written in Rust. `oye` talks to OpenAI-compatible
+A terminal-based coding agent written in Rust. `dex` talks to OpenAI-compatible
 Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`, `grep`,
 `find`) to operate on your local files, and offers an interactive TUI, a
 one-shot prompt mode, and a raw JSON tool mode. Conversations are persisted as
@@ -13,7 +13,7 @@ sessions and can be resumed.
   automatic retries with exponential backoff, and configurable reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write
   and edit files, search the filesystem, and inspect git status/diffs. Tool
-  output caching is disabled by default; set `OYE_TOOL_CACHE=1` to opt in.
+  output caching is disabled by default; set `DEX_TOOL_CACHE=1` to opt in.
 - **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript
   (via `ratatui-markdown`), a custom multi-line input editor with an inline
   block cursor and soft-wrapping (no `tui-textarea` underline / horizontal
@@ -35,22 +35,22 @@ Requires a Rust toolchain (edition 2021):
 
 ```sh
 cargo build --release
-# binary: target/release/oye
+# binary: target/release/dex
 ```
 
 ## Configuration
 
 Configuration is read from a JSON file. The path is resolved in this order:
 
-1. `$OYE_CONFIG` (if set)
-2. `$XDG_CONFIG_HOME/oye/config.json`
-3. `~/.config/oye/config.json`
+1. `$DEX_CONFIG` (if set)
+2. `$XDG_CONFIG_HOME/dex/config.json`
+3. `~/.config/dex/config.json`
 
 Copy the sample to get started:
 
 ```sh
-mkdir -p ~/.config/oye
-cp config.sample.json ~/.config/oye/config.json
+mkdir -p ~/.config/dex
+cp config.sample.json ~/.config/dex/config.json
 ```
 
 `config.json` fields:
@@ -61,10 +61,10 @@ cp config.sample.json ~/.config/oye/config.json
 | `api_key`        | string   | Default API key (overridable by `OPENAI_API_KEY`).                 |
 | `base_url`       | string   | Default API base URL (overridable by `OPENAI_BASE_URL`).           |
 | `model`          | string   | Default model (overridable by `OPENAI_MODEL`).                     |
-| `models`         | string[] | Models shown by `/model` autocomplete (also configurable via `OYE_MODELS`, comma-separated). |
+| `models`         | string[] | Models shown by `/model` autocomplete (also configurable via `DEX_MODELS`, comma-separated). |
 | `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
 | `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
-| `context_window` | integer  | Token context window used for compaction/status (overridable by `OYE_CONTEXT_WINDOW`). |
+| `context_window` | integer  | Token context window used for compaction/status (overridable by `DEX_CONTEXT_WINDOW`). |
 | `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits. |
 | `http_connect_timeout_secs` / `http_request_timeout_secs` | integer | HTTP connection and request limits. |
 
@@ -81,7 +81,7 @@ For OpenCode, use its API key and endpoint. For ChatGPT-backed Codex, first run
 }
 ```
 
-When `provider` is `openai-codex`, `oye` reads the current access token and
+When `provider` is `openai-codex`, `dex` reads the current access token and
 account ID from `CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or
 `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`). Run `codex --login`
 again when the local token expires.
@@ -99,10 +99,10 @@ A minimal example:
 
 ## Usage
 
-Run `oye` with no arguments to launch the interactive TUI:
+Run `dex` with no arguments to launch the interactive TUI:
 
 ```sh
-oye
+dex
 ```
 
 Ask it to do something:
@@ -116,55 +116,55 @@ Ask it to do something:
 Pass a prompt as arguments to get a single answer (no TUI):
 
 ```sh
-oye "explain the Cargo.toml dependencies"
+dex "explain the Cargo.toml dependencies"
 ```
 
 ### Raw tool mode
 
-`oye --tool` reads JSON tool-invocation lines from stdin and prints JSON
+`dex --tool` reads JSON tool-invocation lines from stdin and prints JSON
 results. Useful for piping tool calls from another process:
 
 ```sh
-echo '{"name":"read","args":{"path":"Cargo.toml"}}' | oye --tool
-# => {"ok":"[package]\nname = \"oye\"\n..."}
+echo '{"name":"read","args":{"path":"Cargo.toml"}}' | dex --tool
+# => {"ok":"[package]\nname = \"dex\"\n..."}
 ```
 
 An empty line quits raw tool mode.
 
 ### One-shot tool mode
 
-`oye run <tool> <key>=<value>...` executes a single tool and prints the raw
+`dex run <tool> <key>=<value>...` executes a single tool and prints the raw
 result (errors go to stderr with exit code 1). Values that look like JSON
 numbers/booleans are coerced (`limit=5`, `replaceAll=true`); a single JSON
 object string is also accepted. Inside agent shell commands the binary is
-available as `$OYE_BIN`, so ONE bash call can stitch a whole read-only
+available as `$DEX_BIN`, so ONE bash call can stitch a whole read-only
 pipeline — search locally, read excerpts, print only the distilled result —
 while intermediate output never enters the conversation:
 
 ```sh
-"$OYE_BIN" run grep pattern=TODO output_mode=files | while IFS= read -r f; do
-  "$OYE_BIN" run read "path=$f" limit=3
+"$DEX_BIN" run grep pattern=TODO output_mode=files | while IFS= read -r f; do
+  "$DEX_BIN" run read "path=$f" limit=3
 done
 ```
 
 ### Client–server mode
 
 The TUI is a pure HTTP client; all agent work (LLM calls, tools, sessions)
-happens in a daemon. `oye` with no arguments starts a daemon in the
+happens in a daemon. `dex` with no arguments starts a daemon in the
 background and attaches the TUI to it:
 
 ```sh
-oye                     # daemon on a random localhost port + TUI
+dex                     # daemon on a random localhost port + TUI
 ```
 
 Run the daemon headless (e.g. on a remote machine, in the directory you want
 as the agent workspace) and connect the TUI from anywhere:
 
 ```sh
-oye serve               # daemon on 127.0.0.1:8420
-oye serve 0.0.0.0:8420  # reachable from other machines
-oye connect http://127.0.0.1:8420
-oye connect http://10.0.0.5:8420 "explain the Cargo.toml dependencies"  # one-shot
+dex serve               # daemon on 127.0.0.1:8420
+dex serve 0.0.0.0:8420  # reachable from other machines
+dex connect http://127.0.0.1:8420
+dex connect http://10.0.0.5:8420 "explain the Cargo.toml dependencies"  # one-shot
 ```
 
 The TUI behaves exactly like the local one: assistant text streams live,
@@ -195,9 +195,9 @@ workspace; `bash` can execute arbitrary commands in that workspace and should
 only be enabled in trusted environments. Shell commands default to 120
 seconds and 1 MiB per output stream. HTTP requests default to 10 seconds to
 connect and 300 seconds overall. Tool calls are recorded in
-`$XDG_DATA_HOME/oye/audit.jsonl` (or the equivalent path under
-`~/.local/share`). Configure limits with `OYE_TOOL_*`, `OYE_HTTP_*`, and
-`OYE_MAX_*` environment variables or the corresponding JSON config fields.
+`$XDG_DATA_HOME/dex/audit.jsonl` (or the equivalent path under
+`~/.local/share`). Configure limits with `DEX_TOOL_*`, `DEX_HTTP_*`, and
+`DEX_MAX_*` environment variables or the corresponding JSON config fields.
 
 In the interactive TUI, actions requiring approval open a dedicated overlay.
 Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`,
@@ -236,7 +236,7 @@ Any other arguments are treated as a one-shot prompt.
 
 ### Steering and follow-ups
 
-While `oye` is working, the input remains available. Submitted steering and
+While `dex` is working, the input remains available. Submitted steering and
 follow-up messages stay visible in the queue directly above the input box until
 the worker accepts them. Steering is delivered before the next model call;
 follow-ups wait until the current task has finished. The queue is kept separate
@@ -246,12 +246,12 @@ from the transcript so pending messages do not scroll away.
 
 Sessions are stored as JSONL files under:
 
-- `$XDG_DATA_HOME/oye/sessions` (or `~/.local/share/oye/sessions`),
+- `$XDG_DATA_HOME/dex/sessions` (or `~/.local/share/dex/sessions`),
 - organized in subdirectories by a slug of the current working directory.
 
 Each file starts with a `session` header line followed by `message` entries and
 optional `session_info` (rename) entries. Entries are appended after every
-turn, so a crash or Ctrl+C loses at most the in-progress turn. Starting `oye` in
+turn, so a crash or Ctrl+C loses at most the in-progress turn. Starting `dex` in
 a directory creates a fresh session; use `--session <path>` to continue a saved
 one.
 
@@ -259,9 +259,9 @@ one.
 
 Skills are discovered from these directories (first match wins per directory):
 
-- `<cwd>/.oye/skills`
+- `<cwd>/.dex/skills`
 - `<cwd>/.agents/skills`
-- `$XDG_CONFIG_HOME/oye/skills` (or `~/.config/oye/skills`)
+- `$XDG_CONFIG_HOME/dex/skills` (or `~/.config/dex/skills`)
 
 A skill is a directory containing a `SKILL.md` file with YAML frontmatter:
 
@@ -293,7 +293,7 @@ schema):
 | `find`  | Find file paths matching a pattern (`pattern`, `path`).          |
 
 Tool results are truncated before being sent back to the model, and a result
-cache (`oye-tool-cache.json`) is kept across runs to reduce redundant work.
+cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work.
 
 ## Environment variables
 
@@ -303,21 +303,21 @@ cache (`oye-tool-cache.json`) is kept across runs to reduce redundant work.
 | `OPENAI_BASE_URL`    | API base URL override (non-empty).                       |
 | `OPENAI_MODEL`       | Model override.                                          |
 | `OPENAI_API`         | Wire protocol override (`openai-completions` or `openai-responses`). |
-| `OYE_PROVIDER`        | Provider override (`opencode` or `openai-codex`).          |
+| `DEX_PROVIDER`        | Provider override (`opencode` or `openai-codex`).          |
 | `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |
 | `CODEX_ACCOUNT_ID`   | Account ID paired with `CODEX_ACCESS_TOKEN`.               |
-| `OYE_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
-| `OYE_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
-| `OYE_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
-| `OYE_CONFIG`    | Explicit path to `config.json`.                          |
+| `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
+| `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
+| `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
+| `DEX_CONFIG`    | Explicit path to `config.json`.                          |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
 
 ## Project structure
 
 ```
-oye/
-├── .oye/
+dex/
+├── .dex/
 │   └── skills/           # (optional) project-level agent skills
 ├── target/
 ├── Cargo.lock

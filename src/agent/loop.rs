@@ -34,7 +34,7 @@ pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<Stri
         PermissionMode::AskShell => name == "bash",
         PermissionMode::Trusted => false,
     };
-    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure OYE_PERMISSION", name))
+    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure DEX_PERMISSION", name))
 }
 
 pub(crate) fn approve_tool(
@@ -275,7 +275,7 @@ pub(crate) fn process_turn(
         if !within_budget(turn_deadline) {
             return Err(format!(
                 "turn exceeded the configured time limit ({} seconds); \
-                 raise OYE_MAX_TURN_SECONDS to allow longer turns",
+                 raise DEX_MAX_TURN_SECONDS to allow longer turns",
                 limits.elapsed_seconds
             )
             .into());

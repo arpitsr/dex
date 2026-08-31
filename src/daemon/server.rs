@@ -83,7 +83,7 @@ fn resolve_daemon_info() -> DaemonInfo {
                 .ok()
                 .or_else(|| file.as_ref().and_then(|f| f.model.clone()))
                 .unwrap_or_else(|| "unknown".to_string());
-            let provider_name = std::env::var("OYE_PROVIDER")
+            let provider_name = std::env::var("DEX_PROVIDER")
                 .ok()
                 .or_else(|| file.as_ref().and_then(|f| f.provider.clone()))
                 .unwrap_or_else(|| "opencode".to_string());

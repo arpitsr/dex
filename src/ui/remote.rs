@@ -80,7 +80,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
 pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std::io::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(std::io::Error::other(
-            "interactive UI requires a terminal (TTY); use `oye connect <url> \"prompt\"` for one-shot",
+            "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
         ));
     }
 

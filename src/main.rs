@@ -105,7 +105,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
 }
 
 fn run_interactive() {
-    eprintln!("oye raw tool mode");
+    eprintln!("dex raw tool mode");
     eprintln!("tools: read, bash, write, edit, grep, find, git");
     eprintln!("send JSON lines like: {{\"name\":\"read\",\"args\":{{\"path\":\"Cargo.toml\"}}}}");
     eprintln!("empty line quits");
@@ -226,7 +226,7 @@ fn main() {
             });
         }
         Mode::Connect { url } => {
-            // `oye connect <url>` opens the TUI; `oye connect <url> "prompt"`
+            // `dex connect <url>` opens the TUI; `dex connect <url> "prompt"`
             // runs a one-shot turn against the daemon.
             let prompt = args
                 .rest

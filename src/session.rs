@@ -83,11 +83,11 @@ pub(crate) struct Session {
 impl Session {
     fn session_dir() -> PathBuf {
         if let Some(dir) = env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(dir).join("oye/sessions");
+            return PathBuf::from(dir).join("dex/sessions");
         }
         env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".local/share/oye/sessions"))
-            .unwrap_or_else(|| PathBuf::from(".oye/sessions"))
+            .map(|h| PathBuf::from(h).join(".local/share/dex/sessions"))
+            .unwrap_or_else(|| PathBuf::from(".dex/sessions"))
     }
 
     fn cwd_slug(cwd: &str) -> String {
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn clear_marker_removes_messages_during_recovery() {
         let path =
-            std::env::temp_dir().join(format!("oye-session-test-{}.jsonl", std::process::id()));
+            std::env::temp_dir().join(format!("dex-session-test-{}.jsonl", std::process::id()));
         let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
         let message = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"old"}"#;
         let clear = r#"{"type":"clear","id":"2","timestamp":"2020-01-01T00:00:00Z"}"#;
