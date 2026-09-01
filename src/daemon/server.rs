@@ -468,7 +468,11 @@ fn run_agent_turn(
     drop(_guard);
 
     let terminal = match result {
-        Ok(Ok((response, usage))) => StreamEvent::TurnComplete { response, usage },
+        Ok(Ok((response, usage, cached))) => StreamEvent::TurnComplete {
+            response,
+            usage,
+            cached,
+        },
         Ok(Err(error)) => StreamEvent::TurnFailed { error },
         Err(_) => StreamEvent::TurnFailed {
             error: "turn panicked".to_string(),
@@ -513,7 +517,7 @@ fn run_turn_inner(
     req: &ChatRequest,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<StreamEnvelope>,
-) -> Result<(String, Option<u64>), String> {
+) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
         let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.get(session_id).cloned()
@@ -664,7 +668,9 @@ fn run_turn_inner(
                     },
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
-                    SinkLine::Usage(tokens) => StreamEvent::Usage { tokens },
+                    SinkLine::Usage { tokens, cached } => {
+                        StreamEvent::Usage { tokens, cached }
+                    }
                     SinkLine::Plan(plan) => StreamEvent::Plan {
                         goal: plan.goal,
                         steps: plan.steps,
@@ -742,6 +748,7 @@ fn run_turn_inner(
         &console,
     );
     let usage = tool_state.last_usage;
+    let cached = tool_state.last_cached;
     // Durable terminal marker (P8): a completed turn is recorded before the
     // event is relayed; a failed one gets `turn_failed` in run_agent_turn.
     match &turn_result {
@@ -754,7 +761,7 @@ fn run_turn_inner(
     }
     turn_result
         .map_err(|e| e.to_string())
-        .map(|response| (response, usage))
+        .map(|response| (response, usage, cached))
 }
 
 async fn approve(

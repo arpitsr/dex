@@ -66,6 +66,13 @@ pub(crate) struct ToolState {
     pub(crate) dirty: bool,
     /// Last API-reported prompt token count for the main conversation.
     pub(crate) last_usage: Option<u64>,
+    /// Provider-reported cached-token subset of the last call's prompt, when
+    /// the provider reports cache detail. Display-only.
+    pub(crate) last_cached: Option<u64>,
+    /// Session-cumulative prompt tokens across every LLM call, kept in the
+    /// TUI process (in-memory only, resets on restart). The status bar shows
+    /// `last_usage` as live context utilization and this as the spend figure.
+    pub(crate) total_usage: u64,
     pub(crate) verify_dirty: bool,
 }
 
