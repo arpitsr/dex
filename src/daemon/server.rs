@@ -644,6 +644,7 @@ fn run_turn_inner(
             while let Ok(sl) = sink_rx.recv() {
                 let event = match sl {
                     SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
+                    SinkLine::Thinking(text) => StreamEvent::Thinking(text),
                     SinkLine::ToolInput(preview) => {
                         let mut parts = preview.splitn(2, ' ');
                         let name = parts.next().unwrap_or_default().to_string();

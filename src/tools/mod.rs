@@ -4,6 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -16,6 +17,7 @@ use crate::core::format::clamp_lines;
 unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
+    fn setsid() -> i32;
 }
 
 const SIGKILL: i32 = 9;
@@ -307,14 +309,28 @@ fn run_bash_with_limits(
     max_bytes: usize,
     cancel: &dyn CancellationSource,
 ) -> Result<(String, Option<i32>), ToolError> {
-    let mut child = Command::new("sh")
+    let mut builder = Command::new("sh");
+    builder
         .arg("-c")
         .arg(command)
         .envs(tool_runner_env())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ToolError::Io)?;
+        .stderr(Stdio::piped());
+    // New session for the shell: drops the controlling tty, so tool children
+    // can never write to or race the user's terminal for input. Without this,
+    // a child that probes the terminal (e.g. `cargo test` running the theme
+    // tests → OSC 10/11 on /dev/tty) sends queries to the TUI's pts and races
+    // crossterm for the reply — the TUI can end up with half a color report
+    // typed into the composer.
+    // SAFETY: runs in the forked child before exec; it is not yet a process
+    // group leader, so setsid() succeeds.
+    unsafe {
+        builder.pre_exec(|| {
+            let _ = setsid();
+            Ok(())
+        });
+    }
+    let mut child = builder.spawn().map_err(ToolError::Io)?;
     // Put the shell in its own process group so cancellation/timeout does not
     // leave descendants running.
     unsafe {
@@ -1424,6 +1440,26 @@ mod tests {
             std::env::current_exe().unwrap().display().to_string()
         );
     }
+    #[test]
+    fn bash_children_have_no_controlling_tty() {
+        // A tool child must never share the user's terminal: a child that
+        // probes it (e.g. cargo test → theme query → OSC 10/11 on /dev/tty)
+        // would write to and race the TUI's crossterm for the same pts, and
+        // half a color report could end up typed into the composer.
+        let (output, code) = run_bash_with_limits(
+            "if cat </dev/tty >/dev/null 2>&1; then echo HAS_TTY; else echo NO_TTY; fi",
+            Duration::from_secs(5),
+            4096,
+            &GlobalCancellation,
+        )
+        .unwrap();
+        assert_eq!(code, Some(0));
+        assert!(
+            output.contains("NO_TTY"),
+            "tool child still has a controlling tty: {output}"
+        );
+    }
+
     #[test]
     fn metadata_classifies_tools() {
         assert!(metadata("read").unwrap().read_only);

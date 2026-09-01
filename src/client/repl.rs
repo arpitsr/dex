@@ -23,6 +23,7 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
             print!("{text}");
             io::stdout().flush().ok();
         }
+        StreamEvent::Thinking(_) => {}
         StreamEvent::ToolCall { name, .. } => {
             eprintln!("\n  > {name}...");
         }

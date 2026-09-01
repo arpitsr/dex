@@ -87,6 +87,16 @@ impl StreamPrinter {
     }
 }
 
+/// Reasoning delta under the provider-specific chat-completions key, as a
+/// string; non-string shapes (some providers send arrays) yield None.
+pub(crate) fn delta_thought(delta: &StreamDelta) -> Option<&str> {
+    delta
+        .reasoning
+        .as_ref()
+        .and_then(Value::as_str)
+        .or_else(|| delta.reasoning_content.as_ref().and_then(Value::as_str))
+}
+
 pub(crate) fn read_stream(
     response: reqwest::blocking::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
@@ -131,6 +141,11 @@ pub(crate) fn read_stream(
             usage_cached = usage.prompt_details.as_ref().map(|d| d.cached_tokens);
         }
         for choice in chunk.choices {
+            if let Some(text) = delta_thought(&choice.delta) {
+                if let Some(sink) = &sink {
+                    sink.send(SinkLine::Thinking(text.to_string())).ok();
+                }
+            }
             if let Some(text) = choice.delta.content {
                 content.push_str(&text);
                 // Print complete lines live; keep any partial tail buffered.
@@ -216,6 +231,13 @@ pub(crate) fn read_responses_stream(
             .and_then(Value::as_str)
             .unwrap_or_default();
         match event_type {
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    if let Some(sink) = &sink {
+                        sink.send(SinkLine::Thinking(delta.to_string())).ok();
+                    }
+                }
+            }
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     content.push_str(delta);
@@ -364,6 +386,21 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| matches!(l, SinkLine::Assistant(s) if s.contains("fn main"))));
+    }
+
+    #[test]
+    fn reasoning_deltas_extract_from_provider_specific_fields() {
+        let deepseek: StreamDelta =
+            serde_json::from_str(r#"{"reasoning_content":"step 1"}"#).unwrap();
+        assert_eq!(delta_thought(&deepseek), Some("step 1"));
+        let openrouter: StreamDelta =
+            serde_json::from_str(r#"{"reasoning":"step 2"}"#).unwrap();
+        assert_eq!(delta_thought(&openrouter), Some("step 2"));
+        // Non-string shapes must not kill the chunk parse or yield text.
+        let array: StreamDelta = serde_json::from_str(r#"{"reasoning":[{"a":1}]}"#).unwrap();
+        assert_eq!(delta_thought(&array), None);
+        let plain: StreamDelta = serde_json::from_str(r#"{"content":"hi"}"#).unwrap();
+        assert_eq!(delta_thought(&plain), None);
     }
 
     /// Chat-completions nests cached tokens under `prompt_tokens_details`; a

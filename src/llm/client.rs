@@ -211,7 +211,7 @@ pub(crate) fn call_responses(
         body["tools"] = json!(responses_tools());
     }
     if let Some(effort) = &config.thinking_effort {
-        body["reasoning"] = json!({ "effort": effort });
+        body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
     }
     let resp = post_with_retry(
         config,
