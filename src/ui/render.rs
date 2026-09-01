@@ -341,21 +341,24 @@ struct TranscriptView;
 impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let visible = area.height as usize;
-        let mut display: Vec<Line<'static>> = Vec::new();
-        for (idx, block) in app.transcript.iter().enumerate() {
-            if idx > 0 {
-                // Single canonical gutter between any two semantic blocks.
-                display.push(Line::default());
+        // ponytail: cache wrapped display — scroll alone shouldn't re-wrap O(N)
+        let cache_valid = app.display_cache_width == area.width
+            && app.display_cache_version == app.transcript_version;
+        if !cache_valid {
+            let mut display: Vec<Line<'static>> = Vec::new();
+            for (idx, block) in app.transcript.iter().enumerate() {
+                if idx > 0 {
+                    display.push(Line::default());
+                }
+                for line in block.lines() {
+                    display.extend(wrap_line_display(line, area.width));
+                }
             }
-            for line in block.lines() {
-                display.extend(wrap_line_display(line, area.width));
-                // User block lines carry a background; the wrapping routine
-                // fills the remainder of the row with that background. As
-                // with the pre-block transcript (`Line::from(edge_pad)`), the
-                // visual result is one row per logical line, no extra wraps.
-            }
+            app.display_cache = display;
+            app.display_cache_width = area.width;
+            app.display_cache_version = app.transcript_version;
         }
-        let total = display.len();
+        let total = app.display_cache.len();
         let max_scroll = (total.saturating_sub(visible)) as u16;
         if app.autoscroll {
             app.scroll = max_scroll;
@@ -366,8 +369,9 @@ impl TranscriptView {
             }
         }
 
-        let transcript = Paragraph::new(display)
+        let transcript = Paragraph::new(app.display_cache.clone())
             .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: false })
             .scroll((app.scroll, 0));
         f.render_widget(transcript, area);
     }
@@ -721,6 +725,134 @@ pub(super) fn cell_safe(text: &str) -> String {
 
 pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     let w = width.max(1) as usize;
+    // User prompt lines carry a raised-surface background (pad + content + edge).
+    // Wrapping the whole line (pad+content+edge) to `w` would make continuation
+    // rows start at col 0 without the left pad, and the total length
+    // pad+content+edge would be considered one logical line, causing the
+    // continuation to be shifted and, for very long single-line prompts,
+    // the word-wrap's `last_space` would be inside the content rather than
+    // at the pad boundary. To keep the surface visually solid and to avoid
+    // any overflow, unwrap the inner content, wrap it to `w-2`, and re-add
+    // the pads to every row.
+    let has_bg = line.spans.iter().any(|s| s.style.bg.is_some());
+    if has_bg {
+        // Edge line: single space with bg (top/bottom border of user block)
+        if line.spans.len() == 1 && line.spans[0].content == " " {
+            let bg = line.spans[0].style.bg.unwrap();
+            return vec![Line::from(Span::styled(" ".repeat(w), Style::default().bg(bg)))];
+        }
+        // Content line: pad (1) + content + edge (1) — all with same bg
+        if line.spans.len() == 3
+            && line.spans[0].content == " "
+            && line.spans[2].content == " "
+            && line.spans[0].style.bg.is_some()
+            && line.spans[2].style.bg.is_some()
+        {
+            let content = line.spans[1].content.clone();
+            let content_style = line.spans[1].style;
+            let pad_style = line.spans[0].style;
+            let content_width = w.saturating_sub(2).max(1);
+            // Wrap the inner content only, without pads, using the same
+            // word-wrap logic but without indent and without bg handling.
+            let inner_line = Line::from(Span::styled(content.to_string(), content_style));
+            // Reuse the non-bg wrapping path for the inner content by
+            // constructing raw units for the inner line and wrapping to
+            // content_width. This avoids infinite recursion.
+            let mut raw: Vec<(String, Style, bool)> = Vec::new();
+            for sg in inner_line.styled_graphemes(Style::default()) {
+                if sg.symbol == "\t" {
+                    raw.push(("\t".to_string(), sg.style, true));
+                } else if sg.symbol.chars().all(|c| c.is_control()) {
+                    continue;
+                } else if sg.symbol.chars().any(|c| c.is_control()) {
+                    let filtered: String = sg.symbol.chars().filter(|c| !c.is_control()).collect();
+                    if filtered.is_empty() {
+                        continue;
+                    }
+                    raw.push((filtered, sg.style, false));
+                } else {
+                    raw.push((sg.symbol.to_string(), sg.style, false));
+                }
+            }
+            #[derive(Clone)]
+            struct Unit2 {
+                text: String,
+                style: Style,
+                width: usize,
+                whitespace: bool,
+            }
+            let mut rows2: Vec<Vec<Unit2>> = Vec::new();
+            let mut row2: Vec<Unit2> = Vec::new();
+            let mut row_width2: usize = 0;
+            let mut last_space2: Option<usize> = None;
+            for (symbol, style, is_tab) in raw {
+                let mut text2 = symbol.clone();
+                let mut width2 = if is_tab {
+                    TAB_WIDTH - (row_width2 % TAB_WIDTH)
+                } else {
+                    symbol.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>().max(1)
+                };
+                let mut whitespace2 = is_tab || symbol.chars().all(char::is_whitespace);
+                if is_tab {
+                    text2 = " ".repeat(width2);
+                }
+                if row_width2 + width2 > content_width && !row2.is_empty() {
+                    if let Some(space) = last_space2 {
+                        let remainder = row2.split_off(space + 1);
+                        row2.truncate(space);
+                        rows2.push(row2);
+                        row2 = remainder;
+                    } else {
+                        rows2.push(row2);
+                        row2 = Vec::new();
+                    }
+                    row_width2 = row2.iter().map(|u: &Unit2| u.width).sum::<usize>();
+                    last_space2 = None;
+                    if is_tab {
+                        width2 = TAB_WIDTH - (row_width2 % TAB_WIDTH);
+                        text2 = " ".repeat(width2);
+                        whitespace2 = true;
+                    }
+                }
+                if whitespace2 {
+                    last_space2 = Some(row2.len());
+                }
+                row_width2 += width2;
+                row2.push(Unit2 {
+                    text: text2,
+                    style,
+                    width: width2,
+                    whitespace: whitespace2,
+                });
+            }
+            if !row2.is_empty() || rows2.is_empty() {
+                rows2.push(row2);
+            }
+            let mut out: Vec<Line<'static>> = Vec::new();
+            for row_units in rows2 {
+                let mut spans = Vec::new();
+                spans.push(Span::styled(" ".to_string(), pad_style));
+                spans.extend(row_units.into_iter().map(|u| Span::styled(u.text, u.style)));
+                spans.push(Span::styled(" ".to_string(), pad_style));
+                let mut line = Line::from(spans);
+                let row_width: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>())
+                    .sum();
+                if row_width < w {
+                    let bg = pad_style.bg.unwrap();
+                    line.spans.push(Span::styled(" ".repeat(w - row_width), Style::default().bg(bg)));
+                }
+                out.push(line);
+            }
+            if out.is_empty() {
+                let bg = pad_style.bg.unwrap();
+                out.push(Line::from(Span::styled(" ".repeat(w), Style::default().bg(bg))));
+            }
+            return out;
+        }
+    }
     let output_indent = line.spans.first().is_some_and(|span| {
         span.content.as_ref() == transcript_indent() && span.style.bg.is_none()
     });
@@ -936,6 +1068,10 @@ mod tests {
             slash_selected: 0,
             assistant_open: false,
             plan: crate::core::types::Plan::default(),
+            transcript_version: 0,
+            display_cache: Vec::new(),
+            display_cache_width: 0,
+            display_cache_version: u64::MAX,
         }
     }
 
@@ -1310,6 +1446,33 @@ mod tests {
             if row.contains(short_input) && row.contains("hermetic") {
                 panic!("ghost overlap row: {:?}", row);
             }
+        }
+    }
+
+    #[test]
+    fn user_prompt_wrapping_is_width_bounded_and_fills_background() {
+        let long = "Current: Directive: P0-P5 shipped per PLAN.md.P10 with HARNESS re-score each phase. Gates: P6 permission ceiling+scoped audit, P7 token auth/policy/redaction, P8 tx edits/journal/rebuild, P9 verification/trace/cost, P10 versioned protocol/seq/replay. Primitive beats intent. Principles: Session::set_state/load_session_state JSONL, injection via system at WRAP_UP_THRESHOLD, state in daemon, ceiling not flag, Protocol: src/llm/protocol.rs, src/protocol/mod.rs; Git commits 770d5d1 P5 hardening, 8d0ccb, e2d5c97, prior unstaged 655+/102- across 3 files (fmt'd). Unresolved: P6 ceiling+audit validation pending, P7 remote security (token auth/policy/redaction) in-progress, then P8-10; HARNESS re-score required per phase. ns: treat diff as P5 compaction hardening (token math+deterministic fallback+ephemeral injection); validate format/math/ordering + tests/clippy before commit; sequential execution. Actions: audited token/config wiring; cargo test 68 passed + clippy 0 + build, committed 770d5d1 (3 files); then started P7 audit - hit No such file io error, inspected DaemonState/Client, re-read ns:Mutex<HashMap<String,SessionEntry>>, PendingApproval{}, server::router, TcpListener non-blocking->tokio; DaemonClient blocking request, Outcomes: P5 hardening complete - token accounting hardened, session consistency maintained.";
+        for w in [80, 90, 100, 120, 70, 50, 40] {
+            let mut app = test_app();
+            super::super::render_user_prompt(&mut app, long);
+            // Check wrap_line_display directly for the user block's content line
+            let block = &app.transcript[1]; // 0 is hello, 1 is user
+            for line in block.lines() {
+                let wrapped = wrap_line_display(line, w);
+                for wl in &wrapped {
+                    let s: String = wl.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                    let width = UnicodeWidthStr::width(s.as_str());
+                    assert!(width <= w as usize, "user line overflow at w {w}: width {width} > {w} line {:?}", s);
+                    // User lines should fill exactly w with bg (except maybe last? but our code fills)
+                    // Check that at least one span has bg
+                    assert!(wl.spans.iter().any(|sp| sp.style.bg.is_some()), "user line should have bg");
+                }
+            }
+            // Also test full view rendering at this width does not panic and buffer is correct
+            let backend = TestBackend::new(w, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| view(f, &mut app)).unwrap();
+            assert_eq!(terminal.backend().buffer().area.width, w);
         }
     }
 
