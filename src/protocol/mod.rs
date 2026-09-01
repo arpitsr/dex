@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::core::types::Budget;
+
 /// Request to create a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -126,12 +128,45 @@ pub enum StreamEvent {
     #[serde(rename = "error")]
     Error(String),
 
-    /// Plan update for remote UI sync.
+    /// Plan update for remote UI sync. New fields carry the full task
+    /// contract (goal, constraints, steps, acceptance) so a remote TUI does
+    /// not drop constraints/acceptance when the daemon syncs the plan back.
     #[serde(rename = "plan")]
     Plan {
         goal: Option<String>,
         steps: Vec<(String, bool)>,
+        #[serde(default)]
+        constraints: Vec<String>,
+        #[serde(default)]
+        acceptance: Vec<(String, bool)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<Budget>,
     },
+}
+
+/// One numbered SSE event (P10). `seq` is the daemon-assigned, per-session
+/// monotonic cursor; the event journal persists every payload so a
+/// reconnecting client can replay `GET /api/sessions/{id}/events?since=seq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamEnvelope {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: StreamEvent,
+}
+
+/// Response from `POST /api/sessions/{id}/reattach`: the session is made
+/// usable again and the client gets the cursor to replay from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReattachResponse {
+    pub session_id: String,
+    pub seq: u64,
+}
+
+/// Response from `GET /api/sessions/{id}/events?since=...`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsResponse {
+    pub events: Vec<StreamEnvelope>,
+    pub next_seq: u64,
 }
 
 /// A single skill entry advertised by the daemon (discovered from its

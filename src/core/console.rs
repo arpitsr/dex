@@ -135,6 +135,43 @@ pub(crate) struct Console {
     /// prompting on stdin. The approval channel is still used to send requests;
     /// a separate mechanism resolves them when the client POSTs back.
     pub(crate) remote_approval: bool,
+    /// Redacted per-turn observability journal (P9). Optional; the daemon
+    /// opens one per turn (`<session>.trace.jsonl`, `0600`), local paths skip it.
+    trace: Option<TraceWriter>,
+}
+
+/// Redacted event span appended to a per-turn `trace.jsonl` (P9).
+/// Field meanings are fixed; no prompts, tool args, or secrets are ever
+/// written — only hashes and counters, so a trace is safe to ship to cost
+/// tooling.
+#[derive(Clone)]
+pub(crate) struct TraceWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl TraceWriter {
+    /// Open (append) a trace file with `0600` permissions.
+    pub(crate) fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    pub(crate) fn record(&self, span: serde_json::Value) {
+        use std::io::Write;
+        if let Ok(mut file) = self.file.lock() {
+            let mut line = span.to_string();
+            line.push('\n');
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+    }
 }
 
 impl Clone for Console {
@@ -149,6 +186,7 @@ impl Clone for Console {
                     .clone(),
             ),
             remote_approval: self.remote_approval,
+            trace: self.trace.clone(),
         }
     }
 }
@@ -164,6 +202,7 @@ impl Console {
             approval: Some(approval),
             session_approvals: Mutex::new(None),
             remote_approval: false,
+            trace: None,
         }
     }
 
@@ -175,6 +214,7 @@ impl Console {
             approval: None,
             session_approvals: Mutex::new(None),
             remote_approval: false,
+            trace: None,
         }
     }
 
@@ -188,6 +228,27 @@ impl Console {
             approval: Some(approval),
             session_approvals: Mutex::new(None),
             remote_approval: true,
+            trace: None,
+        }
+    }
+
+    /// Attach a trace journal (P9). Returns a clone (the same file).
+    pub(crate) fn with_trace(mut self, trace: Option<TraceWriter>) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    /// Record one span, if a trace journal is attached. Field names are the
+    /// contract; see `TraceWriter`.
+    pub(crate) fn trace_span(&self, mut span: serde_json::Value) {
+        if let Some(trace) = &self.trace {
+            if let Some(obj) = span.as_object_mut() {
+                obj.insert(
+                    "ts".into(),
+                    serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                );
+            }
+            trace.record(span);
         }
     }
 
