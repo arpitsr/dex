@@ -158,22 +158,26 @@ pub(super) fn plan_status(app: &App) -> Option<String> {
     }
     let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
     let total = app.plan.steps.len();
+    let mut parts = Vec::new();
     if let Some(g) = &app.plan.goal {
         let short = if g.len() > 40 {
             format!("{}…", &g[..40])
         } else {
             g.clone()
         };
-        if total > 0 {
-            Some(format!("Goal: {} · Plan {}/{}", short, done, total))
-        } else {
-            Some(format!("Goal: {}", short))
-        }
-    } else if total > 0 {
-        Some(format!("Plan {}/{}", done, total))
-    } else {
-        None
+        parts.push(format!("Goal: {short}"));
     }
+    if total > 0 {
+        parts.push(format!("Plan {done}/{total}"));
+    }
+    let a_done = app.plan.acceptance.iter().filter(|(_, d)| *d).count();
+    if !app.plan.acceptance.is_empty() {
+        parts.push(format!("✓ {a_done}/{}", app.plan.acceptance.len()));
+    }
+    if app.plan.is_complete() {
+        parts.push("complete".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 pub(super) fn ui_status(app: &App) -> String {
@@ -195,7 +199,7 @@ pub(super) fn ui_status(app: &App) -> String {
             .checked_div(app.config.context_window)
             .unwrap_or(0)
     };
-    let base = format!(
+    let mut base = format!(
         "{} · {} / {}{} · {} / {} tokens ({}%)",
         cwd,
         app.config.provider.name(),
@@ -205,6 +209,22 @@ pub(super) fn ui_status(app: &App) -> String {
         format_tokens(app.config.context_window),
         context_pct
     );
+    // Provider-reported cache-hit subset of the last call's prompt (billed
+    // at a fraction of full input price); omitted until a provider reports it.
+    if let Some(cached) = app.tool_state.last_cached {
+        if cached > 0 {
+            base.push_str(&format!(" · {} cached", format_tokens(cached)));
+        }
+    }
+    // Cumulative prompt tokens across all LLM calls this TUI process has
+    // made (per-call counts are conversation-sized, so this is the spend
+    // figure that grows across turns; the % above is live context usage).
+    if app.tool_state.total_usage > 0 {
+        base.push_str(&format!(
+            " · {} total",
+            format_tokens(app.tool_state.total_usage)
+        ));
+    }
     if let Some(plan) = plan_status(app) {
         format!("{} · {}", base, plan)
     } else {
@@ -340,6 +360,13 @@ struct TranscriptView;
 
 impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+        // Clear the transcript area first: without this a shorter frame (e.g. after
+        // a long wrapped line scrolls out, or after a resize that re-wraps to fewer
+        // rows) would leave trailing cells from the previous Paragraph. The top-level
+        // Clear in `view` covers the whole screen once per frame, but Paragraph only
+        // writes its own cells — any row that was previously occupied and is now empty
+        // would otherwise persist as a ghost until the next full clear (resize).
+        f.render_widget(Clear, area);
         let visible = area.height as usize;
         // ponytail: cache wrapped display — scroll alone shouldn't re-wrap O(N)
         let cache_valid = app.display_cache_width == area.width
@@ -369,9 +396,13 @@ impl TranscriptView {
             }
         }
 
+        // No `.wrap(Wrap)` here: the display cache is already pre-wrapped to
+        // `area.width` by `wrap_line_display`, and ratatui 0.29's WordWrapper
+        // emits a phantom empty row before any all-whitespace line that is
+        // exactly `area.width` wide — the submitted-prompt box's edge rows are
+        // exactly that, so Wrap rendered dark holes inside the box.
         let transcript = Paragraph::new(app.display_cache.clone())
             .style(Style::default().fg(Color::Gray))
-            .wrap(Wrap { trim: false })
             .scroll((app.scroll, 0));
         f.render_widget(transcript, area);
     }
@@ -739,7 +770,10 @@ pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
         // Edge line: single space with bg (top/bottom border of user block)
         if line.spans.len() == 1 && line.spans[0].content == " " {
             let bg = line.spans[0].style.bg.unwrap();
-            return vec![Line::from(Span::styled(" ".repeat(w), Style::default().bg(bg)))];
+            return vec![Line::from(Span::styled(
+                " ".repeat(w),
+                Style::default().bg(bg),
+            ))];
         }
         // Content line: pad (1) + content + edge (1) — all with same bg
         if line.spans.len() == 3
@@ -790,7 +824,11 @@ pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
                 let mut width2 = if is_tab {
                     TAB_WIDTH - (row_width2 % TAB_WIDTH)
                 } else {
-                    symbol.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>().max(1)
+                    symbol
+                        .chars()
+                        .map(|c| c.width().unwrap_or(0))
+                        .sum::<usize>()
+                        .max(1)
                 };
                 let mut whitespace2 = is_tab || symbol.chars().all(char::is_whitespace);
                 if is_tab {
@@ -838,17 +876,28 @@ pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
                 let row_width: usize = line
                     .spans
                     .iter()
-                    .map(|s| s.content.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>())
+                    .map(|s| {
+                        s.content
+                            .chars()
+                            .map(|c| c.width().unwrap_or(0))
+                            .sum::<usize>()
+                    })
                     .sum();
                 if row_width < w {
                     let bg = pad_style.bg.unwrap();
-                    line.spans.push(Span::styled(" ".repeat(w - row_width), Style::default().bg(bg)));
+                    line.spans.push(Span::styled(
+                        " ".repeat(w - row_width),
+                        Style::default().bg(bg),
+                    ));
                 }
                 out.push(line);
             }
             if out.is_empty() {
                 let bg = pad_style.bg.unwrap();
-                out.push(Line::from(Span::styled(" ".repeat(w), Style::default().bg(bg))));
+                out.push(Line::from(Span::styled(
+                    " ".repeat(w),
+                    Style::default().bg(bg),
+                )));
             }
             return out;
         }
@@ -1118,6 +1167,32 @@ mod tests {
             layout.footer.y
         );
         assert_eq!(layout.footer.height, status_height());
+    }
+
+    #[test]
+    fn ui_status_shows_cumulative_token_total() {
+        let mut app = test_app();
+        // No LLM calls yet: no total suffix.
+        assert!(!ui_status(&app).contains("total"), "{}", ui_status(&app));
+        // After calls, the cumulative spend figure appears and grows.
+        app.tool_state.total_usage = 42_000;
+        let text = ui_status(&app);
+        assert!(text.contains("42.0k total"), "{text}");
+        app.tool_state.total_usage = 215_000;
+        let text = ui_status(&app);
+        assert!(text.contains("215.0k total"), "{text}");
+        // Live context usage (% of window) still renders from last_usage.
+        app.tool_state.last_usage = Some(12_000);
+        let text = ui_status(&app);
+        assert!(text.contains("12.0k / 128.0k tokens (9%)"), "{text}");
+        // Cached-token subset appears once a provider reports it, and stays
+        // hidden when it is absent or zero.
+        assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
+        app.tool_state.last_cached = Some(8_000);
+        let text = ui_status(&app);
+        assert!(text.contains("8.0k cached"), "{text}");
+        app.tool_state.last_cached = Some(0);
+        assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
     }
 
     #[test]
@@ -1462,10 +1537,17 @@ mod tests {
                 for wl in &wrapped {
                     let s: String = wl.spans.iter().map(|sp| sp.content.as_ref()).collect();
                     let width = UnicodeWidthStr::width(s.as_str());
-                    assert!(width <= w as usize, "user line overflow at w {w}: width {width} > {w} line {:?}", s);
+                    assert!(
+                        width <= w as usize,
+                        "user line overflow at w {w}: width {width} > {w} line {:?}",
+                        s
+                    );
                     // User lines should fill exactly w with bg (except maybe last? but our code fills)
                     // Check that at least one span has bg
-                    assert!(wl.spans.iter().any(|sp| sp.style.bg.is_some()), "user line should have bg");
+                    assert!(
+                        wl.spans.iter().any(|sp| sp.style.bg.is_some()),
+                        "user line should have bg"
+                    );
                 }
             }
             // Also test full view rendering at this width does not panic and buffer is correct
@@ -1473,6 +1555,136 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal.draw(|f| view(f, &mut app)).unwrap();
             assert_eq!(terminal.backend().buffer().area.width, w);
+        }
+    }
+
+    #[test]
+    fn ghost_key_facts_does_not_overflow_or_overlap_bottom() {
+        // Repro for screenshot ghost: long assistant line with unbroken tokens
+        // must wrap within width and never appear in input/footer area.
+        let ghost = "Key facts: Docs at /home/aks/Work/dex/HARNESS.md (489 lines), PLAN.md (92 lines, P0-P5 shipped, next 6-10: permission ceiling/audit, token auth/policy/redaction, transactional edits/journal, verification, versioned protocol seq/replay). Src layout: src/agent/{loop,state,compaction}, client/http, cli/config/core/daemon/llm/protocol/session/skills/tools/ui. Key symbols: Session::set_state/load_session_state (/resume), Plan{goal,steps}+/goal/plan add/done/clear+SinkLine::Plan→StreamEvent::Plan, WRAP_UP_THRESHOLD, DaemonState/PendingApproval/router/SSE, TurnLimits/deadline/within_budget, TurnComplete/TurnFailed/Usage, SessionHeader, FileConfig/LlmConfig/Provider, system_prompt/project_context, CONFIGURED_OUTPUT_LIMIT/execute_outcome. Unresolved: complete section-by-section audit and rewrite HARNESS.md with code citations and re-scoring per active runtime.1126 lines), daemon mod/server (axum router, SSE, approvals), llm/config/prompt, disposition, versioned protocol seq/replay).";
+        for (w, h) in [
+            (80, 24),
+            (100, 24),
+            (120, 24),
+            (200, 24),
+            (80, 40),
+            (120, 40),
+        ] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let mut app = test_app();
+            // Fill transcript like screenshot: several tool blocks then assistant ghost
+            for name in [
+                "slash.rs",
+                "types.rs",
+                "console.rs",
+                "format.rs",
+                "client.rs",
+                "remote.rs",
+            ] {
+                super::super::append_sink_line(
+                    &mut app,
+                    crate::core::types::SinkLine::ToolInput(format!(
+                        "read /home/aks/Work/dex/src/ui/{name}"
+                    )),
+                );
+                super::super::append_sink_line(
+                    &mut app,
+                    crate::core::types::SinkLine::ToolOutput {
+                        name: "read".into(),
+                        summary: "10 lines".into(),
+                        success: true,
+                        preview: vec![
+                            "1 use std::env;".into(),
+                            "2".into(),
+                            "3 use std::env;".into(),
+                        ],
+                        duration: 0.0,
+                    },
+                );
+            }
+            super::super::append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Assistant(
+                    "Evidence map 80% complete - pulling final modules to re-score the board."
+                        .into(),
+                ),
+            );
+            super::super::append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Assistant(ghost.into()),
+            );
+            app.input = InputField::from_text("try a different approach");
+            terminal.draw(|f| view(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let area = buffer.area;
+            // Compute layout like view does
+            let input_rows = render_input(&app.input, input_content_width(area.width))
+                .0
+                .len() as u16;
+            let pending_total = app.pending_steering.len() + app.pending_followups.len();
+            let visible_pending = pending_total.min(3) as u16;
+            let extra = u16::from(pending_total > 3);
+            let activity_items = 1 + visible_pending + extra;
+            let layout = compute_layout(area, input_rows, activity_items, false).unwrap();
+            // Check every cell in input and footer does not contain ghost fragments
+            // Ghost contains distinctive substrings that should never leak into chrome
+            let forbidden = [
+                "Key facts",
+                "HARNESS.md",
+                "Session::set_state",
+                "WRAP_UP_THRESHOLD",
+            ];
+            let content: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            let rows: Vec<String> = content
+                .chars()
+                .collect::<Vec<char>>()
+                .chunks(w as usize)
+                .map(|c| c.iter().collect())
+                .collect();
+            for y in layout.input.y..layout.input.y + layout.input.height {
+                let row = &rows[y as usize];
+                for pat in forbidden {
+                    assert!(
+                        !row.contains(pat),
+                        "ghost '{pat}' leaked into input at {w}x{h} y={y} row={:?}",
+                        row
+                    );
+                }
+            }
+            for y in layout.footer.y..layout.footer.y + layout.footer.height {
+                let row = &rows[y as usize];
+                for pat in forbidden {
+                    assert!(
+                        !row.contains(pat),
+                        "ghost '{pat}' leaked into footer at {w}x{h} y={y} row={:?}",
+                        row
+                    );
+                }
+            }
+            // Also check that no row in entire buffer exceeds width (hard wrap)
+            for line in &app.display_cache {
+                let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                let width = UnicodeWidthStr::width(s.as_str());
+                assert!(
+                    width <= w as usize,
+                    "display_cache line overflow at {w}: {width} > {w} line={:?}",
+                    s
+                );
+            }
+            // Simulate resize to narrower then wider without new transcript data: cache must re-wrap
+            let backend2 = TestBackend::new(w.saturating_sub(20).max(40), h);
+            let mut terminal2 = ratatui::Terminal::new(backend2).unwrap();
+            terminal2.draw(|f| view(f, &mut app)).unwrap();
+            let content2: String = terminal2
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(!content2.contains("\t"), "tab not expanded after resize");
         }
     }
 
@@ -1507,6 +1719,57 @@ mod tests {
             second_pos,
             first_pos + 1,
             "streamed assistant chunks must stay flush inside one block"
+        );
+    }
+    /// Regression: the submitted-prompt box (raised surface) must render as
+    /// exactly three consecutive rows — top edge, content, bottom edge. The
+    /// transcript Paragraph must NOT enable `Wrap`: the display cache is already
+    /// pre-wrapped, and ratatui 0.29's WordWrapper emits a phantom empty row
+    /// before any all-whitespace line exactly `area.width` wide (the box edge
+    /// rows), punching dark holes inside the box.
+    #[test]
+    fn submitted_prompt_box_is_three_solid_rows() {
+        let backend = TestBackend::new(126, 25);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        super::super::push_info(
+        &mut app,
+        "connected to http://127.0.0.1:35487 - workspace /home/aks/Work/dex - model deepseek-v4-flash"
+            .into(),
+    );
+        super::super::render_user_prompt(&mut app, "can you check pillar 1 form harness.md");
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("read HARNESS.md".into()),
+        );
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "read".into(),
+                summary: "v 313 lines".into(),
+                success: true,
+                preview: vec!["1 # Harness Capability Map".into()],
+                duration: 0.0,
+            },
+        );
+        terminal.draw(|f| view(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let row_of = |needle: &str| {
+            (0..area.height).find(|&y| {
+                let row: String = (0..area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect();
+                row.contains(needle)
+            })
+        };
+        let text_row = row_of("can you check pillar").expect("prompt text rendered");
+        let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
+        // Box = edge, content(text), edge; then one gap line; then the tool block.
+        assert_eq!(
+            tool_row,
+            text_row + 3,
+            "box must occupy exactly text_row-1..text_row+1; a phantom row from Paragraph::wrap shifts the tool block down"
         );
     }
 }

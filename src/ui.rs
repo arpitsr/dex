@@ -288,7 +288,6 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             app.transcript.push(TranscriptBlock::Assistant(new_lines));
             app.assistant_open = true;
             app.transcript_version = app.transcript_version.wrapping_add(1);
-            return;
         }
         SinkLine::ToolInput(s) => {
             dim_intermediate_assistant_block(app);
@@ -387,7 +386,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
         }
         // Usage updates flow into the status bar via StreamEvent::Usage in
         // the remote handler, not into the transcript.
-        SinkLine::Usage(_) => {}
+        SinkLine::Usage { .. } => {}
         SinkLine::Plan(plan) => {
             app.plan = plan;
         }

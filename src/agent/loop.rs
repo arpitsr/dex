@@ -330,7 +330,7 @@ fn call_client_cancellable(
     messages: &[ChatMessage],
     with_tools: bool,
     console: &Console,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
     let client = (*client).clone();
     let messages = messages.to_vec();
     let sink = console.sink().cloned();
@@ -607,14 +607,18 @@ pub(crate) fn process_turn(
                 }
                 Err(e) => return Err(e),
             };
-        if let Some(tokens) = usage {
-            last_usage = Some(tokens);
+        if let Some(u) = usage {
+            last_usage = Some(u.prompt_tokens);
             // Persist promptly so a cancelled turn still keeps an accurate
             // context figure, and push it to the UI: the status bar tracks
             // usage after every LLM call, not once per turn.
             state.last_usage = last_usage;
+            state.last_cached = u.cached_tokens;
             if let Some(sink) = console.sink() {
-                let _ = sink.send(SinkLine::Usage(tokens));
+                let _ = sink.send(SinkLine::Usage {
+                    tokens: u.prompt_tokens,
+                    cached: u.cached_tokens,
+                });
             }
             // Cost accounting (P9): a static approximate prompt-token rate —
             // `DEX_COST_PER_1K` overrides; default $2/M. Real pricing needs
@@ -626,13 +630,14 @@ pub(crate) fn process_turn(
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.002);
             #[allow(clippy::cast_precision_loss)]
-            let cost = tokens as f64 * rate_per_1k / 1000.0;
+            let cost = u.prompt_tokens as f64 * rate_per_1k / 1000.0;
             spend_usd += cost;
             console.trace_span(serde_json::json!({
                 "kind": "llm",
                 "turn_id": turn_id,
                 "iteration": iteration,
-                "prompt_tokens": tokens,
+                "prompt_tokens": u.prompt_tokens,
+                "cached_tokens": u.cached_tokens,
                 "cost_usd": (cost * 1000.0).round() / 1000.0,
             }));
         }
@@ -1117,7 +1122,7 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
             Ok((
                 ChatMessage {
                     role: "assistant".into(),
@@ -1126,7 +1131,10 @@ mod tests {
                     tool_call_id: None,
                     name: None,
                 },
-                Some(1),
+                Some(Usage {
+                    prompt_tokens: 1,
+                    cached_tokens: None,
+                }),
             ))
         }
     }
@@ -1213,7 +1221,7 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let message = if round == 0 {
                 ChatMessage {
@@ -1239,7 +1247,7 @@ mod tests {
                     name: None,
                 }
             };
-            Ok((message, Some(1)))
+            Ok((message, Some(Usage { prompt_tokens: 1, cached_tokens: None })))
         }
     }
 
@@ -1305,7 +1313,7 @@ mod tests {
         let usage_events: Vec<u64> = lines
             .iter()
             .filter_map(|line| match line {
-                SinkLine::Usage(tokens) => Some(*tokens),
+                SinkLine::Usage { tokens, .. } => Some(*tokens),
                 _ => None,
             })
             .collect();
@@ -1326,7 +1334,7 @@ mod tests {
                 _with_tools: bool,
                 _sink: Option<mpsc::Sender<SinkLine>>,
                 _cancel: &dyn CancellationSource,
-            ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+            ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
                 self.captured.lock().unwrap().push(messages.to_vec());
                 Ok((
                     ChatMessage {
@@ -1336,7 +1344,10 @@ mod tests {
                         tool_call_id: None,
                         name: None,
                     },
-                    Some(1),
+                    Some(Usage {
+                        prompt_tokens: 1,
+                        cached_tokens: None,
+                    }),
                 ))
             }
         }
@@ -1431,7 +1442,7 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.captured.lock().unwrap().push(messages.to_vec());
             let reply = self
@@ -1649,8 +1660,8 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
-            Ok((tool_call_msg("bash", "{\"command\":\"echo hi\"}"), Some(1)))
+        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+            Ok((tool_call_msg("bash", "{\"command\":\"echo hi\"}"), Some(Usage { prompt_tokens: 1, cached_tokens: None })))
         }
     }
 

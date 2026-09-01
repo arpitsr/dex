@@ -388,15 +388,21 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                 selected: 0,
             });
         }
-        StreamEvent::TurnComplete { usage, .. } => {
+        StreamEvent::TurnComplete { usage, cached, .. } => {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);
             }
+            if let Some(cached) = cached {
+                remote.app.tool_state.last_cached = Some(cached);
+            }
         }
-        StreamEvent::Usage { tokens } => {
+        StreamEvent::Usage { tokens, cached } => {
             // Live context usage: emitted by the daemon after every LLM call
             // so the status bar updates mid-turn, not just at completion.
             remote.app.tool_state.last_usage = Some(tokens);
+            if cached.is_some() {
+                remote.app.tool_state.last_cached = cached;
+            }
             // Cumulative spend across turns. TurnComplete.usage repeats the
             // final call's count, so only Usage events accumulate.
             remote.app.tool_state.total_usage =

@@ -222,7 +222,11 @@ pub enum SinkLine {
     Error(String),
     /// Prompt tokens reported by the provider after each LLM call, so the
     /// status bar can track context usage live instead of once per turn.
-    Usage(u64),
+    /// `cached` is the provider-reported cached-token subset, when reported.
+    Usage {
+        tokens: u64,
+        cached: Option<u64>,
+    },
     Plan(Plan),
 }
 
@@ -315,9 +319,29 @@ pub(crate) struct StreamOptions {
     pub(crate) include_usage: bool,
 }
 
-#[derive(Deserialize, Default)]
+/// Provider-reported usage for one LLM call, threaded from the stream readers
+/// through the agent loop to the status bar. `cached_tokens` is the
+/// provider-reported cache-hit subset (billed at a fraction of full input
+/// price); None when the provider does not report cache detail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Usage {
     pub(crate) prompt_tokens: u64,
+    pub(crate) cached_tokens: Option<u64>,
+}
+
+/// Chat-completions wire shape for usage. Cache detail nests under
+/// `prompt_tokens_details`, so it needs its own deserialization target.
+#[derive(Deserialize, Default)]
+pub(crate) struct StreamUsage {
+    pub(crate) prompt_tokens: u64,
+    #[serde(rename = "prompt_tokens_details")]
+    pub(crate) prompt_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct PromptTokensDetails {
+    #[serde(default)]
+    pub(crate) cached_tokens: u64,
 }
 
 #[derive(Serialize)]
@@ -339,7 +363,7 @@ pub(crate) struct StreamChunk {
     #[serde(default)]
     pub(crate) choices: Vec<StreamChoice>,
     #[serde(default)]
-    pub(crate) usage: Option<Usage>,
+    pub(crate) usage: Option<StreamUsage>,
 }
 
 #[derive(Deserialize)]

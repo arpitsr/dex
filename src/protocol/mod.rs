@@ -103,12 +103,15 @@ pub enum StreamEvent {
     },
 
     /// The turn completed successfully. `usage` is the daemon-reported prompt
-    /// token count for the conversation, when known.
+    /// token count for the conversation, when known; `cached` the cached-token
+    /// subset the provider reported for the last call, when known.
     #[serde(rename = "turn_complete")]
     TurnComplete {
         response: String,
         #[serde(default)]
         usage: Option<u64>,
+        #[serde(default)]
+        cached: Option<u64>,
     },
 
     /// The turn failed.
@@ -117,8 +120,13 @@ pub enum StreamEvent {
 
     /// Prompt tokens reported by the provider after each LLM call within a
     /// turn, letting the client render live context usage in its status bar.
+    /// `cached` is the provider-reported cached-token subset, when reported.
     #[serde(rename = "usage")]
-    Usage { tokens: u64 },
+    Usage {
+        tokens: u64,
+        #[serde(default)]
+        cached: Option<u64>,
+    },
 
     /// A system message (e.g. compaction notice).
     #[serde(rename = "system")]
