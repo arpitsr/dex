@@ -73,6 +73,10 @@ pub enum StreamEvent {
     #[serde(rename = "assistant_text")]
     AssistantText(String),
 
+    /// Incremental model reasoning ("thinking") delta.
+    #[serde(rename = "thinking")]
+    Thinking(String),
+
     /// A tool call was initiated.
     #[serde(rename = "tool_call")]
     ToolCall {

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, DisableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -84,6 +84,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
         ));
     }
+    OSC_START.get_or_init(Instant::now);
 
     let client = DaemonClient::new(daemon_url)
         .map_err(|e| std::io::Error::other(format!("failed to connect to daemon: {e}")))?;
@@ -147,7 +148,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>();
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
-    let mut app = App {
+    let app = App {
         transcript: Vec::new(),
         input: crate::ui::input::InputField::new(),
         config: display_config(&info),
@@ -179,19 +180,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         history_index: None,
         history_draft: String::new(),
         slash_selected: 0,
+        connection: Some(connection_label(daemon_url)),
         assistant_open: false,
+        show_thinking: false,
         transcript_version: 0,
         display_cache: Vec::new(),
         display_cache_width: 0,
         display_cache_version: u64::MAX,
     };
-    push_info(
-        &mut app,
-        format!(
-            "connected to {daemon_url} · workspace {} · model {}",
-            info.cwd, info.model
-        ),
-    );
 
     let mut remote = RemoteApp {
         app,
@@ -243,23 +239,11 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // take over; surface colors are resolved from this once.
     super::theme::detect_background();
     enable_raw_mode()?;
-    // Correct fix: consume any OSC 10/11 reply that arrived late.
-    // terminal_colorsaurus writes `\x1b]10;?` / `\x1b]11;?` and reads the
-    // reply; on timeout the reply (`\x1b]10;rgb:…\x07`) stays in the tty
-    // queue and crossterm parses it as Alt+`]` + plain chars + Ctrl-G.
-    // Drain with a short deadline so the full burst is consumed before the
-    // event loop starts. No input hack — just consume at the source.
-    {
-        let drain_deadline = Instant::now() + Duration::from_millis(80);
-        while Instant::now() < drain_deadline {
-            let remaining = drain_deadline.saturating_duration_since(Instant::now());
-            if event::poll(remaining)? {
-                let _ = event::read();
-            } else {
-                break;
-            }
-        }
-    }
+    // No startup drain here: a blind deadline cuts OSC reply bursts in half
+    // and leaks the tail (sans lead-in) into the composer. Late replies —
+    // from the theme query above or from anything else querying this tty,
+    // at any time — are swallowed whole by `strip_osc_report` in the event
+    // loop below.
     let _cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
     // No mouse capture: capturing the mouse makes the terminal hand over
@@ -299,6 +283,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             } else if event::poll(Duration::from_millis(16))? {
                 event::read()?
             } else {
+                continue;
+            };
+
+            // Drop OSC 10/11 color reports mis-parsed as keystrokes before
+            // they can type themselves into the composer.
+            let Some(next) = strip_osc_report(next, &mut pending)? else {
                 continue;
             };
 
@@ -348,6 +338,9 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
     match event {
         StreamEvent::AssistantText(text) => {
             append_sink_line(&mut remote.app, SinkLine::Assistant(text));
+        }
+        StreamEvent::Thinking(text) => {
+            append_sink_line(&mut remote.app, SinkLine::Thinking(text));
         }
         StreamEvent::ToolCall { name, args } => {
             let preview = args.as_str().unwrap_or_default().to_string();
@@ -513,6 +506,170 @@ fn arrow_delta(code: KeyCode) -> i32 {
     }
 }
 
+/// How long to hold a suspicious char run while waiting for the rest of an
+/// OSC color report before giving up and replaying it as real input.
+const OSC_LOOKAHEAD: Duration = Duration::from_millis(25);
+
+/// TUI startup instant, so swallowed reports can be attributed: uptime near
+/// zero means our own startup theme query (reply arrived late); a large
+/// uptime means something else queried this tty mid-session.
+static OSC_START: OnceLock<Instant> = OnceLock::new();
+
+/// Best-effort diagnostic journal of OSC runs caught by `strip_osc_report`,
+/// appended to `~/.cache/dex/osc.log`. The reply carries no sender identity,
+/// so the log records when + how late + what; failures are ignored.
+fn log_osc(kind: &str, body: &str) {
+    use std::io::Write;
+    let Some(dir) = dirs::cache_dir() else { return };
+    let path = dir.join("dex/osc.log");
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let up = OSC_START.get_or_init(Instant::now).elapsed().as_secs_f64();
+    let body: String = body.chars().take(80).collect();
+    let _ = writeln!(f, "{ts} uptime={up:.1}s {kind} body={body}");
+}
+
+/// Swallow OSC 10/11 color reports that crossterm mis-parses as keystrokes.
+/// Crossterm has no OSC parsing: `\x1b]11;rgb:0505/1818/2e2e` + BEL arrives
+/// as `Alt+']'`, then one plain-char key per body byte, then `Ctrl+G` (BEL)
+/// or `Alt+'\'` (ST). Such reports come from the startup theme query and
+/// from anything else querying this tty (the terminal itself does), at any
+/// time; unfiltered they type `10;rgb:f6f6/dcdc/acac…` into the composer.
+/// Returns `None` when the run was swallowed; anything that doesn't fit the
+/// report shape is replayed untouched, so real input is never dropped —
+/// worst case it is delayed by one look-ahead window.
+fn strip_osc_report(
+    ev: Event,
+    pending: &mut VecDeque<Event>,
+) -> std::io::Result<Option<Event>> {
+    let lead_in = |e: &Event| {
+        matches!(
+            e,
+            Event::Key(k) if k.code == KeyCode::Char(']') && k.modifiers == KeyModifiers::ALT
+        )
+    };
+    if !lead_in(&ev) {
+        return Ok(Some(ev));
+    }
+    let terminator = |k: &crossterm::event::KeyEvent| {
+        (k.code == KeyCode::Char('g') && k.modifiers == KeyModifiers::CONTROL) // BEL
+            || (k.code == KeyCode::Char('\\') && k.modifiers == KeyModifiers::ALT) // ST
+    };
+
+    // Consume the run: plain chars accumulate into `body`, until a report
+    // terminator, the next report's lead-in, any other key, or a gap.
+    let mut run: Vec<Event> = vec![ev];
+    let mut body = String::new();
+    loop {
+        let next = match pending.pop_front() {
+            Some(e) => e,
+            None if event::poll(OSC_LOOKAHEAD)? => event::read()?,
+            None => break,
+        };
+        let (char_of, ends) = match &next {
+            Event::Key(k) if k.modifiers.is_empty() => match k.code {
+                KeyCode::Char(c) => (Some(c), false),
+                _ => (None, true),
+            },
+            Event::Key(k) if terminator(k) => (None, true),
+            e if lead_in(e) => (None, true),
+            _ => (None, true),
+        };
+        if let Some(c) = char_of {
+            body.push(c);
+        }
+        run.push(next);
+        if ends {
+            break;
+        }
+    }
+
+    // A back-to-back next report begins with its own lead-in; reclassify it.
+    let next_lead_in = if run.len() > 1 && lead_in(run.last().unwrap()) {
+        run.pop()
+    } else {
+        None
+    };
+
+    if is_osc_report(&body) {
+        log_osc("swallowed", &body);
+        if let Some(lead) = next_lead_in {
+            pending.push_front(lead);
+        }
+        return Ok(None);
+    }
+    // Not a report after all (or the burst was split beyond the look-ahead —
+    // ponytail: 25ms; a tty that chunks reply writes slower than that would
+    // leak the tail): replay everything in order. The lead-in itself is
+    // returned for dispatch (Alt+']' inserts nothing) so a replayed run can
+    // never re-enter this filter and loop.
+    log_osc("replayed", &body);
+    let lead_in_ev = run.remove(0);
+    for e in run.into_iter().rev() {
+        pending.push_front(e);
+    }
+    Ok(Some(lead_in_ev))
+}
+
+/// How the engine is reached: loopback daemons are "local", everything else
+/// is reported by host. Used by the status bar instead of a startup banner.
+pub(crate) fn connection_label(daemon_url: &str) -> String {
+    let authority = daemon_url
+        .split_once("://")
+        .map_or(daemon_url, |(_, rest)| rest);
+    // Authority = [userinfo@]host[:port]; stop at the first path/query char.
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    // Bracketed IPv6 literals: everything through `]` is the host, the rest
+    // (if any) is the port. Otherwise a trailing `:digits` is a port.
+    let host = if let Some(close) = authority.find(']') {
+        &authority[..=close]
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => authority,
+        }
+    };
+    if is_loopback(host) {
+        format!("connected to local at {host}")
+    } else {
+        format!("connected to daemon at {host}")
+    }
+}
+
+fn is_loopback(host: &str) -> bool {
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return true;
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let octets: Vec<_> = bare.split('.').collect();
+    octets.len() == 4
+        && octets[0] == "127"
+        && octets[1..].iter().all(|o| o.parse::<u8>().is_ok())
+}
+
+/// Body grammar of an OSC 10/11 color report: `10;rgb:` / `11;rgb:` plus at
+/// least three `/`-separated hex components (16-bit or truncated).
+fn is_osc_report(body: &str) -> bool {
+    let rest = body
+        .strip_prefix("10;rgb:")
+        .or_else(|| body.strip_prefix("11;rgb:"))
+        .unwrap_or("");
+    !rest.is_empty()
+        && rest.split('/').count() >= 3
+        && rest.chars().all(|c| c.is_ascii_hexdigit() || c == '/')
+}
+
 fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     let app = &mut remote.app;
 
@@ -579,6 +736,10 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         }
         KeyCode::Esc if app.busy => {
             request_cancel(remote);
+        }
+        KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
+            app.show_thinking = !app.show_thinking;
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
             KeyCode::Up => {
@@ -774,7 +935,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll"
+                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
                     .to_string(),
             );
             push_info(
@@ -904,4 +1065,48 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_labels_classify_host() {
+        assert_eq!(
+            connection_label("http://127.0.0.1:4113"),
+            "connected to local at 127.0.0.1"
+        );
+        assert_eq!(
+            connection_label("http://localhost:4113"),
+            "connected to local at localhost"
+        );
+        assert_eq!(
+            connection_label("http://[::1]:4113"),
+            "connected to local at [::1]"
+        );
+        assert_eq!(
+            connection_label("daemon.internal:4113"),
+            "connected to daemon at daemon.internal"
+        );
+        assert_eq!(
+            connection_label("https://agent.example.com/api"),
+            "connected to daemon at agent.example.com"
+        );
+    }
+
+    #[test]
+    fn recognizes_leaked_color_reports() {
+        // The exact bodies observed typing themselves into the composer.
+        assert!(is_osc_report("10;rgb:f6f6/dcdc/acac"));
+        assert!(is_osc_report("11;rgb:0505/1818/2e2e"));
+        assert!(is_osc_report("10;rgb:05/18/2e"));
+        // Not reports: replayed as real input.
+        assert!(!is_osc_report("hello"));
+        assert!(!is_osc_report(""));
+        assert!(!is_osc_report("10;rgb:"));
+        assert!(!is_osc_report("12;rgb:0505/1818/2e2e"));
+        assert!(!is_osc_report("11;rgb:zzzz/1818/2e2e"));
+        assert!(!is_osc_report("10;rgb:0505/1818"));
+    }
 }

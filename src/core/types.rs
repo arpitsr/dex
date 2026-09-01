@@ -207,6 +207,9 @@ mod tests {
 #[allow(dead_code)]
 pub enum SinkLine {
     Assistant(String),
+    /// Incremental model reasoning ("thinking") delta. UIs render a collapsed
+    /// one-line preview and can expand the full text on demand.
+    Thinking(String),
     ToolInput(String),
     ToolOutput {
         name: String,
@@ -376,6 +379,14 @@ pub(crate) struct StreamChoice {
 pub(crate) struct StreamDelta {
     pub(crate) content: Option<String>,
     pub(crate) tool_calls: Option<Vec<StreamToolCall>>,
+    /// Reasoning deltas arrive under provider-specific keys (OpenRouter
+    /// `reasoning`, DeepSeek-style `reasoning_content`) and some providers
+    /// send non-string shapes; `Value` keeps a stray shape from failing the
+    /// whole chunk parse.
+    #[serde(default)]
+    pub(crate) reasoning: Option<Value>,
+    #[serde(default)]
+    pub(crate) reasoning_content: Option<Value>,
 }
 
 #[derive(Deserialize)]
