@@ -24,6 +24,14 @@ pub(crate) struct FileConfig {
     pub(crate) max_turn_seconds: Option<u64>,
     pub(crate) http_connect_timeout_secs: Option<u64>,
     pub(crate) http_request_timeout_secs: Option<u64>,
+    pub(crate) verify_command: Option<String>,
+}
+
+pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
+    match provider {
+        Provider::OpenCode => 128_000,
+        Provider::OpenAiCodex => 128_000,
+    }
 }
 
 pub(crate) fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
@@ -42,7 +50,7 @@ pub(crate) fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error
 pub(crate) fn permission_from_env_or_file(
     file: &FileConfig,
 ) -> Result<PermissionMode, Box<dyn std::error::Error>> {
-    let value = env::var("OYE_PERMISSION")
+    let value = env::var("DEX_PERMISSION")
         .ok()
         .or_else(|| file.permission.clone())
         .unwrap_or_else(|| "ask-writes".to_string());
@@ -65,6 +73,7 @@ pub(crate) struct LlmConfig {
     pub(crate) max_tool_iterations: usize,
     pub(crate) max_prompt_tokens: u64,
     pub(crate) max_turn_seconds: u64,
+    pub(crate) verify_command: Option<String>,
     pub(crate) client: reqwest::blocking::Client,
 }
 
@@ -76,7 +85,7 @@ impl LlmConfig {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let file = load_file_config()?;
         crate::tools::set_output_limit(
-            env::var("OYE_TOOL_OUTPUT_BYTES")
+            env::var("DEX_TOOL_OUTPUT_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_tool_output_bytes)
@@ -86,7 +95,7 @@ impl LlmConfig {
             Some(mode) => mode,
             None => permission_from_env_or_file(&file)?,
         };
-        let provider_name = env::var("OYE_PROVIDER")
+        let provider_name = env::var("DEX_PROVIDER")
             .ok()
             .or(file.provider)
             .unwrap_or_else(|| "opencode".to_string());
@@ -98,7 +107,7 @@ impl LlmConfig {
                 Provider::OpenCode => "gpt-5.6-luna".to_string(),
                 Provider::OpenAiCodex => "gpt-5.6-luna".to_string(),
             });
-        let mut available_models = env::var("OYE_MODELS")
+        let mut available_models = env::var("DEX_MODELS")
             .ok()
             .map(|value| {
                 value
@@ -152,6 +161,16 @@ impl LlmConfig {
             ),
             Provider::OpenAiCodex => load_codex_credentials()?,
         };
+        // Resolve context window once, then derive max_prompt_tokens from it
+        // so the two limits can never disagree (old default: both 128k).
+        let context_window = env::var("DEX_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.context_window)
+            .unwrap_or_else(|| provider_default_context_window(provider));
+        let derived_max_prompt = context_window
+            .saturating_sub(16_000)
+            .min(context_window * 3 / 4);
         Ok(Self {
             provider,
             api_key,
@@ -161,32 +180,27 @@ impl LlmConfig {
             api,
             account_id,
             thinking_effort: file.thinking_effort,
-            // Context window in tokens; configurable via file (`context_window`)
-            // or OYE_CONTEXT_WINDOW env, with a conservative default.
-            context_window: env::var("OYE_CONTEXT_WINDOW")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(file.context_window)
-                .unwrap_or(128_000),
+            context_window,
+            verify_command: env::var("DEX_VERIFY").ok().or(file.verify_command.clone()),
             permission,
-            max_tool_iterations: env::var("OYE_MAX_TOOL_ITERATIONS")
+            max_tool_iterations: env::var("DEX_MAX_TOOL_ITERATIONS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_tool_iterations)
                 .unwrap_or(60),
-            max_prompt_tokens: env::var("OYE_MAX_PROMPT_TOKENS")
+            max_prompt_tokens: env::var("DEX_MAX_PROMPT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_prompt_tokens)
-                .unwrap_or(128_000),
-            max_turn_seconds: env::var("OYE_MAX_TURN_SECONDS")
+                .unwrap_or(derived_max_prompt),
+            max_turn_seconds: env::var("DEX_MAX_TURN_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_turn_seconds)
                 .unwrap_or(3600),
             client: reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(
-                    env::var("OYE_HTTP_CONNECT_TIMEOUT_SECS")
+                    env::var("DEX_HTTP_CONNECT_TIMEOUT_SECS")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .or(file.http_connect_timeout_secs)
@@ -196,7 +210,7 @@ impl LlmConfig {
                 // connect and to each individual body read (not to the whole
                 // streamed response), so long-lived SSE streams are safe.
                 .timeout(Duration::from_secs(
-                    env::var("OYE_HTTP_REQUEST_TIMEOUT_SECS")
+                    env::var("DEX_HTTP_REQUEST_TIMEOUT_SECS")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .or(file.http_request_timeout_secs)
@@ -204,6 +218,17 @@ impl LlmConfig {
                 ))
                 .build()?,
         })
+    }
+
+    /// Trigger compaction when prompt exceeds this many tokens.
+    /// Half the window leaves room for completion + tool overhead.
+    pub(crate) fn compaction_threshold(&self) -> u64 {
+        self.context_window / 2
+    }
+
+    /// Tokens reserved for the model's reply.
+    pub(crate) fn reserve_tokens(&self) -> u64 {
+        8192
     }
 
     pub(crate) fn switch_provider(

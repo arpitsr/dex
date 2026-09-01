@@ -27,6 +27,65 @@ pub(crate) fn within_budget(deadline: Instant) -> bool {
 /// When this many iterations remain, nudge the model to wrap up.
 pub(crate) const WRAP_UP_THRESHOLD: usize = 5;
 
+fn load_plan(session: &Option<&mut Session>) -> crate::core::types::Plan {
+    session
+        .as_ref()
+        .and_then(|s| s.path().map(crate::session::load_plan))
+        .unwrap_or_default()
+}
+
+fn plan_injection(plan: &crate::core::types::Plan) -> Option<String> {
+    plan.summary().map(|s| format!("[Plan context]\n{s}"))
+}
+
+fn capture_git_context(cancel: &dyn CancellationSource) -> Option<String> {
+    let mut parts = Vec::new();
+    // Git snapshot — reuse tool_git via direct execute so timeout/cancellation applies.
+    // This is ephemeral (not persisted): only the git stat, not the plan.
+    // The plan is injected separately as `name:plan` each turn.
+    for mode in ["status", "diff"] {
+        let mut args = serde_json::Map::new();
+        args.insert("mode".into(), serde_json::Value::String(mode.into()));
+        if let Ok(out) = crate::tools::execute("git", &args, cancel) {
+            let trimmed = out.trim();
+            if !trimmed.is_empty()
+                && !trimmed.contains("not a git repository")
+                && !trimmed.contains("fatal:")
+            {
+                let header = if mode == "status" {
+                    "git status:"
+                } else {
+                    "git diff --stat:"
+                };
+                parts.push(format!("{header}\n{trimmed}"));
+            }
+        }
+        if parts.join("\n").lines().count() >= 10 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut msg = parts.join("\n\n");
+    // Cap ~10 lines
+    let lines: Vec<&str> = msg.lines().collect();
+    if lines.len() > 10 {
+        msg = format!("{}\n[... truncated]", lines[..10].join("\n"));
+    }
+    Some(format!("[Turn context]\n{msg}"))
+}
+
+fn stuck_nudge(attempt: usize, reason: &str) -> String {
+    let guidance = match attempt {
+        1 => "Try a direct fix for the immediate error (check arguments, file paths, or exact oldText).",
+        2 => "Inspect surrounding architecture/files for context you may be missing.",
+        3 => "Question the assumption behind the approach — maybe the goal needs a different path.",
+        _ => "Propose a re-plan to the user: summarize progress, state what failed, and suggest the next steps.",
+    };
+    format!("[System] Stuck detected ({reason}) — escalation {attempt}: {guidance}")
+}
+
 pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<String> {
     let denied = match mode {
         PermissionMode::ReadOnly => !matches!(name, "read" | "grep" | "find" | "git"),
@@ -34,7 +93,43 @@ pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<Stri
         PermissionMode::AskShell => name == "bash",
         PermissionMode::Trusted => false,
     };
-    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure OYE_PERMISSION", name))
+    denied.then(|| format!("Error: tool '{}' requires approval; use --permission trusted or configure DEX_PERMISSION", name))
+}
+
+fn audit_approval(name: &str, input: &str, decision: &str) {
+    let Some(base) = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        })
+    else {
+        return;
+    };
+    let path = base.join("dex/audit.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&input, &mut hasher);
+    use std::hash::Hasher;
+    let input_hash = format!("{:016x}", hasher.finish());
+    let record = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+        "tool": name,
+        "input_hash": input_hash,
+        "decision": decision,
+        "actor": "local",
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
 }
 
 pub(crate) fn approve_tool(
@@ -61,7 +156,7 @@ pub(crate) fn approve_tool(
     if permission_denied(mode, name).is_none() {
         return true;
     }
-    if console.session_approved(name) {
+    if console.session_approved(name, input) {
         return true;
     }
     // Remote approval: daemon sends the request via SSE and blocks for the
@@ -78,12 +173,19 @@ pub(crate) fn approve_tool(
                 .is_ok()
             {
                 return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
-                    ApprovalDecision::Once => true,
-                    ApprovalDecision::Session => {
-                        console.record_session_approval(name);
+                    ApprovalDecision::Once => {
+                        audit_approval(name, input, "once");
                         true
                     }
-                    ApprovalDecision::Deny => false,
+                    ApprovalDecision::Session => {
+                        audit_approval(name, input, "session");
+                        console.record_session_approval(name, input);
+                        true
+                    }
+                    ApprovalDecision::Deny => {
+                        audit_approval(name, input, "deny");
+                        false
+                    }
                 };
             }
         }
@@ -104,12 +206,19 @@ pub(crate) fn approve_tool(
                 .is_ok()
             {
                 return match response_rx.recv().unwrap_or(ApprovalDecision::Deny) {
-                    ApprovalDecision::Once => true,
-                    ApprovalDecision::Session => {
-                        console.record_session_approval(name);
+                    ApprovalDecision::Once => {
+                        audit_approval(name, input, "once");
                         true
                     }
-                    ApprovalDecision::Deny => false,
+                    ApprovalDecision::Session => {
+                        audit_approval(name, input, "session");
+                        console.record_session_approval(name, input);
+                        true
+                    }
+                    ApprovalDecision::Deny => {
+                        audit_approval(name, input, "deny");
+                        false
+                    }
                 };
             }
         }
@@ -263,6 +372,11 @@ pub(crate) fn process_turn(
     // Spins while the agent works; erased automatically on return.
     let _working = SpinnerGuard::start(console, "Working");
     let mut last_tools: Vec<String> = Vec::new();
+    let mut last_failed: Vec<String> = Vec::new();
+    let mut edit_paths: Vec<String> = Vec::new();
+    let mut search_streak: usize = 0;
+    let mut last_verify_hash: Option<u64> = None;
+    let mut escalation_count: usize = 0;
     let mut last_usage: Option<u64> = state.last_usage;
     let cancellation = cancel;
     let mut persisted_cursor = messages.len();
@@ -271,11 +385,24 @@ pub(crate) fn process_turn(
         elapsed_seconds: config.max_turn_seconds,
     };
     let turn_deadline = crate::agent::r#loop::deadline(limits);
+
+    // Turn-scoped context, computed once: plan snapshot + git status/diff.
+    // These are EPHEMERAL — injected into each model call but never pushed
+    // into `messages`, so they don't accumulate per iteration and don't
+    // survive into the persisted session.
+    let turn_plan = load_plan(&session);
+    if !turn_plan.is_empty() {
+        if let Some(sink) = console.sink() {
+            let _ = sink.send(SinkLine::Plan(turn_plan.clone()));
+        }
+    }
+    let plan_text = plan_injection(&turn_plan);
+    let git_ctx = capture_git_context(cancel);
     for iteration in 0..config.max_tool_iterations {
         if !within_budget(turn_deadline) {
             return Err(format!(
                 "turn exceeded the configured time limit ({} seconds); \
-                 raise OYE_MAX_TURN_SECONDS to allow longer turns",
+                 raise DEX_MAX_TURN_SECONDS to allow longer turns",
                 limits.elapsed_seconds
             )
             .into());
@@ -284,9 +411,6 @@ pub(crate) fn process_turn(
         if cancellation.is_cancelled() {
             let _ = cancellation.take_cancelled();
             return Err("cancelled by user".into());
-        }
-        if estimate_tokens(messages) > config.max_prompt_tokens {
-            return Err("prompt exceeded configured token limit".into());
         }
         // Steering is consumed between turns/tool batches, while the worker
         // still owns the conversation state. This avoids concurrent mutation
@@ -303,33 +427,128 @@ pub(crate) fn process_turn(
                     tool_call_id: None,
                     name: Some("steering".to_string()),
                 });
+                persist_pending(&mut session, messages, &mut persisted_cursor);
             }
         }
-        // Nudge the model to finish as we approach the iteration budget.
+        // Ephemeral preamble this iteration: plan + wrap-up nudge (git context
+        // was captured once above). NOT appended to `messages` — injected at
+        // call-time only, so it never accumulates in history.
         let remaining = config.max_tool_iterations.saturating_sub(iteration);
-        if remaining == WRAP_UP_THRESHOLD {
-            messages.push(ChatMessage {
+        let nudge_text: Option<String> = if remaining == WRAP_UP_THRESHOLD {
+            Some(
+                concat!(
+                "[System] You are approaching the tool-call limit for this turn. ",
+                "Before continuing, briefly re-evaluate: (1) why so many tool calls were needed ",
+                "— e.g. repeated reads, failed edits, or exploring the wrong paths; (2) what the ",
+                "user's actual task goal is and the shortest path remaining to reach it. Then ",
+                "recover toward that goal: avoid repeating failed approaches, prefer ",
+                "batched/broader tool calls over many small ones, and if the goal is already ",
+                "(partially) met, state what was accomplished, what remains, and produce your ",
+                "final answer now."
+            )
+                .to_string(),
+            )
+        } else {
+            None
+        };
+
+        // -------- Proactive compaction BEFORE the model call --------
+        // Estimate effective prompt = persistent history + ephemeral preamble + tool schema
+        let ephemerals: [Option<String>; 3] = [
+            git_ctx.clone().map(|s| format!("[Turn context]\n{s}")),
+            plan_text.clone(),
+            nudge_text.clone(),
+        ];
+        let ephemeral_tokens = estimate_ephemeral_tokens(&ephemerals);
+        // Compact loop: keep trying until under threshold or nothing left to compact.
+        // This replaces the old post-call reactive compaction that allowed
+        // overflow between call and next check.
+        let mut compaction_attempts = 0;
+        while compaction_attempts < 3 {
+            let eff = effective_tokens(messages, &ephemerals, true);
+            let need_by_tokens = eff > config.compaction_threshold()
+                || eff
+                    > config
+                        .max_prompt_tokens
+                        .saturating_sub(config.reserve_tokens());
+            let need_by_count = messages.len() > 1 + KEEP_RECENT_MESSAGES;
+            if !need_by_tokens && !need_by_count {
+                break;
+            }
+            match compact_history(config, messages, cancel) {
+                Ok(true) => {
+                    compaction_attempts += 1;
+                    // Re-persist the compacted history so a session reload
+                    // sees the same compacted view as memory: clear marker,
+                    // then the summary + recent window. The system prompt is
+                    // rebuilt at load, so skip index 0.
+                    if let Some(session) = session.as_deref_mut() {
+                        let _ = session.clear_messages();
+                        for message in messages.iter().skip(1) {
+                            let _ = session.append_message(message.clone());
+                        }
+                    }
+                    persisted_cursor = messages.len();
+                    continue;
+                }
+                Ok(false) => break,
+                Err(e) if e.contains("cancelled") => return Err(e.into()),
+                Err(e) => {
+                    // Non-cancel failures already fell back to the
+                    // deterministic summary inside compact_history; an Err
+                    // here means cancellation. Propagate.
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // Hard-limit check AFTER compaction, including ephemeral overhead.
+        let eff_after = effective_tokens(messages, &ephemerals, true);
+        if eff_after > config.max_prompt_tokens {
+            return Err(format!(
+                "prompt ({} tokens) exceeds max_prompt_tokens ({}); {} history messages \
+                 plus {} tokens of turn context. Compaction already ran — narrow the task \
+                 or raise DEX_CONTEXT_WINDOW / DEX_MAX_PROMPT_TOKENS.",
+                eff_after,
+                config.max_prompt_tokens,
+                messages.len(),
+                ephemeral_tokens
+            )
+            .into());
+        }
+
+        // Build effective messages for this model call (persistent + ephemeral).
+        let mut effective_messages: Vec<ChatMessage> = messages.clone();
+        if let Some(ctx) = &git_ctx {
+            effective_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(format!("[Turn context]\n{ctx}")),
+                tool_calls: None,
+                tool_call_id: None,
+                name: Some("context".to_string()),
+            });
+        }
+        if let Some(text) = &plan_text {
+            effective_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(text.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: Some("plan".to_string()),
+            });
+        }
+        if let Some(nudge) = &nudge_text {
+            effective_messages.push(ChatMessage {
                 role: "user".to_string(),
-                content: Some(
-                    "[System] You are approaching the tool-call limit for this turn. \
-                     Before continuing, briefly re-evaluate: (1) why so many tool \
-                     calls were needed — e.g. repeated reads, failed edits, or \
-                     exploring the wrong paths; (2) what the user's actual task goal \
-                     is and the shortest path remaining to reach it. Then recover \
-                     toward that goal: avoid repeating failed approaches, prefer \
-                     batched/broader tool calls over many small ones, and if the goal \
-                     is already (partially) met, state what was accomplished, what \
-                     remains, and produce your final answer now."
-                        .to_string(),
-                ),
+                content: Some(nudge.clone()),
                 tool_calls: None,
                 tool_call_id: None,
                 name: Some("system-nudge".to_string()),
             });
-            persist_pending(&mut session, messages, &mut persisted_cursor);
         }
+
         let (message, usage) =
-            match call_client_cancellable(client, cancel, messages, true, console) {
+            match call_client_cancellable(client, cancel, &effective_messages, true, console) {
                 Ok(result) => result,
                 Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
                     return Err("cancelled by user".into());
@@ -346,12 +565,10 @@ pub(crate) fn process_turn(
                 let _ = sink.send(SinkLine::Usage(tokens));
             }
         }
-        // Compact when either the message count or an estimated token
-        // budget is exceeded (API-reported usage takes precedence).
-        let est = last_usage.unwrap_or_else(|| estimate_tokens(messages));
-        if messages.len() > 1 + KEEP_RECENT_MESSAGES || est > config.context_window / 2 {
-            compact_history(config, messages, cancel)?;
-        }
+        // Post-call compaction is intentionally removed: the next iteration's
+        // pre-call compaction handles any overflow from tool results just pushed.
+        // This prevents the old order-bug where overflow between push and next
+        // call's hard-limit check was fatal.
         if let Some(calls) = message.tool_calls.clone() {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
@@ -466,7 +683,7 @@ pub(crate) fn process_turn(
                         }
                         cached.clone()
                     } else {
-                        state.insert(cache_key, outcome.text.clone());
+                        state.insert(cache_key.clone(), outcome.text.clone());
                         outcome.text
                     }
                 } else {
@@ -513,6 +730,140 @@ pub(crate) fn process_turn(
                     name: None,
                 });
                 persist_pending(&mut session, messages, &mut persisted_cursor);
+                // — stuck detection ledger —
+                if !ok {
+                    if last_failed.len() >= 6 {
+                        last_failed.remove(0);
+                    }
+                    last_failed.push(cache_key.clone());
+                }
+                if matches!(name.as_str(), "edit" | "write") {
+                    if let Ok(v) = serde_json::from_str::<Value>(&input) {
+                        if let Some(p) = v.get("path").and_then(Value::as_str) {
+                            if edit_paths.len() >= 6 {
+                                edit_paths.remove(0);
+                            }
+                            edit_paths.push(p.to_string());
+                        }
+                    }
+                }
+                if matches!(name.as_str(), "grep" | "find") {
+                    search_streak += 1;
+                } else if name == "read" {
+                    search_streak = 0;
+                }
+            }
+            if batch_has_mutation {
+                state.verify_dirty = true;
+            }
+            // — stuck detection — check patterns and escalate
+            let mut stuck_reason: Option<String> = None;
+            if last_failed
+                .iter()
+                .filter(|k| **k == last_failed.last().cloned().unwrap_or_default())
+                .count()
+                >= 3
+            {
+                stuck_reason = Some("identical failed tool calls".into());
+            } else if edit_paths.len() >= 3
+                && edit_paths[edit_paths.len() - 1] == edit_paths[edit_paths.len() - 2]
+                && edit_paths[edit_paths.len() - 2] == edit_paths[edit_paths.len() - 3]
+            {
+                stuck_reason = Some(format!(
+                    "repeated edits to {}",
+                    edit_paths.last().unwrap_or(&String::new())
+                ));
+            } else if search_streak >= 4 {
+                stuck_reason = Some("consecutive searches without a read".into());
+            }
+            if let Some(reason) = stuck_reason {
+                escalation_count += 1;
+                if escalation_count > 3 {
+                    return Err(format!(
+                        "stuck: {reason} — escalation limit reached; aborting turn. {}",
+                        "Partial progress preserved; please re-plan."
+                    )
+                    .into());
+                }
+                let nudge = stuck_nudge(escalation_count, &reason);
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(nudge),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("system-nudge".into()),
+                });
+                persist_pending(&mut session, messages, &mut persisted_cursor);
+                if escalation_count == 3 {
+                    search_streak = 0;
+                }
+            }
+            // — verification hook —
+            if let Some(cmd) = config.verify_command.clone() {
+                if state.verify_dirty
+                    && within_budget(turn_deadline)
+                    && iteration + 1 < config.max_tool_iterations
+                {
+                    if cancel.is_cancelled() {
+                        return Err("cancelled by user".into());
+                    }
+                    state.verify_dirty = false;
+                    let mut vargs = serde_json::Map::new();
+                    vargs.insert("command".into(), Value::String(cmd.clone()));
+                    let vres = crate::tools::execute_outcome(
+                        "bash",
+                        &vargs,
+                        cancel as &dyn CancellationSource,
+                    );
+                    let tail = vres
+                        .text
+                        .lines()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if vres.ok {
+                        if let Some(sink) = console.sink() {
+                            let _ = sink.send(SinkLine::System("verify \u{2713}".into()));
+                        }
+                    } else {
+                        let hash = {
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+                            let mut h = DefaultHasher::new();
+                            vres.text.lines().next().unwrap_or("").hash(&mut h);
+                            h.finish()
+                        };
+                        let same_sig = last_verify_hash == Some(hash);
+                        last_verify_hash = Some(hash);
+                        if same_sig {
+                            escalation_count += 1;
+                            if escalation_count > 3 {
+                                return Err("verification repeatedly failed with same error — aborting turn.".into());
+                            }
+                            let nudge =
+                                stuck_nudge(escalation_count, "verify failing with same signature");
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: Some(nudge),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: Some("system-nudge".into()),
+                            });
+                        }
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: Some(format!("[verify failed]\n{tail}")),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: Some("verify".into()),
+                        });
+                        persist_pending(&mut session, messages, &mut persisted_cursor);
+                    }
+                }
             }
             state.save();
         } else {
@@ -617,6 +968,7 @@ mod tests {
             max_tool_iterations: 8,
             max_prompt_tokens: 128_000,
             max_turn_seconds: 60,
+            verify_command: None,
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -768,5 +1120,317 @@ mod tests {
             })
             .collect();
         assert_eq!(usage_events, vec![1, 1]);
+    }
+
+    #[test]
+    fn plan_is_injected_before_first_model_call() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct CapturingMock {
+            captured: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+        impl ModelClient for CapturingMock {
+            fn complete(
+                &self,
+                messages: &[ChatMessage],
+                _with_tools: bool,
+                _sink: Option<mpsc::Sender<SinkLine>>,
+                _cancel: &dyn CancellationSource,
+            ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+                self.captured.lock().unwrap().push(messages.to_vec());
+                Ok((
+                    ChatMessage {
+                        role: "assistant".into(),
+                        content: Some("done".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    },
+                    Some(1),
+                ))
+            }
+        }
+        // Create a persisted session with a plan (no global cwd change — leaves parallel tests alone).
+        let cwd = format!(
+            "/tmp/dex-plan-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let mut session = Session::new(cwd.clone(), None).unwrap();
+        let plan = crate::core::types::Plan {
+            goal: Some("test goal".into()),
+            steps: vec![("step one".into(), false), ("step two".into(), true)],
+        };
+        crate::session::save_plan(&mut session, &plan).unwrap();
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let mut state = ToolState::default();
+        let captured: Arc<Mutex<Vec<Vec<ChatMessage>>>> = Arc::new(Mutex::new(Vec::new()));
+        let mock = CapturingMock {
+            captured: captured.clone(),
+        };
+        let config = test_config();
+        let session_path = session.path().map(|p| p.to_path_buf());
+        let res = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            Some(&mut session),
+            &mock,
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        );
+        if let Some(p) = session_path {
+            let _ = std::fs::remove_file(p);
+        }
+        assert!(res.is_ok());
+        let all = captured.lock().unwrap();
+        assert!(!all.is_empty());
+        let first = &all[0];
+        // First model call must contain the plan context.
+        assert!(first.iter().any(|m| m.name.as_deref() == Some("plan")
+            && m.content.as_deref().unwrap_or("").contains("test goal")));
+        // And the turn-start context (plan summary) as well.
+        assert!(first.iter().any(|m| m.name.as_deref() == Some("context")));
+    }
+
+    /// Mock that plays a scripted sequence of responses and captures every
+    /// prompt it was called with.
+    #[derive(Clone)]
+    struct ScriptedMock {
+        responses: std::sync::Arc<Vec<ChatMessage>>,
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl ScriptedMock {
+        fn new(responses: Vec<ChatMessage>) -> Self {
+            Self {
+                responses: std::sync::Arc::new(responses),
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                captured: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ModelClient for ScriptedMock {
+        fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _with_tools: bool,
+            _sink: Option<mpsc::Sender<SinkLine>>,
+            _cancel: &dyn CancellationSource,
+        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.captured.lock().unwrap().push(messages.to_vec());
+            let reply = self
+                .responses
+                .get(round)
+                .cloned()
+                .unwrap_or_else(|| ChatMessage {
+                    role: "assistant".into(),
+                    content: Some("done".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            Ok((reply, None))
+        }
+    }
+
+    fn tool_call_msg(name: &str, args: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![LlmToolCall {
+                id: "call-x".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: args.into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn text_msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn plan_context_is_ephemeral_injected_every_call_but_never_persisted() {
+        let cwd = format!(
+            "/tmp/dex-ephemeral-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let mut session = Session::new(cwd.clone(), None).unwrap();
+        let plan = crate::core::types::Plan {
+            goal: Some("ephemeral goal".into()),
+            steps: vec![("step".into(), false)],
+        };
+        crate::session::save_plan(&mut session, &plan).unwrap();
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let mut state = ToolState::default();
+        // Two tool rounds then a text answer: the plan must be injected into
+        // all three prompts, but must not accumulate in `messages`.
+        let mock = ScriptedMock::new(vec![
+            tool_call_msg("bash", r#"{"command":"echo hi"}"#),
+            tool_call_msg("bash", r#"{"command":"echo again"}"#),
+            text_msg("done"),
+        ]);
+        let captured = mock.captured.clone();
+        let config = test_config();
+        let session_path = session.path().map(|p| p.to_path_buf());
+        let res = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            Some(&mut session),
+            &mock,
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        );
+        if let Some(p) = session_path {
+            let _ = std::fs::remove_file(p);
+        }
+        assert_eq!(res.unwrap(), "done");
+
+        let all = captured.lock().unwrap();
+        assert_eq!(all.len(), 3, "three model calls");
+        for (i, prompt) in all.iter().enumerate() {
+            assert!(
+                prompt.iter().any(|m| m.name.as_deref() == Some("plan")
+                    && m.content
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("ephemeral goal")),
+                "prompt {i} must carry the plan"
+            );
+        }
+        // The persistent history contains NO plan/nudge/context messages —
+        // they are call-time injections, not accumulated turns.
+        for m in &messages {
+            assert_ne!(m.name.as_deref(), Some("plan"), "plan leaked into history");
+            assert_ne!(
+                m.name.as_deref(),
+                Some("system-nudge"),
+                "nudge leaked into history"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_runs_before_the_model_call_and_session_stays_consistent() {
+        let cwd = format!(
+            "/tmp/dex-compact-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let mut session = Session::new(cwd.clone(), None).unwrap();
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        // 30 history messages: over the KEEP_RECENT threshold, so the FIRST
+        // iteration must compact before calling the model. (This is the
+        // regression for the old order bug where the hard-limit check ran
+        // before compaction and killed the turn.)
+        for i in 0..15 {
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: Some(format!("question {i} about module file_{i}.rs")),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: Some(format!("answer {i} edited file_{i}.rs")),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        let initial_len = messages.len();
+        let mut state = ToolState::default();
+        let mock = ScriptedMock::new(vec![
+            tool_call_msg("bash", r#"{"command":"echo hi"}"#),
+            text_msg("done"),
+        ]);
+        let config = test_config();
+        let session_path = session.path().map(|p| p.to_path_buf());
+        let res = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            Some(&mut session),
+            &mock,
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        );
+        let reloaded = session
+            .path()
+            .and_then(|p| crate::session::load_messages_from_session(p).ok());
+        if let Some(p) = session_path {
+            let _ = std::fs::remove_file(p);
+        }
+        assert_eq!(res.unwrap(), "done");
+        // The first model call already saw compacted history.
+        {
+            let all = mock.captured.lock().unwrap();
+            assert!(
+                all[0].len() < initial_len,
+                "first model call must use compacted history: {} vs {initial_len}",
+                all[0].len()
+            );
+            assert!(
+                all[0].iter().any(|m| m.name.as_deref() == Some("summary")),
+                "first model call must contain the summary"
+            );
+        }
+        // In-memory history shrank and carries the summary.
+        assert!(messages.len() < initial_len);
+        assert_eq!(messages[1].name.as_deref(), Some("summary"));
+        // Session reload sees the same compacted view as memory (no stale
+        // pre-compaction turns resurrected).
+        let reloaded = reloaded.expect("session reload");
+        let expected: Vec<serde_json::Value> = messages[1..]
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let got: Vec<serde_json::Value> = reloaded
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(got, expected, "session file must match compacted memory");
     }
 }

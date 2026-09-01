@@ -20,7 +20,8 @@ use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLin
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
-    ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, StreamEvent,
+    ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, LoadSkillRequest, SkillInfo,
+    StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills, skill_dirs};
@@ -31,10 +32,12 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/config", get(get_config))
+        .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
         .route("/api/sessions/{id}/approve", post(approve))
         .route("/api/sessions/{id}/cancel", post(cancel))
+        .route("/api/sessions/{id}/skill", post(load_skill))
         .with_state(state)
 }
 
@@ -83,7 +86,7 @@ fn resolve_daemon_info() -> DaemonInfo {
                 .ok()
                 .or_else(|| file.as_ref().and_then(|f| f.model.clone()))
                 .unwrap_or_else(|| "unknown".to_string());
-            let provider_name = std::env::var("OYE_PROVIDER")
+            let provider_name = std::env::var("DEX_PROVIDER")
                 .ok()
                 .or_else(|| file.as_ref().and_then(|f| f.provider.clone()))
                 .unwrap_or_else(|| "opencode".to_string());
@@ -117,6 +120,88 @@ async fn get_config() -> Json<DaemonInfo> {
             git_dirty: false,
         });
     Json(info)
+}
+
+async fn list_skills() -> Json<serde_json::Value> {
+    let skills = tokio::task::spawn_blocking(|| {
+        let dirs = skill_dirs();
+        discover_skills(&dirs)
+    })
+    .await
+    .unwrap_or_default();
+    let infos: Vec<SkillInfo> = skills
+        .into_iter()
+        .map(|s| SkillInfo {
+            name: s.name,
+            description: s.description,
+        })
+        .collect();
+    Json(json!({ "skills": infos }))
+}
+
+async fn load_skill(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<LoadSkillRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if req.name.is_empty()
+        || !req
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let entry = {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(&session_id).cloned()
+    }
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let skill_name = req.name.clone();
+    let extra_dirs = req.skill_dirs.clone();
+    let (skill, content) = tokio::task::spawn_blocking(move || {
+        let mut dirs = skill_dirs();
+        dirs.extend(extra_dirs.iter().map(std::path::PathBuf::from));
+        let skills = discover_skills(&dirs);
+        let skill = skills.into_iter().find(|s| s.name == skill_name)?;
+        let content = std::fs::read_to_string(&skill.path).ok()?;
+        Some((skill, content))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let skill_for_msg = skill.clone();
+    let content_for_msg = content.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut session = if entry.path.exists() {
+            Session::from_path(&entry.path).map_err(|e| format!("load session: {e}"))?
+        } else {
+            Session::new(entry.cwd.clone(), entry.name.clone())
+                .map_err(|e| format!("create session: {e}"))?
+        };
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: Some(format!(
+                "--- Skill: {} ---\n{}",
+                skill_for_msg.name, content_for_msg
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            name: Some("skill".to_string()),
+        };
+        session
+            .append_message(msg)
+            .map_err(|e| format!("append: {e}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({
+        "name": skill.name,
+        "description": skill.description,
+        "content": content,
+    })))
 }
 
 async fn create_session(
@@ -329,8 +414,31 @@ fn run_turn_inner(
             .map_err(|e| format!("failed to create session: {e}"))?
     };
 
+    // Persist plan forwarded by the client (remote TUI slash commands). Empty string clears.
+    if let Some(plan_json) = &req.plan {
+        if plan_json.is_empty() {
+            let _ = session.set_state("plan", &crate::core::types::Plan::default().to_json());
+        } else {
+            let _ = session.set_state("plan", plan_json);
+        }
+    }
+
+    // Permission ceiling: daemon policy (file/env) is max; client may only go stricter.
+    let daemon_perm = crate::llm::config::load_file_config()
+        .ok()
+        .and_then(|f| crate::llm::config::permission_from_env_or_file(&f).ok())
+        .unwrap_or(crate::core::types::PermissionMode::AskWrites);
+    if let Some(req_perm_str) = &req.permission {
+        let req_perm = crate::core::types::PermissionMode::parse(req_perm_str)?;
+        if req_perm.permissiveness() > daemon_perm.permissiveness() {
+            return Err(format!(
+                "permission escalation denied: daemon ceiling is {:?} (client requested {:?}); use a stricter mode or change daemon config",
+                daemon_perm, req_perm
+            ));
+        }
+    }
     // Build the config from the daemon's own environment/config file, with
-    // optional per-request overrides sent by the client.
+    // optional per-request overrides sent by the client (now validated).
     let config = LlmConfig::from_env(
         req.base_url.clone().filter(|v| !v.is_empty()),
         req.model.clone().filter(|v| !v.is_empty()),
@@ -408,6 +516,10 @@ fn run_turn_inner(
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
                     SinkLine::Usage(tokens) => StreamEvent::Usage { tokens },
+                    SinkLine::Plan(plan) => StreamEvent::Plan {
+                        goal: plan.goal,
+                        steps: plan.steps,
+                    },
                 };
                 let _ = stream_tx.blocking_send(event);
             }
@@ -431,9 +543,13 @@ fn run_turn_inner(
                     continue;
                 }
                 let request_id = uuid::Uuid::new_v4().to_string();
+                let name_clone = request.name.clone();
+                let input_clone = request.input.clone();
                 let parked = PendingApproval {
                     session_id: session_id.clone(),
                     response: request.response,
+                    name: name_clone,
+                    input: input_clone,
                 };
                 let replaced = state
                     .pending_approvals
@@ -490,6 +606,50 @@ async fn approve(
                 crate::protocol::ApprovalDecision::AllowSession => ApprovalDecision::Session,
                 crate::protocol::ApprovalDecision::Deny => ApprovalDecision::Deny,
             };
+            // Audit: best-effort, redacted input hash, actor, request_id
+            {
+                let Some(base) = std::env::var_os("XDG_DATA_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|h| std::path::PathBuf::from(h).join(".local/share"))
+                    })
+                else {
+                    let _ = pending.response.send(decision);
+                    return Ok(Json(json!({ "status": "ok" })));
+                };
+                let path = base.join("dex/audit.jsonl");
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&pending.input, &mut hasher);
+                use std::hash::Hasher;
+                let input_hash = format!("{:016x}", hasher.finish());
+                let decision_str = match decision {
+                    ApprovalDecision::Once => "once",
+                    ApprovalDecision::Session => "session",
+                    ApprovalDecision::Deny => "deny",
+                };
+                let record = serde_json::json!({
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "session_id": session_id,
+                    "request_id": req.request_id,
+                    "tool": pending.name,
+                    "input_hash": input_hash,
+                    "decision": decision_str,
+                    "actor": "remote",
+                });
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let mut line = record.to_string();
+                    line.push('\n');
+                    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+                }
+            }
             let _ = pending.response.send(decision);
             Ok(Json(json!({ "status": "ok" })))
         }

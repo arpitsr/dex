@@ -43,6 +43,8 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub permission: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 /// Response to approve/deny a tool execution. `request_id` must match the
@@ -123,6 +125,37 @@ pub enum StreamEvent {
     /// An error occurred.
     #[serde(rename = "error")]
     Error(String),
+
+    /// Plan update for remote UI sync.
+    #[serde(rename = "plan")]
+    Plan {
+        goal: Option<String>,
+        steps: Vec<(String, bool)>,
+    },
+}
+
+/// A single skill entry advertised by the daemon (discovered from its
+/// workspace). The body is fetched on demand via `POST /api/sessions/{id}/skill`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// Request to load a skill into the current session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadSkillRequest {
+    pub name: String,
+    #[serde(default)]
+    pub skill_dirs: Vec<String>,
+}
+
+/// Response after loading a skill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadSkillResponse {
+    pub name: String,
+    pub description: String,
+    pub content: String,
 }
 
 /// Runtime info about the daemon, returned by `GET /api/config`. The client

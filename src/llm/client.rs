@@ -23,9 +23,14 @@ pub(crate) struct ModelCapabilities {
 }
 
 pub(crate) fn discover_capabilities(config: &LlmConfig) -> ModelCapabilities {
+    // Static per-provider table — no runtime probing.
+    let (streaming, tools) = match config.provider {
+        crate::core::types::Provider::OpenCode => (true, true),
+        crate::core::types::Provider::OpenAiCodex => (true, true),
+    };
     ModelCapabilities {
-        streaming: true,
-        tools: true,
+        streaming,
+        tools,
         responses_api: matches!(config.api, crate::core::types::ApiProtocol::Responses),
     }
 }
@@ -78,7 +83,7 @@ pub(crate) fn provider_log(event: &str, detail: &str) {
     else {
         return;
     };
-    let path = base.join("oye/provider.jsonl");
+    let path = base.join("dex/provider.jsonl");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }

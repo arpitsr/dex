@@ -10,9 +10,10 @@ pub(crate) struct ChatOptions {
     pub(crate) base_url: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) permission: Option<String>,
+    pub(crate) plan: Option<String>,
 }
 
-/// HTTP client for communicating with the oye daemon.
+/// HTTP client for communicating with the dex daemon.
 ///
 /// The blocking reqwest client is deliberate: the TUI runs a dedicated worker
 /// thread per turn that consumes the SSE stream, so no async runtime is
@@ -131,6 +132,7 @@ impl DaemonClient {
                 base_url: options.base_url,
                 model: options.model,
                 permission: options.permission,
+                plan: options.plan,
             })
             .send()?
             .error_for_status()?;
@@ -213,5 +215,47 @@ impl DaemonClient {
             .send()?
             .error_for_status()?;
         Ok(())
+    }
+
+    /// List skills discovered on the daemon (its workspace).
+    pub fn list_skills(&self) -> Result<Vec<SkillInfo>, Box<dyn std::error::Error>> {
+        let resp: serde_json::Value = self
+            .http
+            .get(format!("{}/api/skills", self.base_url))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let skills = resp["skills"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(skills)
+    }
+
+    /// Load a skill by name into the daemon's session history.
+    pub fn load_skill(
+        &self,
+        session_id: &str,
+        name: &str,
+        skill_dirs: &[String],
+    ) -> Result<LoadSkillResponse, Box<dyn std::error::Error>> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/api/sessions/{}/skill",
+                self.base_url, session_id
+            ))
+            .json(&LoadSkillRequest {
+                name: name.to_string(),
+                skill_dirs: skill_dirs.to_vec(),
+            })
+            .send()?
+            .error_for_status()?
+            .json::<LoadSkillResponse>()?;
+        Ok(resp)
     }
 }

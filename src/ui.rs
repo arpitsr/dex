@@ -124,6 +124,11 @@ pub(crate) struct App {
     /// does not merge with the first streamed assistant turn; gaps remain
     /// canonical between blocks.
     pub(crate) assistant_open: bool,
+    pub(crate) plan: crate::core::types::Plan,
+    pub(crate) transcript_version: u64,
+    pub(crate) display_cache: Vec<Line<'static>>,
+    pub(crate) display_cache_width: u16,
+    pub(crate) display_cache_version: u64,
 }
 
 impl App {
@@ -246,6 +251,7 @@ pub(super) fn push_info(app: &mut App, text: String) {
         .push(TranscriptBlock::Info(indent_transcript_line(Line::from(
             Span::styled(text, Style::default().fg(Color::Cyan)),
         ))));
+    app.transcript_version = app.transcript_version.wrapping_add(1);
 }
 
 /// Route a streamed console line into the transcript with the same styling
@@ -263,9 +269,9 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 if app.assistant_open {
                     if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
                         lines.push(Line::default());
+                        app.transcript_version = app.transcript_version.wrapping_add(1);
                     }
                 }
-                app.autoscroll = true;
                 return;
             }
             let new_lines: Vec<Line<'static>> = render::markdown_lines(s.trim_end())
@@ -275,13 +281,13 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             if app.assistant_open {
                 if let Some(TranscriptBlock::Assistant(existing)) = app.transcript.last_mut() {
                     existing.extend(new_lines);
-                    app.autoscroll = true;
+                    app.transcript_version = app.transcript_version.wrapping_add(1);
                     return;
                 }
             }
             app.transcript.push(TranscriptBlock::Assistant(new_lines));
             app.assistant_open = true;
-            app.autoscroll = true;
+            app.transcript_version = app.transcript_version.wrapping_add(1);
             return;
         }
         SinkLine::ToolInput(s) => {
@@ -304,6 +310,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 output: None,
                 preview: Vec::new(),
             });
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::ToolOutput {
             name: _,
@@ -352,7 +359,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 if out.is_none() {
                     *out = Some(output);
                     *prev = preview_lines;
-                    app.autoscroll = true;
+                    app.transcript_version = app.transcript_version.wrapping_add(1);
                     return;
                 }
             }
@@ -365,6 +372,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 output: Some(output),
                 preview: preview_lines,
             });
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::System(s) => {
             app.assistant_open = false;
@@ -375,10 +383,14 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                         Span::styled(s, Style::default().fg(theme::muted_fg())),
                     ],
                 ))));
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         // Usage updates flow into the status bar via StreamEvent::Usage in
         // the remote handler, not into the transcript.
         SinkLine::Usage(_) => {}
+        SinkLine::Plan(plan) => {
+            app.plan = plan;
+        }
         SinkLine::Error(s) => {
             app.assistant_open = false;
             app.transcript
@@ -388,9 +400,12 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                         Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
                     ],
                 ))));
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
     }
-    app.autoscroll = true;
+    // ponytail: sticky autoscroll — don't force true on every append;
+    // TranscriptView snaps only when already at bottom, so manual scroll
+    // during streaming stays put instead of snapping back each chunk.
 }
 
 fn dim_intermediate_assistant_block(app: &mut App) {
@@ -437,32 +452,18 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
     }
     block_lines.push(Line::from(edge_pad));
     app.transcript.push(TranscriptBlock::User(block_lines));
+    app.transcript_version = app.transcript_version.wrapping_add(1);
+    app.autoscroll = true;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
-    #[test]
-    fn indent_transcript_line_adds_gutter() {
-        let line = Line::from("test");
-        let indented = indent_transcript_line(line);
-        assert!(indented.spans[0].content.as_ref() == " ");
-    }
-
-    #[test]
-    fn git_context_returns_empty_on_non_repo() {
-        let (branch, dirty) = crate::core::format::git_context("/tmp/not-a-repo-12345");
-        assert!(branch.is_none());
-        assert!(!dirty);
-    }
-
-    #[test]
-    fn tool_preview_lines_are_indented_and_dimmed() {
-        // Preview formatting is exercised through the Tool block produced by
-        // `append_sink_line`; the stored preview lines must be indented and
-        // dimmed exactly as before.
-        let mut app = App {
+    fn test_app() -> App {
+        App {
             transcript: Vec::new(),
             input: crate::ui::input::InputField::new(),
             config: crate::llm::config::LlmConfig {
@@ -479,6 +480,7 @@ mod tests {
                 max_tool_iterations: 60,
                 max_prompt_tokens: 128_000,
                 max_turn_seconds: 900,
+                verify_command: None,
                 client: reqwest::blocking::Client::new(),
             },
             messages: Vec::new(),
@@ -509,7 +511,34 @@ mod tests {
             history_draft: String::new(),
             slash_selected: 0,
             assistant_open: false,
-        };
+            plan: crate::core::types::Plan::default(),
+            transcript_version: 0,
+            display_cache: Vec::new(),
+            display_cache_width: 0,
+            display_cache_version: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn indent_transcript_line_adds_gutter() {
+        let line = Line::from("test");
+        let indented = indent_transcript_line(line);
+        assert!(indented.spans[0].content.as_ref() == " ");
+    }
+
+    #[test]
+    fn git_context_returns_empty_on_non_repo() {
+        let (branch, dirty) = crate::core::format::git_context("/tmp/not-a-repo-12345");
+        assert!(branch.is_none());
+        assert!(!dirty);
+    }
+
+    #[test]
+    fn tool_preview_lines_are_indented_and_dimmed() {
+        // Preview formatting is exercised through the Tool block produced by
+        // `append_sink_line`; the stored preview lines must be indented and
+        // dimmed exactly as before.
+        let mut app = test_app();
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolInput("bash echo hi".into()),
@@ -534,5 +563,68 @@ mod tests {
         }
         assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
         assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");
+    }
+
+    /// Write a minimal persisted session JSONL (same entry shapes
+    /// `Session::new`/`set_state` produce) so `apply_session_state` can be
+    /// exercised without touching the real session directory.
+    fn write_session_file(state_lines: &[&str]) -> PathBuf {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let mut h = DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        let tid = h.finish();
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "dex-apply-state-{}-{}-{}-{}.jsonl",
+            std::process::id(),
+            tid,
+            nanos,
+            nonce
+        ));
+        let mut lines = vec![r#"{"type":"session","version":1,"id":"statetest","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#.to_string()];
+        lines.extend(state_lines.iter().map(|l| l.to_string()));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn apply_session_state_restores_model_from_session_file() {
+        let path = write_session_file(&[
+            r#"{"type":"session_state","id":"1","timestamp":"2020-01-01T00:00:01Z","key":"model","value":"restored-model"}"#,
+        ]);
+
+        let mut app = test_app();
+        crate::ui::slash::apply_session_state(&mut app, Some(&path));
+
+        assert_eq!(app.config.model, "restored-model");
+        assert!(app
+            .config
+            .available_models
+            .contains(&"restored-model".to_string()));
+    }
+
+    #[test]
+    fn apply_session_state_keeps_config_when_file_has_no_state_entries() {
+        let path = write_session_file(&[]);
+
+        let mut app = test_app();
+        crate::ui::slash::apply_session_state(&mut app, Some(&path));
+
+        assert_eq!(app.config.model, "test");
+    }
+
+    #[test]
+    fn apply_session_state_is_noop_without_a_session_path() {
+        let mut app = test_app();
+        crate::ui::slash::apply_session_state(&mut app, None);
+
+        assert_eq!(app.config.model, "test");
     }
 }

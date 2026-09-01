@@ -15,7 +15,7 @@ pub(crate) trait CancellationSource {
 }
 
 /// Process-global cancellation (Ctrl+C) used by the non-TUI paths
-/// (`oye "prompt"` and `oye --tool`). The TUI/daemon paths use a per-session
+/// (`dex "prompt"` and `dex --tool`). The TUI/daemon paths use a per-session
 /// `CancellationToken` instead, so a cancel never leaks across sessions.
 #[derive(Clone)]
 pub(crate) struct GlobalCancellation;
@@ -29,7 +29,7 @@ impl CancellationSource for GlobalCancellation {
     }
 }
 
-pub(crate) const CACHE_FILE_NAME: &str = "oye-tool-cache.json";
+pub(crate) const CACHE_FILE_NAME: &str = "dex-tool-cache.json";
 
 pub(crate) fn cache_file_path() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
@@ -66,6 +66,7 @@ pub(crate) struct ToolState {
     pub(crate) dirty: bool,
     /// Last API-reported prompt token count for the main conversation.
     pub(crate) last_usage: Option<u64>,
+    pub(crate) verify_dirty: bool,
 }
 
 impl ToolState {
@@ -73,7 +74,7 @@ impl ToolState {
         let mut state = Self::default();
         // Cached tool output can contain source code or secrets. Keep caching
         // opt-in until a caller explicitly requests it.
-        if env::var("OYE_TOOL_CACHE").as_deref() != Ok("1") {
+        if env::var("DEX_TOOL_CACHE").as_deref() != Ok("1") {
             return state;
         }
         if let Some(path) = cache_file_path() {
@@ -100,7 +101,7 @@ impl ToolState {
 
     /// Persist the cache to disk (best-effort; failures are ignored).
     pub(crate) fn save(&self) {
-        if !self.dirty || env::var("OYE_TOOL_CACHE").as_deref() != Ok("1") {
+        if !self.dirty || env::var("DEX_TOOL_CACHE").as_deref() != Ok("1") {
             return;
         }
         if let Some(path) = cache_file_path() {

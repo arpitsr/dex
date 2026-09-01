@@ -73,6 +73,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         max_tool_iterations: 0,
         max_prompt_tokens: 0,
         max_turn_seconds: 0,
+        verify_command: None,
         client: reqwest::blocking::Client::new(),
     }
 }
@@ -80,7 +81,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
 pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std::io::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(std::io::Error::other(
-            "interactive UI requires a terminal (TTY); use `oye connect <url> \"prompt\"` for one-shot",
+            "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
         ));
     }
 
@@ -100,6 +101,19 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         .create_session(&info.cwd, args.session_name.as_deref())
         .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
 
+    // Skills live on the daemon (its workspace). Fetch once for autocomplete
+    // and for local `/skill:` handling; a stale list is harmless — the load
+    // call re-discovers on the daemon side.
+    let daemon_skills = client.list_skills().unwrap_or_default();
+    let tui_skills: Vec<crate::core::types::Skill> = daemon_skills
+        .into_iter()
+        .map(|info| crate::core::types::Skill {
+            name: info.name,
+            description: info.description,
+            path: std::path::PathBuf::from(""),
+        })
+        .collect();
+
     // Per-request overrides so client flags keep working in remote mode.
     let options = ChatOptions {
         skill_dirs: args
@@ -115,6 +129,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             PermissionMode::AskShell => "ask-shell".to_string(),
             PermissionMode::Trusted => "trusted".to_string(),
         }),
+        plan: None,
     };
 
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>();
@@ -128,7 +143,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         messages: Vec::new(),
         tool_state: crate::agent::state::ToolState::default(),
         session: Session::in_memory(info.cwd.clone()),
-        skills: Vec::new(),
+        plan: crate::core::types::Plan::default(),
+        skills: tui_skills,
         turn_start: 0,
         cwd: info.cwd.clone(),
         git_branch: info.git_branch.clone(),
@@ -153,6 +169,10 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         history_draft: String::new(),
         slash_selected: 0,
         assistant_open: false,
+        transcript_version: 0,
+        display_cache: Vec::new(),
+        display_cache_width: 0,
+        display_cache_version: u64::MAX,
     };
     push_info(
         &mut app,
@@ -177,6 +197,23 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // take over; surface colors are resolved from this once.
     super::theme::detect_background();
     enable_raw_mode()?;
+    // Correct fix: consume any OSC 10/11 reply that arrived late.
+    // terminal_colorsaurus writes `\x1b]10;?` / `\x1b]11;?` and reads the
+    // reply; on timeout the reply (`\x1b]10;rgb:…\x07`) stays in the tty
+    // queue and crossterm parses it as Alt+`]` + plain chars + Ctrl-G.
+    // Drain with a short deadline so the full burst is consumed before the
+    // event loop starts. No input hack — just consume at the source.
+    {
+        let drain_deadline = Instant::now() + Duration::from_millis(80);
+        while Instant::now() < drain_deadline {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if event::poll(remaining)? {
+                let _ = event::read();
+            } else {
+                break;
+            }
+        }
+    }
     let _cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
     // No mouse capture: capturing the mouse makes the terminal hand over
@@ -213,7 +250,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
 
             let next = if let Some(event) = pending.pop_front() {
                 event
-            } else if event::poll(Duration::from_millis(50))? {
+            } else if event::poll(Duration::from_millis(16))? {
                 event::read()?
             } else {
                 continue;
@@ -224,8 +261,18 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                     handle_key_event(&mut remote, key, &mut pending)?;
                 }
                 Event::Paste(s) => {
+                    // Tabs would render as tab stops and desync the frame;
+                    // expand them and drop other control characters.
                     for c in s.chars() {
-                        remote.app.input.insert_char(c);
+                        match c {
+                            '\t' => {
+                                for _ in 0..4 {
+                                    remote.app.input.insert_char(' ');
+                                }
+                            }
+                            c if !c.is_control() => remote.app.input.insert_char(c),
+                            _ => {}
+                        }
                     }
                 }
                 Event::Resize(..) => {} // frame recomputed each draw
@@ -314,6 +361,9 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
         StreamEvent::Error(msg) => {
             append_sink_line(&mut remote.app, SinkLine::Error(msg));
         }
+        StreamEvent::Plan { goal, steps } => {
+            remote.app.plan = crate::core::types::Plan { goal, steps };
+        }
     }
 }
 
@@ -356,17 +406,12 @@ fn handle_key_event(
     key: crossterm::event::KeyEvent,
     pending: &mut VecDeque<Event>,
 ) -> std::io::Result<()> {
-    if !remote.app.busy
-        && key.modifiers.is_empty()
-        && matches!(key.code, KeyCode::Up | KeyCode::Down)
-    {
+    if key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down) {
         let mut delta = arrow_delta(key.code);
         let mut wheel = false;
-        let deadline = Instant::now() + ARROW_LOOKAHEAD;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            if !event::poll(remaining)? {
-                break;
-            }
+        // ponytail: poll(0) drain — alternate-scroll bursts are already queued,
+        // no 25ms wait. Keeps wheel instant and stops the "keeps moving" lag.
+        while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(k)
                     if k.kind == KeyEventKind::Press
@@ -376,11 +421,15 @@ fn handle_key_event(
                     wheel = true;
                     delta += arrow_delta(k.code);
                 }
-                other => pending.push_back(other),
+                other => {
+                    pending.push_back(other);
+                    break;
+                }
             }
         }
         if wheel {
-            scroll_transcript(&mut remote.app, delta);
+            // 3 Up per notch -> 9 rows per notch feels responsive without page jump
+            scroll_transcript(&mut remote.app, delta * 3);
             return Ok(());
         }
     }
@@ -573,7 +622,10 @@ fn submit_prompt(remote: &mut RemoteApp) {
     // overlay resolves them via the decision channel.
     let client = remote.client.clone();
     let session_id = remote.session_id.clone();
-    let options = remote.options.clone();
+    let mut options = remote.options.clone();
+    if !remote.app.plan.is_empty() && options.plan.is_none() {
+        options.plan = Some(remote.app.plan.to_json());
+    }
     let prompt = line;
     let event_tx = remote.worker_tx.clone();
     let decision_rx = remote.take_decision_receiver();
@@ -620,72 +672,118 @@ impl RemoteApp {
 /// here; everything else defers to the shared `slash` module. Returns true
 /// when the app should quit.
 fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
-    let app = &mut remote.app;
     match line {
         "/quit" => return true,
         "/clear" | "/new" => {
-            // History lives on the daemon: start a fresh session so the next
-            // turn begins with an empty conversation.
-            match remote.client.create_session(&app.cwd, None) {
+            let cwd = remote.app.cwd.clone();
+            match remote.client.create_session(&cwd, None) {
                 Ok(session) => {
                     remote.session_id = session.session_id;
-                    push_info(app, "new session started.".to_string());
+                    push_info(&mut remote.app, "new session started.".to_string());
                 }
-                Err(e) => push_info(app, format!("could not start new session: {e}")),
+                Err(e) => push_info(&mut remote.app, format!("could not start new session: {e}")),
             }
         }
         "/session" => {
-            push_info(app, format!("session: {} (on daemon)", remote.session_id));
+            let id = remote.session_id.clone();
+            push_info(&mut remote.app, format!("session: {id} (on daemon)"));
         }
         "/help" => {
             push_info(
-                app,
-                "commands: /quit /clear /new /session /permissions /model [<m>]".to_string(),
+                &mut remote.app,
+                "commands: /quit /clear /new /session /permissions /model [<m>] /skill:<name>"
+                    .to_string(),
             );
             push_info(
-                app,
+                &mut remote.app,
                 "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll"
                     .to_string(),
             );
             push_info(
-                app,
+                &mut remote.app,
                 "mouse: drag to select text and copy · wheel scrolls".to_string(),
             );
             push_info(
-                app,
+                &mut remote.app,
                 "while working: Esc/Ctrl+C cancels the turn".to_string(),
             );
         }
-        l if l.starts_with("/provider ")
-            || l.starts_with("/resume")
-            || l.starts_with("/name ")
-            || l.starts_with("/skill:") =>
-        {
-            // Provider/session management runs on the daemon host; the
-            // in-memory client session cannot represent it.
+        _ if line.starts_with("/skill:") => {
+            let name = line["/skill:".len()..].trim().to_string();
+            if name.is_empty() {
+                push_info(&mut remote.app, "usage: /skill:<name>".to_string());
+            } else {
+                let sid = remote.session_id.clone();
+                let dirs = remote.options.skill_dirs.clone();
+                let res = remote.client.load_skill(&sid, &name, &dirs);
+                match res {
+                    Ok(resp) => {
+                        push_info(&mut remote.app, format!("loaded skill: {}", resp.name));
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("404") {
+                            push_info(&mut remote.app, format!("skill not found: {name}"));
+                            let needs_refresh = remote.app.skills.is_empty();
+                            if needs_refresh {
+                                if let Ok(fresh) = remote.client.list_skills() {
+                                    remote.app.skills = fresh
+                                        .into_iter()
+                                        .map(|info| crate::core::types::Skill {
+                                            name: info.name,
+                                            description: info.description,
+                                            path: std::path::PathBuf::from(""),
+                                        })
+                                        .collect();
+                                }
+                            }
+                            let names: Vec<String> =
+                                remote.app.skills.iter().map(|s| s.name.clone()).collect();
+                            if !names.is_empty() {
+                                push_info(&mut remote.app, "available skills:".to_string());
+                                for n in names {
+                                    push_info(&mut remote.app, format!("  - {n}"));
+                                }
+                            }
+                        } else {
+                            push_info(
+                                &mut remote.app,
+                                format!("could not load skill '{name}': {e}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        l if l.starts_with("/provider ") || l.starts_with("/resume") || l.starts_with("/name ") => {
             push_info(
-                app,
+                &mut remote.app,
                 "this command is managed on the daemon host; not supported from a remote client yet"
                     .to_string(),
             );
         }
         _ => {
-            let had_model = app.config.model.clone();
-            let had_permission = app.config.permission;
-            let quit = handle_slash(app, line);
-            // Forward mutations made by handle_slash (model/permission)
-            // so future turns use the same overrides. Base URL and skill dirs
-            // are daemon-owned and not forwarded.
-            if app.config.model != had_model {
-                remote.options.model = Some(app.config.model.clone());
+            let had_model = remote.app.config.model.clone();
+            let had_permission = remote.app.config.permission;
+            let had_plan = remote.app.plan.clone();
+            let quit = handle_slash(&mut remote.app, line);
+            if remote.app.config.model != had_model {
+                remote.options.model = Some(remote.app.config.model.clone());
             }
-            if app.config.permission != had_permission {
-                remote.options.permission = Some(match app.config.permission {
+            if remote.app.config.permission != had_permission {
+                remote.options.permission = Some(match remote.app.config.permission {
                     PermissionMode::ReadOnly => "read-only".to_string(),
                     PermissionMode::AskWrites => "ask-writes".to_string(),
                     PermissionMode::AskShell => "ask-shell".to_string(),
                     PermissionMode::Trusted => "trusted".to_string(),
                 });
+            }
+            if remote.app.plan != had_plan {
+                if remote.app.plan.is_empty() {
+                    remote.options.plan = Some(String::new());
+                } else {
+                    remote.options.plan = Some(remote.app.plan.to_json());
+                }
             }
             return quit;
         }
