@@ -58,6 +58,7 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
         }
         StreamEvent::TurnComplete { .. } => {}
         StreamEvent::Usage { .. } => {}
+        StreamEvent::Plan { .. } => {}
     }
     None
 }

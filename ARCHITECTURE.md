@@ -10,8 +10,8 @@ configuration, provider wire formats, and the command-line entry point;
 confined tool implementations; `session.rs` owns append-only JSONL
 persistence.
 
-`oye` (no args) starts a daemon on a background thread and attaches the TUI
-to it; `oye serve [host:port]` runs the daemon headless and `oye connect
+`dex` (no args) starts a daemon on a background thread and attaches the TUI
+to it; `dex serve [host:port]` runs the daemon headless and `dex connect
 <url>` attaches a TUI to a remote one. Tool approvals are parked server-side
 keyed by request id, streamed to the client as `ApprovalRequired` events, and
 resolved by `POST /api/sessions/{id}/approve`. Cancellation propagates via

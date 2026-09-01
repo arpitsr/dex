@@ -1,167 +1,92 @@
-# Harness Plan
+# Harness Plan — Next
 
-Gap analysis against a best-in-class coding-agent harness: the loop, safety,
-tools, model adapters, and UX are solid; what is missing is harness-side
-**intelligence** — goal/plan state, verification, recovery, and dynamic
-context. Everything below reuses existing primitives (`Session::set_state`,
-the system-nudge injection pattern, `SinkLine` events, the steering channel,
-`is_mutating`). No rewrites, no new abstractions.
+`P0-P5` shipped (intelligence: goal/plan, verify, context, stuck, caps). `HARNESS.md` now `1/2/1/1` for Direction/Knowledge — Trust/Correctness/Recovery still `1/0` and block release. Next closes the **release gates** in order: Remote → Correctness → Recovery → Improvement. Same primitives, no rewrites.
 
-## Principles
+## Principles (still)
 
-- **Injection over state machine.** Do not rewrite the loop as an FSM. New
-  behavior arrives as system-role messages injected at existing points (the
-  `WRAP_UP_THRESHOLD` nudge in `agent/loop.rs` is the template).
-- **State lives in the daemon, persists via sessions.** Plan/verification
-  state is daemon-owned; the session JSONL is the store.
-- **One phase ships before the next starts.** Each phase is independently
-  useful and testable.
+- **Injection over state machine.** New behavior = `system` message at existing seam (`WRAP_UP_THRESHOLD` template).
+- **State in daemon, persisted in JSONL.** `Session::set_state` is the store; `load_session_state` is the restore.
+- **Ceiling, not flag.** Daemon policy beats client request. Fail closed.
+- **One phase ships.** Independently useful, tested, then next.
 
 ---
 
-## Phase 0 — Wire up existing dead persistence (small, unblocks Phase 1)
+## Shipped — P0-P5 ✓ (see git log)
 
-`Session::set_state()` is called by `/model` and `/provider`, but
-`load_session_state()` (`src/session.rs`) is `#[allow(dead_code)]` — state is
-written and never restored.
-
-- [ ] Call `load_session_state` on `/resume` and re-apply model/provider.
-- [ ] Remove the `dead_code` allow.
-- **Accept:** resume a session that switched models → model is restored.
-
-## Phase 1 — Goal and plan state
-
-The model currently has no answer to "what am I accomplishing and why".
-Add a plan object that outlives the transcript and is re-injected every turn.
-
-- [ ] Add `Plan` to daemon agent state:
-  ```rust
-  struct Plan {
-      goal: Option<String>,          // /goal — why
-      steps: Vec<(String, bool)>,    // ordered, done flags — what
-  }
-  ```
-- [ ] Persist via `session.set_state("plan", json)` on every change; restore
-  via Phase 0 loader.
-- [ ] Slash commands in `ui/slash.rs`: `/goal <text>`, `/plan` (show),
-  `/plan add <s>`, `/plan done <n>`, `/plan clear`. Surface in
-  `SLASH_COMMANDS` + autocomplete.
-- [ ] Inject before each model call in `process_turn`: one short system
-  message (`name: Some("plan")`) with goal + unchecked steps. Suppress when
-  empty. Route through `persist_pending` like the existing nudge.
-- [ ] Model self-update: system prompt gains one line — "Maintain progress
-  against the stated goal; state the current objective before non-obvious
-  tool batches." (Prompt-level, not harness-parsed tool calls.)
-- [ ] UI: one status-bar row in `ui/render.rs` — `Goal: … · Plan 3/7`, and a
-  `SinkLine::Plan` event so remote clients (`ui/remote.rs`) stay in sync.
-- **Accept:** `/goal` survives `/resume`; model receives goal each turn;
-  status bar shows progress. Test: inject a plan, assert it appears in
-  messages passed to the mock client.
-
-## Phase 2 — Verification hook
-
-Edits currently go unverified unless the model volunteers. Make verification
-a harness reflex.
-
-- [ ] Config: `verify_command: Option<String>` (and `OYE_VERIFY` env) in
-  `LlmConfig`/`config.sample.json`. Explicit command first; auto-detection
-  (cargo/go/package.json) is a later fallback, not now.
-- [ ] In `process_turn`, after a batch containing a mutating call
-  (`is_mutating` already exists): if `verify_command` is set and the
-  iteration budget allows, run it through the existing `bash` tool path
-  (same timeout/output caps/cancellation — no new execution code).
-- [ ] Feed the result back:
-  - pass → one-line `SinkLine::System` "verify ✓";
-  - fail → tool-role message (`name: Some("verify")`) with the failure tail,
-    so the next model call treats it as a high-priority observation. Do not
-    count it against `max_tool_iterations` differently than any tool call.
-- [ ] Deduplicate: skip re-running when no mutation happened since the last
-  run (track a dirty flag in `ToolState`).
-- **Accept:** with `verify_command = "cargo test"`, an edit triggers a run;
-  a failing test reaches the model as an observation; Ctrl+C cancels it.
-  Test: mock client performs an edit, executor runs the configured command
-  against a temp workspace.
-
-## Phase 3 — Turn-start context injection
-
-Orientation snapshot so the model starts every turn with repository + task
-state instead of rediscovering it.
-
-- [ ] At turn start in `process_turn` (before the first model call only),
-  inject one compact system message: goal/plan summary (Phase 1) +
-  `git status --short` + `git diff --stat` when the workspace is a repo and
-  output is non-empty. Reuse `tool_git` rather than shelling out.
-- [ ] Cap it (~10 lines); omit silently outside a git repo.
-- [ ] Compaction: extend the `summarize_old_messages` prompt
-  (`agent/compaction.rs`) to preserve the current goal/plan verbatim and
-  recent verification failures, so compaction cannot erase orientation.
-- **Accept:** first model call of each turn sees goal + git snapshot; a
-  compacted history still contains the goal. Test: mock client records
-  messages; assert first request contains the injected block.
-
-## Phase 4 — Stuck detection and escalation
-
-Today only 3-identical-successful-calls are blocked. Extend the existing
-`last_tools` ring buffer into a failure ledger.
-
-- [ ] Track (ring buffer, same pattern as `last_tools`):
-  - identical **failed** calls (currently only successes are counted),
-  - repeated `edit`/`write` to the same path (3+ times),
-  - `verify_command` failing with an unchanged failure signature
-    (hash the first line of the failure),
-  - N consecutive search calls (`grep`/`find`) with no `read` in between.
-- [ ] On a pattern hit, inject the strategy-escalation nudge (reuse the
-  `WRAP_UP_THRESHOLD` message shape): attempt 1 → direct fix; 2 → inspect
-  surrounding architecture; 3 → question the assumption; 4+ → propose a
-  re-plan and surface it to the user. Cap escalations per turn (e.g. 3) to
-  avoid nudge spam.
-- [ ] After the final escalation, abort the turn with the existing
-  "budget exhausted, here's where we are" error — the recovery prompt to the
-  user is already good.
-- **Accept:** a mock model that repeats the same failing edit gets nudged,
-  then the turn ends with a useful message; normal retry sequences are not
-  blocked. Test each pattern with scripted mock responses.
-
-## Phase 5 — Real capability discovery
-
-`discover_capabilities` (`llm/client.rs`) hardcodes `streaming: true,
-tools: true`.
-
-- [ ] Per-provider capability table in `LlmConfig` (static, honest data —
-  no runtime probing): streaming, tools, context window default.
-- [ ] Use the context window to drive the existing compaction thresholds
-  instead of requiring `context_window` to be configured by hand.
-- **Accept:** unknown providers degrade to current behavior; known ones get
-  correct compaction without manual config.
-
-## Explicitly deferred (do not build now)
-
-- **Subagents / parallel delegation** — a mediocre multi-agent system is
-  worse than this single-agent loop; revisit only after Phases 1–4 are done.
-- **AST/symbol tools (tree-sitter), LSP diagnostics** — large dependency,
-  Tier-3 value; `grep`+`chain` cover most retrieval needs today.
-- **`run_tests` as a dedicated tool** — `verify_command` (Phase 2) covers it;
-  add a tool only if the model needs to choose targets per-turn.
-- **Structured-output / reasoning-metadata normalization** — add when a
-  concrete provider mismatch demands it; the `ModelClient` trait is the seam.
-- **Automatic per-model context-limit discovery via probing** — static table
-  is lazier and deterministic.
+| Phase | What | HARNESS |
+|---|---|---|
+| 0 | `load_session_state` wired on `/resume`, `plan`/`model`/`provider` restore | #7 `1` |
+| 1 | `Plan{goal,steps}` `session.set_state("plan")`, `/goal` `/plan add/done/clear`, `name:plan` inject each turn + `SinkLine::Plan`→`StreamEvent::Plan`, `Goal:·Plan 3/7` bar | #1 `0→1`, #16 |
+| 2 | `verify_command`/`DEX_VERIFY`, `ToolState::verify_dirty`, `bash` same caps/cancel, `verify ✓` / `name:verify` fail, dedup | #10 `0→1`, #6 partial |
+| 3 | `turn_start_context` once/turn `Plan+git status/diff --stat` cap 10 + `summarize_old_messages` preserves plan/verify | #5 `1→2` |
+| 4 | `last_failed`/`edit_paths`/`last_verify_hash`/`search_streak` + `stuck_nudge` 1-4 cap 3 → abort | #3 `1→2` |
+| 5 | `provider_default_context_window` + honest `discover_capabilities` drives `context_window/2` compaction | #19 `#21` |
 
 ---
 
-## Validation gates (unchanged, per existing practice)
+## Phase 6 — Permission ceiling & audit (closes #12) ✓
 
-Every phase: `cargo fmt -- --check`, `cargo test --all-targets`,
-`cargo clippy --all-targets -- -D warnings`. Each phase lands with its own
-tests before the next starts.
+Client must not escalate daemon policy. One approval must not become a shell wildcard.
 
-## Suggested order recap
+- [x] Daemon owns ceiling: `LlmConfig::permission` from file/env is max; `ChatRequest.permission` may only request **equal or stricter** (`read-only > ask-writes > ask-shell > trusted`). Reject `trusted` override with `403` + `StreamEvent::Error`. (`daemon/server::run_turn_inner` checks `daemon_perm.permissiveness()` vs `req_perm`, `PermissionMode::permissiveness()` in `core/types`)
+- [x] Scope approvals: approval key = `name + hash(input+diff)` not just `name`. `write`/`edit` scoped to `path`, `bash` scoped to `command` hash. Expiry 10m / one turn (per-turn `Console` drop). `Session` approval set stores hash, not string. (`core/console::approval_key`, `session_approved`/`record_session_approval` scoped)
+- [x] Audit: `session_state` + `audit.jsonl` record `actor` (`local`/`remote`), `request_id`, `decision` (`once`/`session`/`deny`), `input_hash`, timestamp. (`agent/loop::audit_approval`, `daemon/server::approve` audit block writes `audit.jsonl` `0600`)
+- **Accept:** `DEX_PERMISSION=ask-writes` daemon, client `ChatRequest{permission:"trusted"}` → `403`; `approve bash "echo hi"` does not approve `bash "rm -rf /"`; `grep audit.jsonl` shows `allow-session` with hash.
 
-| Phase | Ships | Effort |
-|-------|-------|--------|
-| 0 | Dead state restore wired | hours |
-| 1 | Goal/plan persistence + injection + UI | 1–2 days |
-| 2 | Verify-on-mutate hook | 1 day |
-| 3 | Turn-start snapshot + compaction preserves orientation | 1 day |
-| 4 | Failure-ledger stuck detection + escalation | 1–2 days |
-| 5 | Static capability table | hours |
+## Phase 7 — Secrets & remote security (closes #14, unblocks remote gate)
+
+Unauthenticated `HTTP + bash` is RCE. Make `store:false` + redaction the default.
+
+- [ ] Daemon auth: `DEX_TOKEN` file (`~/.config/dex/token`, `0600`) or env, `Authorization: Bearer <token>` on every `/api/*` (health exempt). `cargo` generates token on first `dex serve` if missing, prints `dex connect http://host:port?token=…`.
+- [ ] Server policy: `base_url`/`permission` overrides forbidden for remote (only `model`/`skill_dirs` may be forwarded). `ApiProtocol` forced server-side.
+- [ ] Redaction + retention: `session.rs`/`audit.jsonl`/`provider.jsonl` redact `api_key`, `base_url` secrets, `write` content >200 chars truncated in logs; file mode `0600`; `DEX_RETENTION_DAYS` (default 30) prunes old sessions.
+- **Accept:** `curl /api/sessions` without token → `401`; `curl -H "Authorization: Bearer bad"` + `base_url: https://evil.com` → `403` and daemon `base_url` unchanged; `grep -r AKIA` in `~/.local/share/dex/` finds nothing.
+
+## Phase 8 — Change control & durability (closes #9, #7, #15 — recovery gate)
+
+Edits must be reviewable and restart must not duplicate effects.
+
+- [ ] Transactional file tools: `write`/`edit` require `expected_hash` (from `read` preview) → `409` if stale; record `before_hash`/`after_hash`/`patch` in `session_state "change:<id>"`; `SinkLine::System` patch preview before approval when `permission != trusted`.
+- [ ] Durable journal: `turn_start`/`turn_complete`/`turn_failed` + `effect_start`/`effect_result` (`tool_call_id` + `hash`) appended via `fsync` alternative (`File::sync_data`); `daemon::run_daemon` rebuilds `sessions` + `active_turns` on restart from JSONL; persistence `io::Error` → `turn_failed` not ignored.
+- [ ] Checkpoint/undo: `session::clear` keeps `before` snapshot; `/undo` (or `edit` with `hash` mismatch) restores last change set.
+- **Accept:** two `edit` to same file concurrent → second `409`; `kill -9` daemon mid-`bash` → restart `load_session_state` shows `turn_failed` with `unknown` effects reconciled, no duplicate `write`.
+
+## Phase 9 — Verification gate + observability (closes #10, #20, starts #22)
+
+"Done" must link claims to recorded checks; cost must be answerable without grepping raw logs.
+
+- [ ] Gate: every mutating batch gets `verification_disposition: pass|fail|waived` in `Session` (`waived` requires `name:waive` reason). `verify_command` auto-detect fallback (`cargo test`/`go test`/`npm test` if file exists) when not set. Fail → `name:verify` re-enters loop; `max_tool_iterations` includes verify round.
+- [ ] Trace: `SinkLine` already has `Usage/ToolOutput`; add `TraceSpan{task_id,turn_id,tool_call_id, start, duration, tokens, cost, approval, effect_hash, verify}` redacted, single `trace.jsonl` per turn, `0600`. `GET /api/sessions/{id}/trace` returns it.
+- **Accept:** `DEX_VERIFY="cargo test"` edit → failing test → next model sees `name:verify` + trace shows `verify:fail cost:$0.02`; `waived` without reason → `400`; `grep trace.jsonl | jq .cost` sums to task cost.
+
+## Phase 10 — Protocol & reattach (closes #17, #24, #2 gap)
+
+Clients must reattach and replay deterministically.
+
+- [ ] Versioned protocol: `Accept: application/vnd.dex.v1+json` + `X-Dex-Protocol: 1`; `StreamEvent` gains `seq: u64`; `GET /api/sessions/{id}/events?since=seq` replays; `POST /api/sessions/{id}/chat` idempotent via `Idempotency-Key` header ( dedup on `prompt_hash` 60s).
+- [ ] Reattach: `GET /api/sessions` now lists persisted JSONL sessions (not just in-memory `sessions` Mutex), `POST /api/sessions/{id}/reattach` returns `seq` cursor; TUI `run_ratatui_repl_with_remote` on reconnect replays missed `seq` then streams new.
+- **Accept:** disconnect mid-turn (kill SSE), `curl /events?since=last_seq` returns missed `tool_result`+`turn_complete`; `dex connect --reattach <id>` resumes same transcript; `Idempotency-Key` replay returns same `turn_complete` without second `bash` run.
+
+## Explicitly deferred (still)
+
+- **Subagents / delegation (#11, #25)** — needs #9/#12/#15/#20 guarantees first; single-agent loop is the scale gate.
+- **LSP/diagnostics (#6 Tier-3)** — `grep`+`chain` still covers 90%; add only on demonstrated retrieval failure with eval.
+- **Sandbox hard-isolation (#13 full)** — `bwrap`/nsjail per-turn mount+net+quota is correct but is a new binary/privilege; do `Phase 6-8` cheap confinement first, then measure.
+- **Instruction hierarchy (#4) full + repo map (#6)** — needs provenance labels + cached map invalidation; do after traces (#9) exist to measure.
+- **Long-running autonomy (#25) queue/leases/heartbeat** — requires #7+#15 durable journal.
+
+---
+
+## Validation gates (same)
+
+Every phase: `cargo fmt -- --check`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`. Each lands with its own `behavioral` test (mock `ModelClient` + temp workspace + `NeverCancel`) before next starts. `HARNESS.md` re-scored after phase with code ref + acceptance check.
+
+## Order recap (next)
+
+| Phase | Ships | Effort | Gate |
+|---|---|---|---|
+| 6 | Permission ceiling + scoped audit | 1 day | Remote |
+| 7 | Token auth + server policy + redaction | 1-2 days | Remote |
+| 8 | Transactional edits + durable journal + rebuild | 1-2 days | Recovery |
+| 9 | Verification disposition + redacted trace/cost | 1 day | Correctness+Improvement |
+| 10 | Versioned protocol + seq/replay/reattach | 1 day | Recovery+Interface |
