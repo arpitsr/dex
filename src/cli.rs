@@ -14,6 +14,9 @@ pub(crate) struct Args {
     pub session_name: Option<String>,
     pub skill_dirs: Vec<PathBuf>,
     pub permission: Option<PermissionMode>,
+    /// P10: attach to an existing daemon session (replay its event journal)
+    /// instead of creating a fresh one. `dex connect <url> --reattach <id>`.
+    pub reattach: Option<String>,
     pub rest: Vec<String>,
 }
 
@@ -44,12 +47,14 @@ pub(crate) fn parse_args() -> Args {
     let mut session_name = None;
     let mut skill_dirs = Vec::new();
     let mut permission = None;
+    let mut reattach = None;
     let mut rest = Vec::new();
     let mut input = env::args().skip(1);
     while let Some(arg) = input.next() {
         match arg.as_str() {
             "--base-url" => base_url = Some(required(&mut input, "--base-url")),
             "--model" => model = Some(required(&mut input, "--model")),
+            "--reattach" => reattach = Some(required(&mut input, "--reattach")),
             "--session" | "-s" => {
                 session_path = Some(PathBuf::from(required(&mut input, "--session")))
             }
@@ -75,6 +80,7 @@ pub(crate) fn parse_args() -> Args {
         session_name,
         skill_dirs,
         permission,
+        reattach,
         rest,
     }
 }

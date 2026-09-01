@@ -86,6 +86,14 @@ pub(crate) enum ToolError {
     Io(io::Error),
     EditNotUnique(usize),
     OutsideWorkspace(String),
+    /// A write/edit supplied an `expected_hash` that no longer matches the
+    /// file on disk (someone else changed it since the model's last read).
+    /// The caller must re-read and retry — the write is not applied.
+    StaleFile {
+        path: String,
+        expected: String,
+        actual: String,
+    },
     /// A shell command ran but signalled failure (non-zero exit, killed, or
     /// timed out). `code` is `None` when the process never exited on its own.
     /// Carries the combined output so partial results still reach the model.
@@ -180,6 +188,15 @@ impl std::fmt::Display for ToolError {
                 "oldText matches {n} locations; include more surrounding lines to make it unique, or pass replaceAll: true"
             ),
             Self::OutsideWorkspace(path) => write!(f, "path is outside the workspace: {}", path),
+            Self::StaleFile {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "file changed since it was read (expected_hash mismatch: expected {expected}, file is {actual}) — re-read {} and retry; concurrent edit wins, your write was not applied",
+                path
+            ),
             Self::Shell { output, code } => match code {
                 Some(code) => write!(f, "{output}\n[exit {code}]"),
                 None => write!(f, "{output}"),
@@ -567,6 +584,7 @@ fn tool_bash(
 fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
     let path = workspace_path(&arg_str(args, "path")?)?;
     let content = arg_str(args, "content")?;
+    check_expected_hash(args, &path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(ToolError::Io)?;
     }
@@ -580,6 +598,38 @@ fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
         ),
         None => format!("wrote {}", path.display()),
     })
+}
+
+/// When a write/edit carries `expected_hash`, reject if the file on disk no
+/// longer matches (stale read → 409 semantics). Absent file hashes to the
+/// empty-string sentinel.
+fn check_expected_hash(args: &Map<String, Value>, path: &Path) -> Result<(), ToolError> {
+    let Some(expected) = args.get("expected_hash").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let actual = hash_file(&path.display().to_string());
+    if actual != expected {
+        return Err(ToolError::StaleFile {
+            path: path.display().to_string(),
+            expected: expected.to_string(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// FNV-1a 64-bit hex hash of a file's bytes. An absent file hashes as empty
+/// content (the before-hash of a `write` creating a new file).
+pub(crate) fn hash_file(path: &str) -> String {
+    let bytes = fs::read(path).unwrap_or_default();
+    let mut hash = 2166136261u64;
+    for b in &bytes {
+        hash = (hash ^ u64::from(*b)).wrapping_mul(16777619);
+    }
+    format!("{:016x}", hash)
 }
 
 fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
@@ -600,10 +650,78 @@ fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
             "oldText and newText are identical; nothing to edit".to_string(),
         ));
     }
+    check_expected_hash(args, &path)?;
     let content = fs::read_to_string(&path).map_err(ToolError::Io)?;
     let (updated, note) = apply_edit(&content, &old, &new, replace_all)?;
     fs::write(&path, updated).map_err(ToolError::Io)?;
     Ok(format!("edited {}{note}", path.display()))
+}
+
+/// Human-readable before/after diff for a pending write/edit, used as a
+/// patch preview before approval (`permission != trusted`). Returns None when
+/// the file is missing or too large, or the diff is empty.
+pub(crate) fn change_preview(name: &str, args: &Map<String, Value>) -> Option<String> {
+    let path = workspace_path(&arg_str(args, "path").ok()?).ok()?;
+    let before = fs::read_to_string(&path).ok();
+    let after = match name {
+        "write" => arg_str(args, "content").ok(),
+        "edit" => {
+            let old = arg_str(args, "oldText").ok()?;
+            let new = arg_str(args, "newText").ok()?;
+            let replace_all = args
+                .get("replaceAll")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            apply_edit(before.as_deref().unwrap_or(""), &old, &new, replace_all)
+                .ok()
+                .map(|(updated, _)| updated)
+        }
+        _ => return None,
+    }?;
+    let diff = simple_diff(before.as_deref().unwrap_or(""), &after);
+    if diff.is_empty() {
+        return None;
+    }
+    let header = match before {
+        Some(_) => format!("{name} {}", path.display()),
+        None => format!("{name} {} (new file)", path.display()),
+    };
+    Some(format!("{header}\n{diff}"))
+}
+
+/// Minimal line diff (`-` removed / `+` added), capped so a preview never
+/// floods the transcript.
+fn simple_diff(before: &str, after: &str) -> String {
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let mut out = Vec::new();
+    let max = before_lines.len().max(after_lines.len());
+    for i in 0..max {
+        let b = before_lines.get(i);
+        let a = after_lines.get(i);
+        match (b, a) {
+            (Some(b), Some(a)) if b == a => {}
+            (Some(b), Some(a)) => {
+                out.push(format!("-{b}"));
+                out.push(format!("+{a}"));
+            }
+            (Some(b), None) => out.push(format!("-{b}")),
+            (None, Some(a)) => out.push(format!("+{a}")),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    let mut text = out.join("\n");
+    if out.len() > 40 {
+        text = format!(
+            "{}\n[... {} more lines]",
+            out[..40].join("\n"),
+            out.len() - 40
+        );
+    }
+    text
 }
 
 fn apply_edit(
@@ -1360,6 +1478,61 @@ mod tests {
         assert!(note.contains("2 occurrences"), "{note}");
         // Without replaceAll the duplicate is an error, not a silent partial.
         assert!(apply_edit("a b a", "a", "c", false).is_err());
+    }
+
+    #[test]
+    fn write_edit_require_expected_hash_and_reject_stale() {
+        // Real workspace file under target/ (inside cwd, cleaned up).
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let path = cwd.join("target/dex-stale-test.txt");
+        fs::write(&path, "v1\n").unwrap();
+        let rel = "target/dex-stale-test.txt";
+        let h = hash_file(&path.display().to_string());
+
+        // Correct expected_hash: edit applies.
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("oldText".into(), Value::String("v1".into()));
+        args.insert("newText".into(), Value::String("v2".into()));
+        args.insert("expected_hash".into(), Value::String(h.clone()));
+        assert!(execute("edit", &args, &GlobalCancellation).is_ok());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
+
+        // Stale expected_hash: rejected, file untouched.
+        let mut stale = Map::new();
+        stale.insert("path".into(), Value::String(rel.into()));
+        stale.insert("oldText".into(), Value::String("v2".into()));
+        stale.insert("newText".into(), Value::String("v3".into()));
+        stale.insert("expected_hash".into(), Value::String("deadbeef".into()));
+        assert!(matches!(
+            execute("edit", &stale, &GlobalCancellation),
+            Err(ToolError::StaleFile { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
+
+        // hash_file is deterministic.
+        assert_eq!(
+            hash_file(&path.display().to_string()),
+            hash_file(&path.display().to_string())
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn change_preview_shows_diff_for_write_and_edit() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let path = cwd.join("target/dex-preview-test.txt");
+        fs::write(&path, "line1\nline2\n").unwrap();
+        let rel = "target/dex-preview-test.txt";
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("line1\nCHANGED\n".into()));
+        let preview = change_preview("write", &args).unwrap();
+        assert!(preview.contains("line2"), "{preview}");
+        assert!(preview.contains("-line2"), "{preview}");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
