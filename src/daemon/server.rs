@@ -14,14 +14,14 @@ use tokio::sync::mpsc;
 
 use crate::agent::r#loop::process_turn;
 use crate::agent::state::ToolState;
-use crate::core::console::{CancellationToken, Console};
+use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::format::git_context;
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
-    ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, LoadSkillRequest, SkillInfo,
-    StreamEvent,
+    ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
+    LoadSkillRequest, ReattachResponse, SkillInfo, StreamEnvelope, StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills, skill_dirs};
@@ -38,6 +38,13 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/approve", post(approve))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/{id}/skill", post(load_skill))
+        // P10: versioned reattach/replay, P9: trace, P8: undo.
+        .route("/api/sessions/{id}/events", get(session_events))
+        .route("/api/sessions/{id}/reattach", post(reattach))
+        .route("/api/sessions/{id}/trace", get(session_trace))
+        .route("/api/sessions/{id}/undo", post(session_undo))
+        .route("/api/sessions/{id}/waive", post(session_waive))
+        .route("/api/sessions/{id}/name", post(session_name))
         .with_state(state)
 }
 
@@ -242,69 +249,150 @@ async fn create_session(
 }
 
 async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    // Sessions are in-memory only; after a daemon restart the map is empty
-    // even though session files remain on disk. This is a known limitation —
-    // the next turn creates a fresh session and history is still on disk.
-    let sessions: Vec<serde_json::Value> = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .map(|(id, entry)| {
+    // P10: disk-backed listing. Sessions created before a restart live on in
+    // the JSONL, so the list is rebuilt from the session directory (the
+    // in-memory `sessions` map is seeded the same way at startup).
+    //
+    // Merge disk entries over in-memory so a session created in this process
+    // (whose file already exists) is listed once.
+    let mut by_id: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    for (path, header) in session::Session::list_all().unwrap_or_default() {
+        let name = header.name().map(|n| n.to_string());
+        let message_count = crate::session::load_messages_from_session(&path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let turn_state = session::Session::last_turn_state(&path);
+        by_id.insert(
+            header.id().to_string(),
             json!({
-                "session_id": id,
-                "path": entry.path.to_string_lossy(),
-                "name": entry.name,
-                "cwd": entry.cwd,
-            })
-        })
-        .collect();
-
+                "session_id": header.id(),
+                "path": path.display().to_string(),
+                "name": name,
+                "cwd": header.cwd(),
+                "created_at": header.timestamp(),
+                "message_count": message_count,
+                "turn_state": turn_state,
+            }),
+        );
+    }
+    // Preserve in-memory sessions that have no file yet (shouldn't happen).
+    {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, entry) in sessions.iter() {
+            by_id.entry(id.clone()).or_insert_with(|| {
+                json!({
+                    "session_id": id,
+                    "path": entry.path.to_string_lossy(),
+                    "name": entry.name,
+                    "cwd": entry.cwd,
+                    "created_at": "",
+                    "message_count": 0,
+                    "turn_state": "unknown",
+                })
+            });
+        }
+    }
+    let mut sessions: Vec<serde_json::Value> = by_id.into_values().collect();
+    sessions.sort_by(|a, b| {
+        let a = a
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let b = b
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        b.cmp(a)
+    });
     Json(json!({ "sessions": sessions }))
 }
 
 async fn chat(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // P10 versioned protocol: a client MAY declare its protocol version; a
+    // newer-than-supported version is rejected. Absence stays backward-compatible.
+    if let Some(protocol) = headers.get("x-dex-protocol").and_then(|v| v.to_str().ok()) {
+        if protocol != "1" {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    // P10 idempotency: the same `Idempotency-Key` within 60s replays the
+    // recorded terminal event instead of re-running effects.
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|k| !k.is_empty())
+        .map(ToOwned::to_owned);
+    let request_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&req).unwrap_or_default().hash(&mut h);
+        h.finish()
+    };
+    // Idempotency replay is routed through the SAME channel/stream as a live
+    // turn (single return type below): the recorded terminal envelope is just
+    // pushed and the stream closes.
+    let mut replay_envelope: Option<StreamEnvelope> = None;
+    if let Some(key) = &idempotency_key {
+        if let Some(terminal) = state.idempotent_replay(key, &session_id, request_hash) {
+            replay_envelope = serde_json::from_str::<StreamEnvelope>(&terminal).ok();
+        }
+    }
     // Reject concurrent turns on the same session up front so the
-    // append-only session log stays consistent.
+    // append-only session log stays consistent. A replay must not hold the
+    // active-turn slot, so it is checked before registration.
     {
         let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if !sessions.contains_key(&session_id) {
             return Err(StatusCode::NOT_FOUND);
         }
     }
-    {
-        let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
-        if active.contains(&session_id) {
-            return Err(StatusCode::CONFLICT);
+    if replay_envelope.is_none() {
+        {
+            let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+            if active.contains(&session_id) {
+                return Err(StatusCode::CONFLICT);
+            }
+            active.insert(session_id.clone());
         }
-        active.insert(session_id.clone());
+
+        // Register a fresh per-turn cancellation token before spawning so a
+        // /cancel arriving during turn setup is still observed. The agent loop
+        // and the stream reader poll it; it never leaks across sessions or
+        // later turns.
+        let cancel = CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.clone(), cancel.clone());
     }
 
-    // Register a fresh per-turn cancellation token before spawning so a
-    // /cancel arriving during turn setup is still observed. The agent loop
-    // and the stream reader poll it; it never leaks across sessions or
-    // later turns.
-    let cancel = CancellationToken::new();
-    state
-        .cancel_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(session_id.clone(), cancel.clone());
+    let (tx, mut rx) = mpsc::channel::<StreamEnvelope>(256);
 
-    let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
-
-    // Run the whole (blocking) agent turn on the blocking pool. Everything
-    // below — session IO, config building, the LLM call and tool execution —
-    // is synchronous, so it must never run on a runtime worker.
-    let state_for_turn = state.clone();
-    let sid = session_id.clone();
-    tokio::task::spawn_blocking(move || {
-        run_agent_turn(state_for_turn, sid, req, cancel, tx);
-    });
+    if let Some(env) = replay_envelope {
+        // Replay: emit the recorded terminal envelope, then close.
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.blocking_send(env);
+        });
+    } else {
+        // Run the whole (blocking) agent turn on the blocking pool. Everything
+        // below — session IO, config building, the LLM call and tool
+        // execution — is synchronous, so it must never run on a runtime worker.
+        let state_for_turn = state.clone();
+        let sid = session_id.clone();
+        let idem_key = idempotency_key;
+        let cancel = CancellationToken::new();
+        tokio::task::spawn_blocking(move || {
+            run_agent_turn(state_for_turn, sid, req, cancel, tx, idem_key, request_hash);
+        });
+    }
 
     // Convert the receiver into an SSE stream. Each event is serialized
     // exactly once: axum adds the `data:` prefix, so hand it raw JSON.
@@ -322,14 +410,16 @@ async fn chat(
     ))
 }
 
-/// Run one agent turn and push `StreamEvent`s into `tx`. Fully blocking;
-/// called from `spawn_blocking` only.
+/// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Fully
+/// blocking; called from `spawn_blocking` only.
 fn run_agent_turn(
     state: Arc<DaemonState>,
     session_id: String,
     req: ChatRequest,
     cancel: CancellationToken,
-    tx: mpsc::Sender<StreamEvent>,
+    tx: mpsc::Sender<StreamEnvelope>,
+    idempotency_key: Option<String>,
+    request_hash: u64,
 ) {
     // Use a guard so active_turns/cancel_tokens/pending approvals are cleaned
     // even when run_turn_inner panics inside spawn_blocking.
@@ -377,19 +467,48 @@ fn run_agent_turn(
     // be accepted promptly; drop ordering handles pending approvals/active turns.
     drop(_guard);
 
-    match result {
-        Ok(Ok((response, usage))) => {
-            let _ = tx.blocking_send(StreamEvent::TurnComplete { response, usage });
-        }
-        Ok(Err(error)) => {
-            let _ = tx.blocking_send(StreamEvent::TurnFailed { error });
-        }
-        Err(_) => {
-            let _ = tx.blocking_send(StreamEvent::TurnFailed {
-                error: "turn panicked".to_string(),
-            });
+    let terminal = match result {
+        Ok(Ok((response, usage, cached))) => StreamEvent::TurnComplete {
+            response,
+            usage,
+            cached,
+        },
+        Ok(Err(error)) => StreamEvent::TurnFailed { error },
+        Err(_) => StreamEvent::TurnFailed {
+            error: "turn panicked".to_string(),
+        },
+    };
+    // P10/P8: the terminal event gets a seq, is journaled (reopening the
+    // session file so an in-flight handle is untouched), dedup'd via
+    // Idempotency-Key, and only then emitted.
+    let seq = state.next_seq(&session_id);
+    let env = StreamEnvelope {
+        seq,
+        event: terminal,
+    };
+    let serialized = serde_json::to_string(&env).unwrap_or_default();
+    if let Some(path) = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session_id)
+        .map(|e| e.path.clone())
+    {
+        if let Ok(mut journal) = Session::from_path(&path) {
+            let _ =
+                journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+            // Durable turn_failed marker for runs that did not finish normally.
+            if matches!(&env.event, StreamEvent::TurnFailed { .. })
+                && crate::session::Session::last_turn_state(&path) == "interrupted"
+            {
+                let _ = journal.turn_event("turn_failed");
+            }
         }
     }
+    if let Some(key) = idempotency_key {
+        state.idempotency_record(&key, &session_id, request_hash, serialized);
+    }
+    let _ = tx.blocking_send(env);
 }
 
 fn run_turn_inner(
@@ -397,8 +516,8 @@ fn run_turn_inner(
     session_id: &str,
     req: &ChatRequest,
     cancel: &CancellationToken,
-    tx: &mpsc::Sender<StreamEvent>,
-) -> Result<(String, Option<u64>), String> {
+    tx: &mpsc::Sender<StreamEnvelope>,
+) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
         let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.get(session_id).cloned()
@@ -414,12 +533,20 @@ fn run_turn_inner(
             .map_err(|e| format!("failed to create session: {e}"))?
     };
 
-    // Persist plan forwarded by the client (remote TUI slash commands). Empty string clears.
+    // Persist plan forwarded by the client (remote TUI slash commands). Empty
+    // string clears. Invalid JSON is rejected explicitly rather than silently
+    // storing garbage (which would come back as an empty plan on reload).
     if let Some(plan_json) = &req.plan {
         if plan_json.is_empty() {
-            let _ = session.set_state("plan", &crate::core::types::Plan::default().to_json());
+            session
+                .set_state("plan", &crate::core::types::Plan::default().to_json())
+                .map_err(|e| format!("failed to persist plan: {e}"))?;
         } else {
-            let _ = session.set_state("plan", plan_json);
+            let plan: crate::core::types::Plan = serde_json::from_str(plan_json)
+                .map_err(|e| format!("invalid plan JSON from client: {e}"))?;
+            session
+                .set_state("plan", &plan.to_json())
+                .map_err(|e| format!("failed to persist plan: {e}"))?;
         }
     }
 
@@ -439,7 +566,7 @@ fn run_turn_inner(
     }
     // Build the config from the daemon's own environment/config file, with
     // optional per-request overrides sent by the client (now validated).
-    let config = LlmConfig::from_env(
+    let mut config = LlmConfig::from_env(
         req.base_url.clone().filter(|v| !v.is_empty()),
         req.model.clone().filter(|v| !v.is_empty()),
         req.permission
@@ -448,6 +575,11 @@ fn run_turn_inner(
             .transpose()?,
     )
     .map_err(|e| format!("failed to build config: {e}"))?;
+    // P9: auto-detect the verification command at the daemon boundary (its
+    // filesystem is the workspace); the agent loop consumes config only.
+    if config.verify_command.is_none() {
+        config.verify_command = crate::llm::config::detect_verify_command();
+    }
 
     // Skills are resolved on the daemon (its filesystem is the workspace).
     let mut dirs = skill_dirs();
@@ -473,21 +605,42 @@ fn run_turn_inner(
         tool_call_id: None,
         name: None,
     };
-    let _ = session.turn_event("turn_start");
-    let _ = session.append_message(user_message.clone());
+    // Durable journal (P8): a turn only exists once turn_start is recorded,
+    // and an io::Error here fails the turn instead of being swallowed.
+    session
+        .turn_event("turn_start")
+        .map_err(|e| format!("failed to record turn_start: {e}"))?;
+    session
+        .append_message(user_message.clone())
+        .map_err(|e| format!("failed to persist prompt: {e}"))?;
     messages.push(user_message);
+
+    // Per-turn redacted trace journal (P9): `<session>.trace.jsonl`, 0600.
+    let trace = session
+        .path()
+        .map(|p| p.with_extension("trace.jsonl"))
+        .and_then(|p| TraceWriter::open(p).ok());
 
     // The agent loop reports through std channels; bridge them onto the
     // tokio sender with dedicated threads.
     let (sink_tx, sink_rx) = std_mpsc::channel::<SinkLine>();
     let (approval_tx, approval_rx) = std_mpsc::channel::<ApprovalRequest>();
-    let console = Console::daemon(sink_tx, approval_tx);
+    let console = Console::daemon(sink_tx, approval_tx).with_trace(trace);
 
     // Sink bridge: SinkLines arrive from the streaming LLM reader and tool
-    // executor; forward them as StreamEvents on a dedicated thread.
+    // executor; forward them as numbered StreamEnvelopes on a dedicated
+    // thread, journaling each one for replay (P10).
     {
         let stream_tx = tx.clone();
+        let state = state.clone();
+        let session_path = session.path().map(|p| p.to_path_buf());
+        let sid = session_id.to_string();
         std::thread::spawn(move || {
+            // Reopen so journal writes never fight the agent loop's handle;
+            // events land in the separate `<id>.events.jsonl` file.
+            let mut journal = session_path
+                .as_deref()
+                .and_then(|p| Session::from_path(p).ok());
             while let Ok(sl) = sink_rx.recv() {
                 let event = match sl {
                     SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
@@ -515,13 +668,22 @@ fn run_turn_inner(
                     },
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
-                    SinkLine::Usage(tokens) => StreamEvent::Usage { tokens },
+                    SinkLine::Usage { tokens, cached } => {
+                        StreamEvent::Usage { tokens, cached }
+                    }
                     SinkLine::Plan(plan) => StreamEvent::Plan {
                         goal: plan.goal,
                         steps: plan.steps,
+                        constraints: plan.constraints,
+                        acceptance: plan.acceptance,
+                        budget: plan.budget,
                     },
                 };
-                let _ = stream_tx.blocking_send(event);
+                let seq = state.next_seq(&sid);
+                if let Some(s) = journal.as_mut() {
+                    let _ = s.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                }
+                let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
             }
         });
     }
@@ -561,10 +723,13 @@ fn run_turn_inner(
                     // avoid a deadlock in a stray agent thread.
                     let _ = stale.response.send(ApprovalDecision::Deny);
                 }
-                let _ = stream_tx.blocking_send(StreamEvent::ApprovalRequired {
-                    request_id,
-                    name: request.name,
-                    input: request.input,
+                let _ = stream_tx.blocking_send(StreamEnvelope {
+                    seq: state.next_seq(&session_id),
+                    event: StreamEvent::ApprovalRequired {
+                        request_id,
+                        name: request.name,
+                        input: request.input,
+                    },
                 });
             }
         });
@@ -583,9 +748,20 @@ fn run_turn_inner(
         &console,
     );
     let usage = tool_state.last_usage;
+    let cached = tool_state.last_cached;
+    // Durable terminal marker (P8): a completed turn is recorded before the
+    // event is relayed; a failed one gets `turn_failed` in run_agent_turn.
+    match &turn_result {
+        Ok(_) => session
+            .turn_event("turn_complete")
+            .map_err(|e| format!("failed to record turn_complete: {e}"))?,
+        Err(_) => session
+            .turn_event("turn_failed")
+            .map_err(|e| format!("failed to record turn_failed: {e}"))?,
+    }
     turn_result
         .map_err(|e| e.to_string())
-        .map(|response| (response, usage))
+        .map(|response| (response, usage, cached))
 }
 
 async fn approve(
@@ -703,4 +879,194 @@ async fn cancel(
     }
 
     Json(json!({ "status": "ok" }))
+}
+
+/// Resolve a session file path from the registry, or 404.
+fn session_path(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<std::path::PathBuf, StatusCode> {
+    state
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .map(|e| e.path.clone())
+        .filter(|p| p.exists())
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// `GET /api/sessions/{id}/events?since=<seq>` — replay journaled stream
+/// events after a cursor (P10). Missing journal file replays nothing.
+async fn session_events(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<EventsResponse>, StatusCode> {
+    let path = session_path(&state, &session_id)?;
+    let since = params
+        .get("since")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let events = tokio::task::spawn_blocking(move || {
+        let mut events = Vec::new();
+        for (seq, payload) in Session::load_events(&path, since).unwrap_or_default() {
+            if let Ok(event) = serde_json::from_str::<StreamEvent>(&payload) {
+                events.push(StreamEnvelope { seq, event });
+            }
+        }
+        let next_seq = events
+            .last()
+            .map(|e| e.seq.saturating_add(1))
+            .unwrap_or(since);
+        (events, next_seq)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (events, next_seq) = events;
+    Ok(Json(EventsResponse { events, next_seq }))
+}
+
+/// `POST /api/sessions/{id}/reattach` — re-register a persisted session after
+/// a daemon restart (or a client reconnect) and return the replay cursor.
+async fn reattach(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<ReattachResponse>, StatusCode> {
+    let mut sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = sessions
+        .get(&session_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if !entry.path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    state.seed_seq(&session_id, &entry.path);
+    // Prune stale idempotency-recorded seq: reattach hands the client the
+    // cursor to resume from.
+    let seq = Session::max_event_seq(&entry.path);
+    sessions.insert(
+        session_id.clone(),
+        SessionEntry {
+            path: entry.path.clone(),
+            name: entry.name,
+            cwd: entry.cwd,
+        },
+    );
+    Ok(Json(ReattachResponse {
+        session_id: session_id.clone(),
+        seq,
+    }))
+}
+
+/// `GET /api/sessions/{id}/trace` — the per-session (redacted) trace journal
+/// rows for this session, for cost/outcome queries (P9).
+async fn session_trace(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let path = session_path(&state, &session_id)?;
+    let trace_path = path.with_extension("trace.jsonl");
+    let rows = tokio::task::spawn_blocking(move || -> Vec<serde_json::Value> {
+        let Ok(text) = std::fs::read_to_string(&trace_path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "trace": rows })))
+}
+
+/// `POST /api/sessions/{id}/undo` — revert the last recorded change (P8).
+/// Refuses when the file moved on since (after_hash mismatch) or is too big.
+async fn session_undo(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let path = session_path(&state, &session_id)?;
+    let result = tokio::task::spawn_blocking(move || {
+        let mut session = Session::from_path(&path)?;
+        session::undo_last_change(&mut session)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match result {
+        Ok(message) => Ok(Json(json!({ "status": "ok", "message": message }))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StatusCode::NOT_FOUND),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(StatusCode::CONFLICT),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// `POST /api/sessions/{id}/waive` with `{"reason": ...}` — record a
+/// `waived` verification disposition. A missing/empty reason is a 400 (P9:
+/// waived requires a reason).
+async fn session_waive(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let reason = req
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if reason.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let path = session_path(&state, &session_id)?;
+    let reason = reason.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut session = Session::from_path(&path)?;
+        // A waive is a recorded, user-authored message the model sees next.
+        session.append_message(ChatMessage {
+            role: "user".into(),
+            content: Some(format!("[verify waived] {reason}")),
+            tool_calls: None,
+            tool_call_id: None,
+            name: Some("waive".into()),
+        })?;
+        session.set_state(
+            "verify",
+            &serde_json::json!({
+                "disposition": "waived",
+                "reason": reason,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+/// `POST /api/sessions/{id}/name` with `{"name": ...}` — rename a session
+/// (remote counterpart of local `/name`).
+async fn session_name(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let name = req
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim);
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let path = session_path(&state, &session_id)?;
+    let name = name.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut session = Session::from_path(&path)?;
+        session.set_name(name)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "status": "ok" })))
 }

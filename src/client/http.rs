@@ -11,6 +11,8 @@ pub(crate) struct ChatOptions {
     pub(crate) model: Option<String>,
     pub(crate) permission: Option<String>,
     pub(crate) plan: Option<String>,
+    /// P10: replay-safe submission key; the daemon dedups identical keys within 60s.
+    pub(crate) idempotency_key: Option<String>,
 }
 
 /// HTTP client for communicating with the dex daemon.
@@ -58,10 +60,24 @@ impl DaemonClient {
         let info = self
             .http
             .get(format!("{}/api/config", self.base_url))
+            .headers(self.api_headers())
             .send()?
             .error_for_status()?
             .json::<DaemonInfo>()?;
         Ok(info)
+    }
+
+    /// Versioned-protocol headers (P10): declared on every `/api/*` request
+    /// so the daemon can reject a mismatch. Health checks stay header-free.
+    fn api_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(value) = reqwest::header::HeaderValue::from_str("application/vnd.dex.v1+json") {
+            headers.insert(reqwest::header::ACCEPT, value);
+        }
+        if let Ok(value) = reqwest::header::HeaderValue::from_str("1") {
+            headers.insert("x-dex-protocol", value);
+        }
+        headers
     }
 
     /// Create a new session on the daemon.
@@ -73,6 +89,7 @@ impl DaemonClient {
         let resp = self
             .http
             .post(format!("{}/api/sessions", self.base_url))
+            .headers(self.api_headers())
             .json(&CreateSessionRequest {
                 cwd: cwd.to_string(),
                 name: name.map(String::from),
@@ -83,11 +100,12 @@ impl DaemonClient {
         Ok(resp)
     }
 
-    /// List all sessions on the daemon.
+    /// List all sessions on the daemon (P10: disk-backed, survives restarts).
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, Box<dyn std::error::Error>> {
         let resp: serde_json::Value = self
             .http
             .get(format!("{}/api/sessions", self.base_url))
+            .headers(self.api_headers())
             .send()?
             .error_for_status()?
             .json()?;
@@ -123,9 +141,11 @@ impl DaemonClient {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{}/api/sessions/{}/chat", self.base_url, session_id);
 
-        let response = self
-            .http
-            .post(&url)
+        let mut builder = self.http.post(&url).headers(self.api_headers());
+        if let Some(key) = &options.idempotency_key {
+            builder = builder.header("idempotency-key", key);
+        }
+        let response = builder
             .json(&ChatRequest {
                 prompt: prompt.to_string(),
                 skill_dirs: options.skill_dirs,
@@ -161,8 +181,10 @@ impl DaemonClient {
                 continue;
             }
 
-            let Ok(event) = serde_json::from_str::<StreamEvent>(data) else {
-                continue;
+            // Events are numbered envelopes on the versioned path (P10).
+            let event = match serde_json::from_str::<StreamEnvelope>(data) {
+                Ok(env) => env.event,
+                Err(_) => continue, // unparsable envelope; skip
             };
 
             if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
@@ -172,8 +194,10 @@ impl DaemonClient {
                 let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
                 if let Err(e) = self.approve(session_id, &request_id, decision) {
                     // Surface but do not kill the stream: the daemon denies
-                    // pending approvals on turn teardown anyway.
-                    eprintln!("[approval] failed to deliver decision: {e}");
+                    // pending approvals on turn teardown anyway. Log, don't
+                    // eprintln — a raw write here paints over the TUI's
+                    // alternate screen and lingers until a resize repaint.
+                    crate::llm::client::provider_log("approval_delivery_failed", &e.to_string());
                 }
                 continue;
             }
@@ -196,6 +220,7 @@ impl DaemonClient {
                 "{}/api/sessions/{}/approve",
                 self.base_url, session_id
             ))
+            .headers(self.api_headers())
             .json(&ApprovalResponse {
                 request_id: request_id.to_string(),
                 decision,
@@ -212,6 +237,7 @@ impl DaemonClient {
                 "{}/api/sessions/{}/cancel",
                 self.base_url, session_id
             ))
+            .headers(self.api_headers())
             .send()?
             .error_for_status()?;
         Ok(())
@@ -222,6 +248,7 @@ impl DaemonClient {
         let resp: serde_json::Value = self
             .http
             .get(format!("{}/api/skills", self.base_url))
+            .headers(self.api_headers())
             .send()?
             .error_for_status()?
             .json()?;
@@ -249,6 +276,7 @@ impl DaemonClient {
                 "{}/api/sessions/{}/skill",
                 self.base_url, session_id
             ))
+            .headers(self.api_headers())
             .json(&LoadSkillRequest {
                 name: name.to_string(),
                 skill_dirs: skill_dirs.to_vec(),
@@ -257,5 +285,107 @@ impl DaemonClient {
             .error_for_status()?
             .json::<LoadSkillResponse>()?;
         Ok(resp)
+    }
+
+    /// Re-register a persisted session and get the replay cursor (P10).
+    pub fn reattach(
+        &self,
+        session_id: &str,
+    ) -> Result<ReattachResponse, Box<dyn std::error::Error>> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/api/sessions/{}/reattach",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .send()?
+            .error_for_status()?
+            .json::<ReattachResponse>()?;
+        Ok(resp)
+    }
+
+    /// Replay journaled stream events after `since` (P10).
+    pub fn events(
+        &self,
+        session_id: &str,
+        since: u64,
+    ) -> Result<EventsResponse, Box<dyn std::error::Error>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/api/sessions/{}/events?since={}",
+                self.base_url, session_id, since
+            ))
+            .headers(self.api_headers())
+            .send()?
+            .error_for_status()?
+            .json::<EventsResponse>()?;
+        Ok(resp)
+    }
+
+    /// Fetch the redacted trace rows for a session (P9).
+    pub fn trace(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let resp: serde_json::Value = self
+            .http
+            .get(format!(
+                "{}/api/sessions/{}/trace",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .send()?
+            .error_for_status()?
+            .json()?;
+        Ok(resp["trace"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Undo the last recorded change; Ok(true) when an undo happened.
+    pub fn undo(&self, session_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/api/sessions/{}/undo",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .send()?
+            .error_for_status()?
+            .json::<serde_json::Value>()?;
+        Ok(resp["status"].as_str() == Some("ok"))
+    }
+
+    /// Record a `waived` verification disposition with a reason (P9).
+    pub fn waive(&self, session_id: &str, reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.http
+            .post(format!(
+                "{}/api/sessions/{}/waive",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .json(&serde_json::json!({ "reason": reason }))
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Rename a session on the daemon.
+    pub fn rename_session(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.http
+            .post(format!(
+                "{}/api/sessions/{}/name",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .json(&serde_json::json!({ "name": name }))
+            .send()?
+            .error_for_status()?;
+        Ok(())
     }
 }
