@@ -24,12 +24,21 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/plan add", "Add a plan step"),
     ("/plan done", "Mark a plan step done"),
     ("/plan clear", "Clear the plan"),
+    ("/constraint add", "Add a task constraint"),
+    ("/constraint clear", "Clear all constraints"),
+    ("/accept add", "Add an acceptance criterion"),
+    ("/accept done", "Mark an acceptance criterion checked"),
+    ("/accept clear", "Clear acceptance criteria"),
+    ("/budget", "Show or set the task budget"),
+    ("/budget clear", "Clear the task budget"),
+    ("/waive <reason>", "Waive verification with a reason"),
+    ("/undo", "Undo the last recorded file change"),
     ("/help", "Show available commands"),
 ];
 
-fn save_plan(app: &mut App) {
+fn save_plan(app: &mut App) -> std::io::Result<()> {
     let json = app.plan.to_json();
-    let _ = app.session.set_state("plan", &json);
+    app.session.set_state("plan", &json)
 }
 
 pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
@@ -44,6 +53,24 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
             .iter()
             .filter(|c| c.starts_with(&q))
             .map(|c| (c.to_string(), "Plan command".to_string()))
+            .collect();
+    }
+    if input.starts_with("/constraint") {
+        let choices = ["/constraint add ", "/constraint clear"];
+        let q = input.to_ascii_lowercase();
+        return choices
+            .iter()
+            .filter(|c| c.starts_with(&q))
+            .map(|c| (c.to_string(), "Constraint command".to_string()))
+            .collect();
+    }
+    if input.starts_with("/accept") {
+        let choices = ["/accept add ", "/accept done ", "/accept clear"];
+        let q = input.to_ascii_lowercase();
+        return choices
+            .iter()
+            .filter(|c| c.starts_with(&q))
+            .map(|c| (c.to_string(), "Acceptance command".to_string()))
             .collect();
     }
     if input.starts_with("/goal")
@@ -256,26 +283,54 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 push_info(app, "usage: /goal <text>".to_string());
             } else {
                 app.plan.goal = Some(text.clone());
-                save_plan(app);
-                push_info(app, format!("goal set: {text}"));
+                if let Err(e) = save_plan(app) {
+                    push_info(app, format!("could not persist goal: {e}"));
+                } else {
+                    push_info(app, format!("goal set: {text}"));
+                }
             }
         }
         "/plan" => {
             if app.plan.is_empty() {
-                push_info(app, "no plan yet; use /goal and /plan add".to_string());
+                push_info(
+                    app,
+                    "no plan yet; use /goal, /plan add, /constraint add, /accept add".to_string(),
+                );
             } else {
                 if let Some(g) = app.plan.goal.clone() {
                     push_info(app, format!("Goal: {g}"));
                 }
+                if !app.plan.constraints.is_empty() {
+                    push_info(app, "Constraints:".to_string());
+                    let constraints = app.plan.constraints.clone();
+                    for c in constraints {
+                        push_info(app, format!("  - {c}"));
+                    }
+                }
                 let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
                 let total = app.plan.steps.len();
-                push_info(app, format!("Plan {done}/{total}"));
-                let steps = app.plan.steps.clone();
-                for (i, (s, done)) in steps.iter().enumerate() {
-                    push_info(
-                        app,
-                        format!("  {} {} {}", if *done { "[x]" } else { "[ ]" }, i + 1, s),
-                    );
+                if total > 0 {
+                    push_info(app, format!("Plan {done}/{total}"));
+                    let steps = app.plan.steps.clone();
+                    for (i, (s, done)) in steps.iter().enumerate() {
+                        push_info(
+                            app,
+                            format!("  {} {} {}", if *done { "[x]" } else { "[ ]" }, i + 1, s),
+                        );
+                    }
+                }
+                if !app.plan.acceptance.is_empty() {
+                    push_info(app, "Acceptance:".to_string());
+                    let acceptance = app.plan.acceptance.clone();
+                    for (i, (s, checked)) in acceptance.iter().enumerate() {
+                        push_info(
+                            app,
+                            format!("  {} {} {}", if *checked { "[x]" } else { "[ ]" }, i + 1, s),
+                        );
+                    }
+                }
+                if app.plan.is_complete() {
+                    push_info(app, "plan complete ✓".to_string());
                 }
             }
         }
@@ -285,8 +340,11 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 push_info(app, "usage: /plan add <step>".to_string());
             } else {
                 app.plan.steps.push((text.clone(), false));
-                save_plan(app);
-                push_info(app, format!("added step {}: {text}", app.plan.steps.len()));
+                if let Err(e) = save_plan(app) {
+                    push_info(app, format!("could not persist plan: {e}"));
+                } else {
+                    push_info(app, format!("added step {}: {text}", app.plan.steps.len()));
+                }
             }
         }
         _ if line.starts_with("/plan done ") => {
@@ -301,19 +359,180 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 );
             } else {
                 app.plan.steps[n - 1].1 = true;
-                save_plan(app);
-                push_info(app, format!("marked step {n} done"));
+                if let Err(e) = save_plan(app) {
+                    push_info(app, format!("could not persist plan: {e}"));
+                } else {
+                    push_info(app, format!("marked step {n} done"));
+                }
             }
         }
         "/plan clear" => {
             app.plan = Plan::default();
-            save_plan(app);
-            push_info(app, "plan cleared".to_string());
+            if let Err(e) = save_plan(app) {
+                push_info(app, format!("could not persist plan: {e}"));
+            } else {
+                push_info(app, "plan cleared".to_string());
+            }
         }
+        _ if line.starts_with("/constraint add ") => {
+            let text = line["/constraint add ".len()..].trim().to_string();
+            if text.is_empty() {
+                push_info(app, "usage: /constraint add <text>".to_string());
+            } else {
+                app.plan.constraints.push(text.clone());
+                if let Err(e) = save_plan(app) {
+                    push_info(app, format!("could not persist constraints: {e}"));
+                } else {
+                    push_info(app, format!("added constraint: {text}"));
+                }
+            }
+        }
+        "/constraint clear" => {
+            app.plan.constraints.clear();
+            if let Err(e) = save_plan(app) {
+                push_info(app, format!("could not persist constraints: {e}"));
+            } else {
+                push_info(app, "constraints cleared".to_string());
+            }
+        }
+        _ if line.starts_with("/accept add ") => {
+            let text = line["/accept add ".len()..].trim().to_string();
+            if text.is_empty() {
+                push_info(app, "usage: /accept add <criterion>".to_string());
+            } else {
+                app.plan.acceptance.push((text.clone(), false));
+                if let Err(e) = save_plan(app) {
+                    push_info(app, format!("could not persist acceptance: {e}"));
+                } else {
+                    push_info(
+                        app,
+                        format!(
+                            "added acceptance criterion {}: {text}",
+                            app.plan.acceptance.len()
+                        ),
+                    );
+                }
+            }
+        }
+        _ if line.starts_with("/accept done ") => {
+            let n = line["/accept done ".len()..]
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
+            if n == 0 || n > app.plan.acceptance.len() {
+                push_info(
+                    app,
+                    format!("usage: /accept done <1..{}>", app.plan.acceptance.len()),
+                );
+            } else {
+                app.plan.acceptance[n - 1].1 = true;
+                if let Err(e) = save_plan(app) {
+                    push_info(app, format!("could not persist acceptance: {e}"));
+                } else {
+                    push_info(app, format!("marked acceptance criterion {n} checked"));
+                }
+            }
+        }
+        "/accept clear" => {
+            app.plan.acceptance.clear();
+            if let Err(e) = save_plan(app) {
+                push_info(app, format!("could not persist acceptance: {e}"));
+            } else {
+                push_info(app, "acceptance criteria cleared".to_string());
+            }
+        }
+        "/budget" => match app.plan.budget.clone() {
+            Some(b) => push_info(
+                app,
+                format!(
+                    "budget: {}s · {} iterations · ${:.2}",
+                    b.max_seconds.unwrap_or(0),
+                    b.max_tool_iterations.unwrap_or(0),
+                    b.max_cost_usd.unwrap_or(0.0)
+                ),
+            ),
+            None => push_info(
+                app,
+                "no budget set; use /budget <seconds> [iterations] [cost]".to_string(),
+            ),
+        },
+        "/budget clear" => {
+            app.plan.budget = None;
+            if let Err(e) = save_plan(app) {
+                push_info(app, format!("could not persist budget: {e}"));
+            } else {
+                push_info(app, "budget cleared".to_string());
+            }
+        }
+        _ if line.starts_with("/budget ") => {
+            let parts: Vec<&str> = line["/budget ".len()..].split_whitespace().collect();
+            if parts.is_empty() {
+                push_info(
+                    app,
+                    "usage: /budget <seconds> [tool_iterations] [cost_usd]".to_string(),
+                );
+            } else {
+                let max_seconds = parts[0].parse::<u64>().ok();
+                if max_seconds.is_none() {
+                    push_info(
+                        app,
+                        "usage: /budget <seconds> [tool_iterations] [cost_usd]".to_string(),
+                    );
+                } else {
+                    let mut budget = crate::core::types::Budget {
+                        max_seconds,
+                        ..crate::core::types::Budget::default()
+                    };
+                    if let Some(iters) = parts.get(1) {
+                        budget.max_tool_iterations = iters.parse::<u32>().ok();
+                    }
+                    if let Some(cost) = parts.get(2) {
+                        budget.max_cost_usd = cost.parse::<f64>().ok();
+                    }
+                    app.plan.budget = Some(budget);
+                    if let Err(e) = save_plan(app) {
+                        push_info(app, format!("could not persist budget: {e}"));
+                    } else {
+                        push_info(app, "budget set (enforced this session)".to_string());
+                    }
+                }
+            }
+        }
+        _ if line.starts_with("/waive ") => {
+            let reason = line["/waive ".len()..].trim().to_string();
+            if reason.is_empty() {
+                push_info(app, "usage: /waive <reason>".to_string());
+            } else {
+                app.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(format!("[verify waived] {reason}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("waive".to_string()),
+                });
+                let _ = app
+                    .session
+                    .append_message(app.messages.last().cloned().unwrap());
+                let _ = app.session.set_state(
+                    "verify",
+                    &serde_json::json!({
+                        "disposition": "waived",
+                        "reason": reason,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    })
+                    .to_string(),
+                );
+                push_info(app, "verification waived (recorded)".to_string());
+            }
+        }
+        "/undo" => match crate::session::undo_last_change(&mut app.session) {
+            Ok(message) => push_info(app, message),
+            Err(e) => push_info(app, format!("undo: {e}")),
+        },
         "/help" => {
             push_info(
                 app,
-                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>] /goal <text> /plan [add|done|clear]"
+                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>] /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear]"
                     .to_string(),
             );
             push_info(

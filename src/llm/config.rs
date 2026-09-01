@@ -34,6 +34,25 @@ pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
     }
 }
 
+/// Auto-detect a verification command (P9) when none is configured: a
+/// recognized manifest in the workspace selects the standard test command.
+/// Called at the daemon/one-shot boundary (NOT inside the shared agent loop),
+/// so a test harness with a real workspace CWD cannot accidentally re-run the
+/// project's own test suite mid-turn.
+pub(crate) fn detect_verify_command() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    if cwd.join("Cargo.toml").exists() {
+        return Some("cargo test".into());
+    }
+    if cwd.join("go.mod").exists() {
+        return Some("go test ./...".into());
+    }
+    if cwd.join("package.json").exists() {
+        return Some("npm test".into());
+    }
+    None
+}
+
 pub(crate) fn load_file_config() -> Result<FileConfig, Box<dyn std::error::Error>> {
     let Some(path) = crate::config::path() else {
         return Ok(FileConfig::default());

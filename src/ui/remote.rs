@@ -97,9 +97,19 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         .get_config()
         .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
 
-    let session = client
-        .create_session(&info.cwd, args.session_name.as_deref())
-        .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+    let (session_id, is_reattach) = if let Some(reattach) = &args.reattach {
+        // P10: attach to an existing persisted session on the daemon and get
+        // the replay cursor, instead of creating a fresh one.
+        let resp = client
+            .reattach(reattach)
+            .map_err(|e| std::io::Error::other(format!("failed to reattach session: {e}")))?;
+        (resp.session_id, true)
+    } else {
+        let resp = client
+            .create_session(&info.cwd, args.session_name.as_deref())
+            .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        (resp.session_id, false)
+    };
 
     // Skills live on the daemon (its workspace). Fetch once for autocomplete
     // and for local `/skill:` handling; a stale list is harmless — the load
@@ -130,6 +140,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             PermissionMode::Trusted => "trusted".to_string(),
         }),
         plan: None,
+        idempotency_key: None,
     };
 
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>();
@@ -185,13 +196,48 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let mut remote = RemoteApp {
         app,
         client,
-        session_id: session.session_id,
+        session_id: session_id.clone(),
         options,
         worker_tx,
         worker_rx,
         decision_tx,
         cancel_flag,
     };
+
+    // P10: reconstruct the transcript for a reattached session by replaying
+    // its journaled event stream. Idempotent replays skip stale approvals
+    // (parked approvals die with their turn on the daemon).
+    if is_reattach {
+        let mut since = 0u64;
+        let mut batches = 0;
+        loop {
+            match remote.client.events(&remote.session_id, since) {
+                Ok(resp) => {
+                    if resp.events.is_empty() {
+                        break;
+                    }
+                    for env in resp.events {
+                        if !matches!(env.event, StreamEvent::ApprovalRequired { .. }) {
+                            handle_stream_event(&mut remote, env.event);
+                        }
+                    }
+                    since = resp.next_seq;
+                    batches += 1;
+                    if batches > 10_000 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    push_info(&mut remote.app, format!("replay failed: {e}"));
+                    break;
+                }
+            }
+        }
+        push_info(
+            &mut remote.app,
+            format!("reattached to session {session_id}"),
+        );
+    }
 
     // Detect the terminal background before raw mode / the alternate screen
     // take over; surface colors are resolved from this once.
@@ -342,15 +388,25 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                 selected: 0,
             });
         }
-        StreamEvent::TurnComplete { usage, .. } => {
+        StreamEvent::TurnComplete { usage, cached, .. } => {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);
             }
+            if let Some(cached) = cached {
+                remote.app.tool_state.last_cached = Some(cached);
+            }
         }
-        StreamEvent::Usage { tokens } => {
+        StreamEvent::Usage { tokens, cached } => {
             // Live context usage: emitted by the daemon after every LLM call
             // so the status bar updates mid-turn, not just at completion.
             remote.app.tool_state.last_usage = Some(tokens);
+            if cached.is_some() {
+                remote.app.tool_state.last_cached = cached;
+            }
+            // Cumulative spend across turns. TurnComplete.usage repeats the
+            // final call's count, so only Usage events accumulate.
+            remote.app.tool_state.total_usage =
+                remote.app.tool_state.total_usage.saturating_add(tokens);
         }
         StreamEvent::TurnFailed { error } => {
             append_sink_line(&mut remote.app, SinkLine::Error(error));
@@ -361,8 +417,20 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
         StreamEvent::Error(msg) => {
             append_sink_line(&mut remote.app, SinkLine::Error(msg));
         }
-        StreamEvent::Plan { goal, steps } => {
-            remote.app.plan = crate::core::types::Plan { goal, steps };
+        StreamEvent::Plan {
+            goal,
+            steps,
+            constraints,
+            acceptance,
+            budget,
+        } => {
+            remote.app.plan = crate::core::types::Plan {
+                goal,
+                steps,
+                constraints,
+                acceptance,
+                budget,
+            };
         }
     }
 }
@@ -688,10 +756,20 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             let id = remote.session_id.clone();
             push_info(&mut remote.app, format!("session: {id} (on daemon)"));
         }
+        "/undo" => {
+            let sid = remote.session_id.clone();
+            match remote.client.undo(&sid) {
+                Ok(true) => push_info(&mut remote.app, "last change undone.".to_string()),
+                Ok(false) | Err(_) => push_info(
+                    &mut remote.app,
+                    "nothing to undo (or undo refused).".to_string(),
+                ),
+            }
+        }
         "/help" => {
             push_info(
                 &mut remote.app,
-                "commands: /quit /clear /new /session /permissions /model [<m>] /skill:<name>"
+                "commands: /quit /clear /new /session /undo /waive <reason> /permissions /model [<m>] /skill:<name> /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear] /budget [<seconds> <iterations>]"
                     .to_string(),
             );
             push_info(
@@ -755,10 +833,47 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                 }
             }
         }
-        l if l.starts_with("/provider ") || l.starts_with("/resume") || l.starts_with("/name ") => {
+        _ if line.starts_with("/waive ") => {
+            let reason = line["/waive ".len()..].trim().to_string();
+            if reason.is_empty() {
+                push_info(&mut remote.app, "usage: /waive <reason>".to_string());
+            } else {
+                let sid = remote.session_id.clone();
+                match remote.client.waive(&sid, &reason) {
+                    Ok(()) => push_info(
+                        &mut remote.app,
+                        "verification waived (recorded for this session).".to_string(),
+                    ),
+                    Err(e) => push_info(
+                        &mut remote.app,
+                        format!("could not waive verification: {e}"),
+                    ),
+                }
+            }
+        }
+        _ if line.starts_with("/name ") => {
+            let name = line["/name ".len()..].trim().to_string();
+            if name.is_empty() {
+                push_info(&mut remote.app, "usage: /name <name>".to_string());
+            } else {
+                let sid = remote.session_id.clone();
+                match remote.client.rename_session(&sid, &name) {
+                    Ok(()) => push_info(&mut remote.app, format!("session name: {name}")),
+                    Err(e) => push_info(&mut remote.app, format!("could not rename: {e}")),
+                }
+            }
+        }
+        l if l.starts_with("/provider ") => {
             push_info(
                 &mut remote.app,
-                "this command is managed on the daemon host; not supported from a remote client yet"
+                "provider is configured on the daemon host; not switchable from a remote client"
+                    .to_string(),
+            );
+        }
+        l if l.starts_with("/resume") => {
+            push_info(
+                &mut remote.app,
+                "sessions persist on the daemon; resume with `dex connect <url> --reattach <session_id>` (see /session for the id)"
                     .to_string(),
             );
         }

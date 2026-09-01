@@ -42,7 +42,7 @@ pub(crate) trait ModelClient {
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
         cancel: &dyn CancellationSource,
-    ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>>;
+    ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>>;
 }
 
 impl ModelClient for LlmConfig {
@@ -52,7 +52,7 @@ impl ModelClient for LlmConfig {
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
         cancel: &dyn CancellationSource,
-    ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+    ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
         call_llm(self, messages, with_tools, sink, cancel)
     }
 }
@@ -166,7 +166,7 @@ pub(crate) fn call_chat_completions(
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn CancellationSource,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
     let req = ChatRequest {
         model: config.model.clone(),
         messages: messages.to_vec(),
@@ -196,7 +196,7 @@ pub(crate) fn call_responses(
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn CancellationSource,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
     let (instructions, input) = responses_input(messages);
     let mut body = json!({
         "model": config.model,
@@ -228,7 +228,7 @@ pub(crate) fn call_llm(
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn CancellationSource,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
     let capabilities = crate::llm::discover_capabilities(config);
     if with_tools && !capabilities.tools {
         return Err("configured model does not support tools".into());
@@ -249,7 +249,7 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
             Ok((
                 ChatMessage {
                     role: "assistant".into(),
@@ -258,7 +258,10 @@ mod tests {
                     tool_call_id: None,
                     name: None,
                 },
-                Some(3),
+                Some(Usage {
+                    prompt_tokens: 3,
+                    cached_tokens: None,
+                }),
             ))
         }
     }
@@ -269,6 +272,12 @@ mod tests {
             .complete(&[], false, None, &crate::agent::state::GlobalCancellation)
             .unwrap();
         assert_eq!(message.content.as_deref(), Some("mock response"));
-        assert_eq!(usage, Some(3));
+        assert_eq!(
+            usage,
+            Some(Usage {
+                prompt_tokens: 3,
+                cached_tokens: None
+            })
+        );
     }
 }

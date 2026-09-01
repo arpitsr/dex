@@ -91,7 +91,7 @@ pub(crate) fn read_stream(
     response: reqwest::blocking::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn crate::agent::state::CancellationSource,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut content = String::new();
@@ -99,6 +99,7 @@ pub(crate) fn read_stream(
     let mut printer = StreamPrinter::new(sink.clone());
     let mut tool_calls: Vec<LlmToolCall> = Vec::new();
     let mut usage_tokens: Option<u64> = None;
+    let mut usage_cached: Option<u64> = None;
 
     loop {
         if cancel.take_cancelled() {
@@ -127,6 +128,7 @@ pub(crate) fn read_stream(
         };
         if let Some(usage) = &chunk.usage {
             usage_tokens = Some(usage.prompt_tokens);
+            usage_cached = usage.prompt_details.as_ref().map(|d| d.cached_tokens);
         }
         for choice in chunk.choices {
             if let Some(text) = choice.delta.content {
@@ -165,7 +167,10 @@ pub(crate) fn read_stream(
             tool_call_id: None,
             name: None,
         },
-        usage_tokens,
+        usage_tokens.map(|tokens| Usage {
+            prompt_tokens: tokens,
+            cached_tokens: usage_cached,
+        }),
     ))
 }
 
@@ -173,7 +178,7 @@ pub(crate) fn read_responses_stream(
     response: reqwest::blocking::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn crate::agent::state::CancellationSource,
-) -> Result<(ChatMessage, Option<u64>), Box<dyn std::error::Error>> {
+) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut content = String::new();
@@ -183,6 +188,7 @@ pub(crate) fn read_responses_stream(
     let mut response_items: HashMap<String, usize> = HashMap::new();
     let mut pending_arguments: HashMap<String, String> = HashMap::new();
     let mut usage_tokens = None;
+    let mut usage_cached: Option<u64> = None;
 
     loop {
         if cancel.take_cancelled() {
@@ -296,6 +302,9 @@ pub(crate) fn read_responses_stream(
             "response.completed" | "response.done" => {
                 if let Some(usage) = event.pointer("/response/usage") {
                     usage_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+                    usage_cached = usage
+                        .pointer("/input_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64);
                 }
             }
             _ => {}
@@ -321,6 +330,55 @@ pub(crate) fn read_responses_stream(
             tool_call_id: None,
             name: None,
         },
-        usage_tokens,
+        usage_tokens.map(|tokens| Usage {
+            prompt_tokens: tokens,
+            cached_tokens: usage_cached,
+        }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compaction summarizer (and any in-process caller) must be able to
+    /// pass a sink and have ALL streamed output routed into the channel —
+    /// never printed raw to stdout, which inside the TUI process is the
+    /// alternate screen (ghost text until resize). With sink=None the raw
+    /// print is intentional (plain one-shot CLI streaming); callers running
+    /// beside a TUI must always pass a sink.
+    #[test]
+    fn stream_printer_with_sink_routes_lines_to_channel_not_stdout() {
+        let (tx, rx) = mpsc::channel();
+        let mut printer = StreamPrinter::new(Some(tx));
+        printer.feed_line("Key facts: internal summary line");
+        printer.feed_line("```rust");
+        printer.feed_line("fn main() {}");
+        printer.feed_line("```");
+        printer.finish();
+
+        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        assert!(lines
+            .iter()
+            .any(|l| matches!(l, SinkLine::Assistant(s) if s.contains("Key facts"))));
+        assert!(lines
+            .iter()
+            .any(|l| matches!(l, SinkLine::Assistant(s) if s.contains("fn main"))));
+    }
+
+    /// Chat-completions nests cached tokens under `prompt_tokens_details`; a
+    /// provider that omits the detail object must parse as None, not fail.
+    #[test]
+    fn stream_usage_parses_cached_tokens_with_and_without_detail() {
+        let usage: StreamUsage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":42}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.prompt_details.map(|d| d.cached_tokens), Some(42));
+
+        let usage: StreamUsage =
+            serde_json::from_str(r#"{"prompt_tokens":100}"#).unwrap();
+        assert!(usage.prompt_details.is_none());
+    }
 }

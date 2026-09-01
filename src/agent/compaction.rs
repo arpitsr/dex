@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+
 use crate::agent::state::CancellationSource;
 use crate::core::format::*;
 use crate::core::types::*;
@@ -119,7 +121,13 @@ pub(crate) fn summarize_old_messages(
             name: None,
         },
     ];
-    let (summary, _) = call_llm(config, &prompt, false, None, cancel)?;
+    // Dead-drop sink: with sink=None, StreamPrinter prints streamed deltas
+    // raw to stdout, which inside the TUI process is the alternate screen —
+    // the internal summary then ghosts over the UI until the next resize
+    // repaint. A dropped receiver makes every send fail silently instead.
+    let (sink, rx) = mpsc::channel();
+    drop(rx);
+    let (summary, _) = call_llm(config, &prompt, false, Some(sink), cancel)?;
     Ok(summary.content.unwrap_or_default())
 }
 
