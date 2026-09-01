@@ -161,6 +161,16 @@ impl LlmConfig {
             ),
             Provider::OpenAiCodex => load_codex_credentials()?,
         };
+        // Resolve context window once, then derive max_prompt_tokens from it
+        // so the two limits can never disagree (old default: both 128k).
+        let context_window = env::var("DEX_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.context_window)
+            .unwrap_or_else(|| provider_default_context_window(provider));
+        let derived_max_prompt = context_window
+            .saturating_sub(16_000)
+            .min(context_window * 3 / 4);
         Ok(Self {
             provider,
             api_key,
@@ -170,13 +180,7 @@ impl LlmConfig {
             api,
             account_id,
             thinking_effort: file.thinking_effort,
-            // Context window in tokens; configurable via file (`context_window`)
-            // or DEX_CONTEXT_WINDOW env, with a conservative default per provider.
-            context_window: env::var("DEX_CONTEXT_WINDOW")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(file.context_window)
-                .unwrap_or_else(|| provider_default_context_window(provider)),
+            context_window,
             verify_command: env::var("DEX_VERIFY").ok().or(file.verify_command.clone()),
             permission,
             max_tool_iterations: env::var("DEX_MAX_TOOL_ITERATIONS")
@@ -188,7 +192,7 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_prompt_tokens)
-                .unwrap_or(128_000),
+                .unwrap_or(derived_max_prompt),
             max_turn_seconds: env::var("DEX_MAX_TURN_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -214,6 +218,17 @@ impl LlmConfig {
                 ))
                 .build()?,
         })
+    }
+
+    /// Trigger compaction when prompt exceeds this many tokens.
+    /// Half the window leaves room for completion + tool overhead.
+    pub(crate) fn compaction_threshold(&self) -> u64 {
+        self.context_window / 2
+    }
+
+    /// Tokens reserved for the model's reply.
+    pub(crate) fn reserve_tokens(&self) -> u64 {
+        8192
     }
 
     pub(crate) fn switch_provider(
