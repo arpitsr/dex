@@ -169,6 +169,10 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         history_draft: String::new(),
         slash_selected: 0,
         assistant_open: false,
+        transcript_version: 0,
+        display_cache: Vec::new(),
+        display_cache_width: 0,
+        display_cache_version: u64::MAX,
     };
     push_info(
         &mut app,
@@ -246,7 +250,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
 
             let next = if let Some(event) = pending.pop_front() {
                 event
-            } else if event::poll(Duration::from_millis(50))? {
+            } else if event::poll(Duration::from_millis(16))? {
                 event::read()?
             } else {
                 continue;
@@ -402,17 +406,12 @@ fn handle_key_event(
     key: crossterm::event::KeyEvent,
     pending: &mut VecDeque<Event>,
 ) -> std::io::Result<()> {
-    if !remote.app.busy
-        && key.modifiers.is_empty()
-        && matches!(key.code, KeyCode::Up | KeyCode::Down)
-    {
+    if key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down) {
         let mut delta = arrow_delta(key.code);
         let mut wheel = false;
-        let deadline = Instant::now() + ARROW_LOOKAHEAD;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            if !event::poll(remaining)? {
-                break;
-            }
+        // ponytail: poll(0) drain — alternate-scroll bursts are already queued,
+        // no 25ms wait. Keeps wheel instant and stops the "keeps moving" lag.
+        while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(k)
                     if k.kind == KeyEventKind::Press
@@ -422,11 +421,15 @@ fn handle_key_event(
                     wheel = true;
                     delta += arrow_delta(k.code);
                 }
-                other => pending.push_back(other),
+                other => {
+                    pending.push_back(other);
+                    break;
+                }
             }
         }
         if wheel {
-            scroll_transcript(&mut remote.app, delta);
+            // 3 Up per notch -> 9 rows per notch feels responsive without page jump
+            scroll_transcript(&mut remote.app, delta * 3);
             return Ok(());
         }
     }

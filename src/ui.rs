@@ -125,6 +125,10 @@ pub(crate) struct App {
     /// canonical between blocks.
     pub(crate) assistant_open: bool,
     pub(crate) plan: crate::core::types::Plan,
+    pub(crate) transcript_version: u64,
+    pub(crate) display_cache: Vec<Line<'static>>,
+    pub(crate) display_cache_width: u16,
+    pub(crate) display_cache_version: u64,
 }
 
 impl App {
@@ -247,6 +251,7 @@ pub(super) fn push_info(app: &mut App, text: String) {
         .push(TranscriptBlock::Info(indent_transcript_line(Line::from(
             Span::styled(text, Style::default().fg(Color::Cyan)),
         ))));
+    app.transcript_version = app.transcript_version.wrapping_add(1);
 }
 
 /// Route a streamed console line into the transcript with the same styling
@@ -264,9 +269,9 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 if app.assistant_open {
                     if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
                         lines.push(Line::default());
+                        app.transcript_version = app.transcript_version.wrapping_add(1);
                     }
                 }
-                app.autoscroll = true;
                 return;
             }
             let new_lines: Vec<Line<'static>> = render::markdown_lines(s.trim_end())
@@ -276,13 +281,13 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             if app.assistant_open {
                 if let Some(TranscriptBlock::Assistant(existing)) = app.transcript.last_mut() {
                     existing.extend(new_lines);
-                    app.autoscroll = true;
+                    app.transcript_version = app.transcript_version.wrapping_add(1);
                     return;
                 }
             }
             app.transcript.push(TranscriptBlock::Assistant(new_lines));
             app.assistant_open = true;
-            app.autoscroll = true;
+            app.transcript_version = app.transcript_version.wrapping_add(1);
             return;
         }
         SinkLine::ToolInput(s) => {
@@ -305,6 +310,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 output: None,
                 preview: Vec::new(),
             });
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::ToolOutput {
             name: _,
@@ -353,7 +359,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 if out.is_none() {
                     *out = Some(output);
                     *prev = preview_lines;
-                    app.autoscroll = true;
+                    app.transcript_version = app.transcript_version.wrapping_add(1);
                     return;
                 }
             }
@@ -366,6 +372,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 output: Some(output),
                 preview: preview_lines,
             });
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::System(s) => {
             app.assistant_open = false;
@@ -376,6 +383,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                         Span::styled(s, Style::default().fg(theme::muted_fg())),
                     ],
                 ))));
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         // Usage updates flow into the status bar via StreamEvent::Usage in
         // the remote handler, not into the transcript.
@@ -392,9 +400,12 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                         Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
                     ],
                 ))));
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
     }
-    app.autoscroll = true;
+    // ponytail: sticky autoscroll — don't force true on every append;
+    // TranscriptView snaps only when already at bottom, so manual scroll
+    // during streaming stays put instead of snapping back each chunk.
 }
 
 fn dim_intermediate_assistant_block(app: &mut App) {
@@ -441,6 +452,8 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
     }
     block_lines.push(Line::from(edge_pad));
     app.transcript.push(TranscriptBlock::User(block_lines));
+    app.transcript_version = app.transcript_version.wrapping_add(1);
+    app.autoscroll = true;
 }
 
 #[cfg(test)]
@@ -499,6 +512,10 @@ mod tests {
             slash_selected: 0,
             assistant_open: false,
             plan: crate::core::types::Plan::default(),
+            transcript_version: 0,
+            display_cache: Vec::new(),
+            display_cache_width: 0,
+            display_cache_version: u64::MAX,
         }
     }
 
