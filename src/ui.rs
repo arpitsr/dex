@@ -342,7 +342,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::ToolOutput {
-            name: _,
+            name,
             summary,
             success,
             preview,
@@ -368,13 +368,25 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ));
             }
             let output = indent_transcript_line(Line::from(spans));
+            // write/edit previews are a git diff: color it like git does.
+            let is_diff = matches!(name.as_str(), "write" | "edit");
             let preview_lines: Vec<Line<'static>> = preview
                 .iter()
                 .map(|line| {
-                    indent_transcript_line(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(theme::tool_preview_fg()),
-                    )))
+                    let style = if is_diff {
+                        if line.starts_with('+') {
+                            Style::default().fg(Color::LightGreen)
+                        } else if line.starts_with('-') {
+                            Style::default().fg(Color::LightRed)
+                        } else if line.starts_with("@@") {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(theme::tool_preview_fg())
+                        }
+                    } else {
+                        Style::default().fg(theme::tool_preview_fg())
+                    };
+                    indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
                 })
                 .collect();
             app.assistant_open = false;
@@ -555,9 +567,15 @@ mod tests {
         let mut app = test_app();
         app.tick = 8; // throttle window open, so every delta bumps the version
         for chunk in ["Let me ", "think."] {
-            append_sink_line(&mut app, crate::core::types::SinkLine::Thinking(chunk.into()));
+            append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Thinking(chunk.into()),
+            );
         }
-        append_sink_line(&mut app, crate::core::types::SinkLine::Assistant("done".into()));
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("done".into()),
+        );
         assert_eq!(app.transcript.len(), 2);
         assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "Let me think."));
         assert!(matches!(&app.transcript[1], TranscriptBlock::Assistant(_)));
@@ -568,7 +586,10 @@ mod tests {
     fn thinking_only_deltas_stay_in_one_block() {
         let mut app = test_app();
         for chunk in ["a", "b", "c"] {
-            append_sink_line(&mut app, crate::core::types::SinkLine::Thinking(chunk.into()));
+            append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Thinking(chunk.into()),
+            );
         }
         assert_eq!(app.transcript.len(), 1);
         assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "abc"));

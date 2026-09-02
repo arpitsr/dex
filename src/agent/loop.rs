@@ -250,6 +250,7 @@ pub(crate) fn execute_tool_call(
                 ToolOutcome {
                     text: format!("Error: invalid tool arguments: {}", error),
                     ok: false,
+                    diff: None,
                 },
             )
         }
@@ -261,10 +262,19 @@ pub(crate) fn execute_tool_call(
             ToolOutcome {
                 text: "Error: tool arguments must be a JSON object".into(),
                 ok: false,
+                diff: None,
             },
         );
     };
     let input = serde_json::to_string(&args).unwrap_or_default();
+    // Capture the write/edit before/after diff while the file still holds the
+    // "before" state: it decorates the approval prompt and, on success, the
+    // tool-result preview. Display-only — the model keeps seeing plain text.
+    let change_diff = if matches!(name.as_str(), "write" | "edit") {
+        crate::tools::change_diff(&name, &args)
+    } else {
+        None
+    };
     // P8: show a diff preview before requiring approval for a write/edit on
     // the non-trusted path, so the user sees what would change.
     if matches!(name.as_str(), "write" | "edit")
@@ -273,9 +283,9 @@ pub(crate) fn execute_tool_call(
             PermissionMode::AskWrites | PermissionMode::AskShell
         )
     {
-        if let Some(preview) = crate::tools::change_preview(&name, &args) {
+        if let Some(diff) = &change_diff {
             if let Some(sink) = console.sink() {
-                let _ = sink.send(SinkLine::System(format!("[change preview]\n{preview}")));
+                let _ = sink.send(SinkLine::System(format!("[change preview]\n{diff}")));
             }
         }
     }
@@ -286,10 +296,15 @@ pub(crate) fn execute_tool_call(
             ToolOutcome {
                 text: format!("Error: permission denied for tool '{}'", name),
                 ok: false,
+                diff: None,
             },
         );
     }
-    (name.clone(), input, execute_outcome(&name, &args, cancel))
+    let mut outcome = execute_outcome(&name, &args, cancel);
+    if outcome.ok {
+        outcome.diff = change_diff;
+    }
+    (name.clone(), input, outcome)
 }
 
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
@@ -735,6 +750,7 @@ pub(crate) fn process_turn(
                                 ToolOutcome {
                                     text: "Error: tool worker panicked".into(),
                                     ok: false,
+                                    diff: None,
                                 },
                                 Duration::ZERO,
                             )
@@ -743,9 +759,10 @@ pub(crate) fn process_turn(
                     .collect()
             };
 
-            for (index, (call, (name, input, outcome, elapsed))) in
+            for (index, (call, (name, input, mut outcome, elapsed))) in
                 calls.iter().zip(results).enumerate()
             {
+                let change_diff = outcome.diff.take();
                 let cache_key = format!(
                     "{}:{}:{}{}",
                     env::current_dir()
@@ -823,11 +840,17 @@ pub(crate) fn process_turn(
                     // line to expose the actual error detail.
                     let counts_only = matches!(name.as_str(), "read" | "grep" | "find" | "chain");
                     let skip_first = !counts_only || !ok;
+                    // write/edit shows the full captured diff (color-coded in
+                    // the TUI); everything else keeps the 3-line preview.
+                    let preview = match (ok, change_diff.as_deref()) {
+                        (true, Some(diff)) => diff_preview_lines(diff, 400),
+                        _ => tool_result_preview(&result, 3, skip_first),
+                    };
                     let _ = sink.send(SinkLine::ToolOutput {
                         name: name.clone(),
                         summary,
                         success: ok,
-                        preview: tool_result_preview(&result, 3, skip_first),
+                        preview,
                         duration: elapsed.as_secs_f64(),
                     });
                 } else {
@@ -1247,7 +1270,13 @@ mod tests {
                     name: None,
                 }
             };
-            Ok((message, Some(Usage { prompt_tokens: 1, cached_tokens: None })))
+            Ok((
+                message,
+                Some(Usage {
+                    prompt_tokens: 1,
+                    cached_tokens: None,
+                }),
+            ))
         }
     }
 
@@ -1661,7 +1690,13 @@ mod tests {
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
         ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
-            Ok((tool_call_msg("bash", "{\"command\":\"echo hi\"}"), Some(Usage { prompt_tokens: 1, cached_tokens: None })))
+            Ok((
+                tool_call_msg("bash", "{\"command\":\"echo hi\"}"),
+                Some(Usage {
+                    prompt_tokens: 1,
+                    cached_tokens: None,
+                }),
+            ))
         }
     }
 

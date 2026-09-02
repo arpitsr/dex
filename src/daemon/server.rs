@@ -21,7 +21,8 @@ use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
-    LoadSkillRequest, ReattachResponse, SkillInfo, StreamEnvelope, StreamEvent,
+    FollowupRequest, LoadSkillRequest, ReattachResponse, SkillInfo, SteerRequest, StreamEnvelope,
+    StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills, skill_dirs};
@@ -37,6 +38,8 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/chat", post(chat))
         .route("/api/sessions/{id}/approve", post(approve))
         .route("/api/sessions/{id}/cancel", post(cancel))
+        .route("/api/sessions/{id}/steer", post(steer))
+        .route("/api/sessions/{id}/followup", post(followup))
         .route("/api/sessions/{id}/skill", post(load_skill))
         // P10: versioned reattach/replay, P9: trace, P8: undo.
         .route("/api/sessions/{id}/events", get(session_events))
@@ -352,6 +355,13 @@ async fn chat(
             return Err(StatusCode::NOT_FOUND);
         }
     }
+    // Pre-create per-turn channels so `POST /steer` / `POST /followup`
+    // have a target as soon as the turn is registered (avoids a race where
+    // the client sends steering in the gap between `active_turns` insert and
+    // the `spawn_blocking` thread creating its channels).
+    let mut steering_rx_opt: Option<std_mpsc::Receiver<String>> = None;
+    let mut followup_rx_opt: Option<std_mpsc::Receiver<String>> = None;
+    let mut cancel_for_turn: Option<CancellationToken> = None;
     if replay_envelope.is_none() {
         {
             let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
@@ -371,6 +381,24 @@ async fn chat(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(session_id.clone(), cancel.clone());
+        cancel_for_turn = Some(cancel);
+        // Steering / follow-up queues for this turn (mirrors old local
+        // `event.rs` channels). Insert now so the HTTP handlers can push
+        // immediately.
+        let (steering_tx, steering_rx) = std_mpsc::channel::<String>();
+        let (followup_tx, followup_rx) = std_mpsc::channel::<String>();
+        state
+            .steering_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.clone(), steering_tx);
+        state
+            .followup_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.clone(), followup_tx);
+        steering_rx_opt = Some(steering_rx);
+        followup_rx_opt = Some(followup_rx);
     }
 
     let (tx, mut rx) = mpsc::channel::<StreamEnvelope>(256);
@@ -388,9 +416,19 @@ async fn chat(
         let state_for_turn = state.clone();
         let sid = session_id.clone();
         let idem_key = idempotency_key;
-        let cancel = CancellationToken::new();
+        let cancel = cancel_for_turn.unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            run_agent_turn(state_for_turn, sid, req, cancel, tx, idem_key, request_hash);
+            run_agent_turn(
+                state_for_turn,
+                sid,
+                req,
+                cancel,
+                tx,
+                idem_key,
+                request_hash,
+                steering_rx_opt,
+                followup_rx_opt,
+            );
         });
     }
 
@@ -412,6 +450,7 @@ async fn chat(
 
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Fully
 /// blocking; called from `spawn_blocking` only.
+#[allow(clippy::too_many_arguments)]
 fn run_agent_turn(
     state: Arc<DaemonState>,
     session_id: String,
@@ -420,9 +459,11 @@ fn run_agent_turn(
     tx: mpsc::Sender<StreamEnvelope>,
     idempotency_key: Option<String>,
     request_hash: u64,
+    steering_rx: Option<std_mpsc::Receiver<String>>,
+    followup_rx: Option<std_mpsc::Receiver<String>>,
 ) {
-    // Use a guard so active_turns/cancel_tokens/pending approvals are cleaned
-    // even when run_turn_inner panics inside spawn_blocking.
+    // Use a guard so active_turns/cancel_tokens/pending approvals/steering
+    // are cleaned even when run_turn_inner panics inside spawn_blocking.
     struct TurnGuard {
         state: Arc<DaemonState>,
         session_id: String,
@@ -454,14 +495,114 @@ fn run_agent_turn(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&self.session_id);
+            self.state
+                .steering_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
+            self.state
+                .followup_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
         }
     }
     let _guard = TurnGuard {
         state: state.clone(),
         session_id: session_id.clone(),
     };
+    // Steering / follow-up channels for this turn (mirrors the old in-memory
+    // `event.rs` submit path). `POST /steer` and `POST /followup` push into
+    // these; the agent loop consumes them between iterations / chained turns.
+    // When `chat` pre-creates the queues to avoid a race, reuse them; else
+    // (direct `run_agent_turn` calls, e.g. tests) create them here.
+    let (steering_rx, followup_rx) = match (steering_rx, followup_rx) {
+        (Some(sr), Some(fr)) => (sr, fr),
+        _ => {
+            let (steering_tx, sr) = std_mpsc::channel::<String>();
+            let (followup_tx, fr) = std_mpsc::channel::<String>();
+            state
+                .steering_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.clone(), steering_tx);
+            state
+                .followup_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.clone(), followup_tx);
+            (sr, fr)
+        }
+    };
+    let (steering_accepted_tx, steering_accepted_rx) = std_mpsc::channel::<String>();
+    let (followup_accepted_tx, followup_accepted_rx) = std_mpsc::channel::<String>();
+    // Forward accepted steers/follow-ups onto the SSE stream so the remote
+    // TUI can clear its `pending_*` badge and render the prompt. Journaled
+    // so a reattach replay reconstructs the transcript.
+    {
+        let tx_clone = tx.clone();
+        let state_clone = state.clone();
+        let sid = session_id.clone();
+        let entry_path = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sid)
+            .map(|e| e.path.clone());
+        std::thread::spawn(move || {
+            let mut journal = entry_path
+                .as_deref()
+                .and_then(|p| Session::from_path(p).ok());
+            while let Ok(content) = steering_accepted_rx.recv() {
+                let event = StreamEvent::SteeringAccepted {
+                    content: content.clone(),
+                };
+                let seq = state_clone.next_seq(&sid);
+                if let Some(j) = journal.as_mut() {
+                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                }
+                let _ = tx_clone.blocking_send(StreamEnvelope { seq, event });
+            }
+        });
+    }
+    {
+        let tx_clone = tx.clone();
+        let state_clone = state.clone();
+        let sid = session_id.clone();
+        let entry_path = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sid)
+            .map(|e| e.path.clone());
+        std::thread::spawn(move || {
+            let mut journal = entry_path
+                .as_deref()
+                .and_then(|p| Session::from_path(p).ok());
+            while let Ok(content) = followup_accepted_rx.recv() {
+                let event = StreamEvent::FollowupAccepted {
+                    content: content.clone(),
+                };
+                let seq = state_clone.next_seq(&sid);
+                if let Some(j) = journal.as_mut() {
+                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                }
+                let _ = tx_clone.blocking_send(StreamEnvelope { seq, event });
+            }
+        });
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_turn_inner(&state, &session_id, &req, &cancel, &tx)
+        run_turn_inner(
+            &state,
+            &session_id,
+            &req,
+            &cancel,
+            &tx,
+            Some(&steering_rx),
+            Some(&steering_accepted_tx),
+            Some(&followup_rx),
+            Some(&followup_accepted_tx),
+        )
     }));
     // Drop the guard now before sending the terminal event so a new turn can
     // be accepted promptly; drop ordering handles pending approvals/active turns.
@@ -511,12 +652,17 @@ fn run_agent_turn(
     let _ = tx.blocking_send(env);
 }
 
+#[allow(clippy::too_many_arguments, unused_assignments)]
 fn run_turn_inner(
     state: &Arc<DaemonState>,
     session_id: &str,
     req: &ChatRequest,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<StreamEnvelope>,
+    steering_rx: Option<&std_mpsc::Receiver<String>>,
+    steering_accepted_tx: Option<&std_mpsc::Sender<String>>,
+    followup_rx: Option<&std_mpsc::Receiver<String>>,
+    followup_accepted_tx: Option<&std_mpsc::Sender<String>>,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
         let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -635,56 +781,70 @@ fn run_turn_inner(
         let state = state.clone();
         let session_path = session.path().map(|p| p.to_path_buf());
         let sid = session_id.to_string();
+        let cancel = cancel.clone();
         std::thread::spawn(move || {
             // Reopen so journal writes never fight the agent loop's handle;
             // events land in the separate `<id>.events.jsonl` file.
             let mut journal = session_path
                 .as_deref()
                 .and_then(|p| Session::from_path(p).ok());
-            while let Ok(sl) = sink_rx.recv() {
-                let event = match sl {
-                    SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
-                    SinkLine::Thinking(text) => StreamEvent::Thinking(text),
-                    SinkLine::ToolInput(preview) => {
-                        let mut parts = preview.splitn(2, ' ');
-                        let name = parts.next().unwrap_or_default().to_string();
-                        let args = parts.next().unwrap_or_default().to_string();
-                        StreamEvent::ToolCall {
-                            name,
-                            args: serde_json::Value::String(args),
+            loop {
+                match sink_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(sl) => {
+                        let event = match sl {
+                            SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
+                            SinkLine::Thinking(text) => StreamEvent::Thinking(text),
+                            SinkLine::ToolInput(preview) => {
+                                let mut parts = preview.splitn(2, ' ');
+                                let name = parts.next().unwrap_or_default().to_string();
+                                let args = parts.next().unwrap_or_default().to_string();
+                                StreamEvent::ToolCall {
+                                    name,
+                                    args: serde_json::Value::String(args),
+                                }
+                            }
+                            SinkLine::ToolOutput {
+                                name,
+                                summary,
+                                success,
+                                preview,
+                                duration,
+                            } => StreamEvent::ToolResult {
+                                name,
+                                summary,
+                                success,
+                                preview,
+                                duration,
+                            },
+                            SinkLine::System(text) => StreamEvent::System(text),
+                            SinkLine::Error(text) => StreamEvent::Error(text),
+                            SinkLine::Usage { tokens, cached } => {
+                                StreamEvent::Usage { tokens, cached }
+                            }
+                            SinkLine::Plan(plan) => StreamEvent::Plan {
+                                goal: plan.goal,
+                                steps: plan.steps,
+                                constraints: plan.constraints,
+                                acceptance: plan.acceptance,
+                                budget: plan.budget,
+                            },
+                        };
+                        let seq = state.next_seq(&sid);
+                        if let Some(s) = journal.as_mut() {
+                            let _ = s.append_event(
+                                seq,
+                                &serde_json::to_string(&event).unwrap_or_default(),
+                            );
+                        }
+                        let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if cancel.is_cancelled() {
+                            break;
                         }
                     }
-                    SinkLine::ToolOutput {
-                        name,
-                        summary,
-                        success,
-                        preview,
-                        duration,
-                    } => StreamEvent::ToolResult {
-                        name,
-                        summary,
-                        success,
-                        preview,
-                        duration,
-                    },
-                    SinkLine::System(text) => StreamEvent::System(text),
-                    SinkLine::Error(text) => StreamEvent::Error(text),
-                    SinkLine::Usage { tokens, cached } => {
-                        StreamEvent::Usage { tokens, cached }
-                    }
-                    SinkLine::Plan(plan) => StreamEvent::Plan {
-                        goal: plan.goal,
-                        steps: plan.steps,
-                        constraints: plan.constraints,
-                        acceptance: plan.acceptance,
-                        budget: plan.budget,
-                    },
-                };
-                let seq = state.next_seq(&sid);
-                if let Some(s) = journal.as_mut() {
-                    let _ = s.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
             }
         });
     }
@@ -737,19 +897,73 @@ fn run_turn_inner(
     }
 
     let mut tool_state = ToolState::load();
-    let turn_result = process_turn(
-        &config,
-        &mut messages,
-        &mut tool_state,
-        None,
-        None,
-        Some(&mut session),
-        &config,
-        cancel,
-        &console,
-    );
-    let usage = tool_state.last_usage;
-    let cached = tool_state.last_cached;
+    #[allow(unused_assignments)]
+    // Outer loop for follow-up chaining (mirrors old local `event.rs` loop):
+    // `process_turn` consumes steering mid-turn; follow-ups are drained after
+    // each successful turn and chained without a new HTTP request.
+    let mut final_response = String::new();
+    let mut final_usage = None;
+    let mut final_cached = None;
+    let turn_result: Result<String, Box<dyn std::error::Error>>;
+    loop {
+        let result = process_turn(
+            &config,
+            &mut messages,
+            &mut tool_state,
+            steering_rx,
+            steering_accepted_tx,
+            Some(&mut session),
+            &config,
+            cancel,
+            &console,
+        );
+        match result {
+            Ok(resp) => {
+                final_response = resp;
+                final_usage = tool_state.last_usage;
+                final_cached = tool_state.last_cached;
+                // Drain follow-ups queued while this turn ran.
+                let followups: Vec<String> = followup_rx
+                    .as_ref()
+                    .map(|rx| rx.try_iter().collect())
+                    .unwrap_or_default();
+                if followups.is_empty() {
+                    turn_result = Ok(final_response.clone());
+                    break;
+                }
+                for content in followups {
+                    if let Some(tx) = followup_accepted_tx {
+                        let _ = tx.send(content.clone());
+                    }
+                    let msg = ChatMessage {
+                        role: "user".into(),
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: Some("follow-up".into()),
+                    };
+                    session
+                        .append_message(msg.clone())
+                        .map_err(|e| format!("failed to persist followup: {e}"))?;
+                    messages.push(msg);
+                }
+                if cancel.is_cancelled() {
+                    turn_result = Err("cancelled by user".into());
+                    break;
+                }
+                // chained follow-up: loop and run another turn with the same
+                // session/messages/tool_state but without new turn_start marker
+                // (the followup is already persisted).
+                continue;
+            }
+            Err(e) => {
+                turn_result = Err(e);
+                break;
+            }
+        }
+    }
+    let usage = final_usage;
+    let cached = final_cached;
     // Durable terminal marker (P8): a completed turn is recorded before the
     // event is relayed; a failed one gets `turn_failed` in run_agent_turn.
     match &turn_result {
@@ -880,6 +1094,55 @@ async fn cancel(
     }
 
     Json(json!({ "status": "ok" }))
+}
+
+async fn steer(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SteerRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Session must exist; steering only valid while a turn is active.
+    {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if !sessions.contains_key(&session_id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    let tx = {
+        let map = state.steering_txs.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&session_id).cloned()
+    }
+    .ok_or(StatusCode::CONFLICT)?;
+    tx.send(content).map_err(|_| StatusCode::CONFLICT)?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn followup(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<FollowupRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if !sessions.contains_key(&session_id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    let tx = {
+        let map = state.followup_txs.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&session_id).cloned()
+    }
+    .ok_or(StatusCode::CONFLICT)?;
+    tx.send(content).map_err(|_| StatusCode::CONFLICT)?;
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 /// Resolve a session file path from the registry, or 404.

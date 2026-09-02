@@ -60,6 +60,12 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
         StreamEvent::TurnComplete { .. } => {}
         StreamEvent::Usage { .. } => {}
         StreamEvent::Plan { .. } => {}
+        StreamEvent::SteeringAccepted { content } => {
+            eprintln!("[steer] {content}");
+        }
+        StreamEvent::FollowupAccepted { content } => {
+            eprintln!("[follow-up] {content}");
+        }
     }
     None
 }

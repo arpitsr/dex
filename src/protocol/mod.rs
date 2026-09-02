@@ -30,6 +30,19 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+/// Request to enqueue a steering message into an active turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerRequest {
+    pub content: String,
+}
+
+/// Request to enqueue a follow-up message (runs as a chained turn after the
+/// current one completes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowupRequest {
+    pub content: String,
+}
+
 /// Request to submit a chat prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -154,6 +167,16 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<Budget>,
     },
+
+    /// Steering message was accepted by the agent loop (mid-turn injection).
+    /// The client uses this to clear its `pending_steering` badge and render
+    /// the user's steer as a transcript block.
+    #[serde(rename = "steering_accepted")]
+    SteeringAccepted { content: String },
+
+    /// Follow-up message was accepted and queued for the next chained turn.
+    #[serde(rename = "followup_accepted")]
+    FollowupAccepted { content: String },
 }
 
 /// One numbered SSE event (P10). `seq` is the daemon-assigned, per-session

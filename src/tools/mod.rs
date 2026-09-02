@@ -1,10 +1,11 @@
 #![allow(clippy::doc_lazy_continuation)]
 use serde_json::{Map, Value};
+use similar::TextDiff;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -109,10 +110,13 @@ pub(crate) enum ToolError {
 /// A tool result together with whether the call actually succeeded. Success
 /// is decided where the exit status is known — never inferred from the
 /// output text, which may legitimately contain markers like `[exit 1]`.
+/// `diff` carries the display-only git diff for write/edit, captured before
+/// the file was mutated; it never reaches the model.
 #[derive(Clone, Debug)]
 pub(crate) struct ToolOutcome {
     pub(crate) text: String,
     pub(crate) ok: bool,
+    pub(crate) diff: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,10 +267,16 @@ fn shell_timeout() -> Duration {
 /// ponytail: shell stitching only — if JSON routing in pipelines gets
 /// painful, embed rquickjs and expose tools as functions (same $DEX_BIN mechanism).
 fn tool_runner_env() -> Vec<(String, String)> {
-    std::env::current_exe()
-        .ok()
-        .map(|exe| vec![("DEX_BIN".to_string(), exe.display().to_string())])
-        .unwrap_or_default()
+    let mut env = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        env.push(("DEX_BIN".to_string(), exe.display().to_string()));
+    }
+    // git via bash without --no-pager can invoke delta/bat/less which
+    // probe the terminal (OSC 10/11) and race crossterm for the reply;
+    // force a non-interactive pager so the child never queries the pts.
+    env.push(("GIT_PAGER".to_string(), "cat".to_string()));
+    env.push(("PAGER".to_string(), "cat".to_string()));
+    env
 }
 
 /// Read up to `limit` bytes; reports whether more output remained after the
@@ -314,6 +324,7 @@ fn run_bash_with_limits(
         .arg("-c")
         .arg(command)
         .envs(tool_runner_env())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // New session for the shell: drops the controlling tty, so tool children
@@ -673,11 +684,13 @@ fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
     Ok(format!("edited {}{note}", path.display()))
 }
 
-/// Human-readable before/after diff for a pending write/edit, used as a
-/// patch preview before approval (`permission != trusted`). Returns None when
-/// the file is missing or too large, or the diff is empty.
-pub(crate) fn change_preview(name: &str, args: &Map<String, Value>) -> Option<String> {
-    let path = workspace_path(&arg_str(args, "path").ok()?).ok()?;
+/// Git-style unified diff (4 context lines, `--- a/…` / `+++ b/…` headers,
+/// `/dev/null` for new files) of a pending write/edit, shown in the
+/// transcript before approval and under the tool result. Returns None when
+/// the file is missing or the change is empty.
+pub(crate) fn change_diff(name: &str, args: &Map<String, Value>) -> Option<String> {
+    let raw_path = arg_str(args, "path").ok()?;
+    let path = workspace_path(&raw_path).ok()?;
     let before = fs::read_to_string(&path).ok();
     let after = match name {
         "write" => arg_str(args, "content").ok(),
@@ -694,50 +707,21 @@ pub(crate) fn change_preview(name: &str, args: &Map<String, Value>) -> Option<St
         }
         _ => return None,
     }?;
-    let diff = simple_diff(before.as_deref().unwrap_or(""), &after);
-    if diff.is_empty() {
-        return None;
-    }
-    let header = match before {
-        Some(_) => format!("{name} {}", path.display()),
-        None => format!("{name} {} (new file)", path.display()),
+    let diff = TextDiff::from_lines(before.as_deref().unwrap_or(""), &after);
+    let (old_header, new_header) = match &before {
+        Some(_) => (format!("a/{raw_path}"), format!("b/{raw_path}")),
+        None => ("/dev/null".to_string(), format!("b/{raw_path}")),
     };
-    Some(format!("{header}\n{diff}"))
-}
-
-/// Minimal line diff (`-` removed / `+` added), capped so a preview never
-/// floods the transcript.
-fn simple_diff(before: &str, after: &str) -> String {
-    let before_lines: Vec<&str> = before.lines().collect();
-    let after_lines: Vec<&str> = after.lines().collect();
-    let mut out = Vec::new();
-    let max = before_lines.len().max(after_lines.len());
-    for i in 0..max {
-        let b = before_lines.get(i);
-        let a = after_lines.get(i);
-        match (b, a) {
-            (Some(b), Some(a)) if b == a => {}
-            (Some(b), Some(a)) => {
-                out.push(format!("-{b}"));
-                out.push(format!("+{a}"));
-            }
-            (Some(b), None) => out.push(format!("-{b}")),
-            (None, Some(a)) => out.push(format!("+{a}")),
-            _ => {}
-        }
-    }
+    let out = diff
+        .unified_diff()
+        .context_radius(4)
+        .header(&old_header, &new_header)
+        .to_string();
     if out.is_empty() {
-        return String::new();
+        None
+    } else {
+        Some(out)
     }
-    let mut text = out.join("\n");
-    if out.len() > 40 {
-        text = format!(
-            "{}\n[... {} more lines]",
-            out[..40].join("\n"),
-            out.len() - 40
-        );
-    }
-    text
 }
 
 fn apply_edit(
@@ -997,6 +981,7 @@ fn has_ripgrep() -> bool {
     *RG.get_or_init(|| {
         Command::new("rg")
             .arg("--version")
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -1407,10 +1392,12 @@ pub(crate) fn execute_outcome(
         Ok(out) => ToolOutcome {
             text: out,
             ok: true,
+            diff: None,
         },
         Err(e) => ToolOutcome {
             text: format!("Error: {}", e),
             ok: false,
+            diff: None,
         },
     }
 }
@@ -1556,19 +1543,42 @@ mod tests {
     }
 
     #[test]
-    fn change_preview_shows_diff_for_write_and_edit() {
+    fn change_diff_shows_unified_diff_for_write_and_edit() {
         let cwd = std::env::current_dir().unwrap();
         fs::create_dir_all(cwd.join("target")).unwrap();
         let path = cwd.join("target/dex-preview-test.txt");
-        fs::write(&path, "line1\nline2\n").unwrap();
+        fs::write(&path, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n").unwrap();
         let rel = "target/dex-preview-test.txt";
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
-        args.insert("content".into(), Value::String("line1\nCHANGED\n".into()));
-        let preview = change_preview("write", &args).unwrap();
-        assert!(preview.contains("line2"), "{preview}");
-        assert!(preview.contains("-line2"), "{preview}");
+        args.insert("oldText".into(), Value::String("l5\n".into()));
+        args.insert("newText".into(), Value::String("L5\nL5b\n".into()));
+        let diff = change_diff("edit", &args).unwrap();
+        assert!(diff.contains("--- a/target/dex-preview-test.txt"), "{diff}");
+        assert!(diff.contains("+++ b/target/dex-preview-test.txt"), "{diff}");
+        assert!(diff.contains("@@"), "{diff}");
+        assert!(diff.contains("-l5"), "{diff}");
+        assert!(diff.contains("+L5b"), "{diff}");
+        // Context lines surround the change (4 radius) and are untouched.
+        assert!(diff.lines().any(|l| l == " l4"), "{diff}");
+        assert!(diff.lines().any(|l| l == " l9"), "{diff}");
+        // Lines beyond the 4-line context radius stay outside the hunks.
+        assert!(!diff.contains(" l10\n"), "{diff}");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn change_diff_new_file_uses_dev_null_header() {
+        let cwd = std::env::current_dir().unwrap();
+        let rel = "target/dex-preview-new.txt";
+        let _ = fs::remove_file(cwd.join(rel));
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("hello\n".into()));
+        let diff = change_diff("write", &args).unwrap();
+        assert!(diff.contains("--- /dev/null"), "{diff}");
+        assert!(diff.contains("+++ b/target/dex-preview-new.txt"), "{diff}");
+        assert!(diff.contains("+hello"), "{diff}");
     }
 
     #[test]
