@@ -46,6 +46,13 @@ pub(crate) struct DaemonState {
     /// signals the token so this turn unwinds without touching other
     /// sessions; the entry is removed when the turn finishes.
     pub cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
+    /// Per-session steering queue: `POST /steer` pushes into the turn's
+    /// `steering_rx` (consumed inside `process_turn` between iterations).
+    pub steering_txs: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    /// Per-session follow-up queue: `POST /followup` pushes into a turn's
+    /// outer loop (`run_agent_turn`) which chains a new `process_turn`
+    /// iteration without a new HTTP request.
+    pub followup_txs: Mutex<HashMap<String, mpsc::Sender<String>>>,
     /// Per-session next event sequence number (P10) for the SSE journal,
     /// seeded from disk on startup so replays stay consistent across restarts.
     pub event_seqs: Mutex<HashMap<String, u64>>,
@@ -71,6 +78,8 @@ impl DaemonState {
             pending_approvals: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashSet::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
+            steering_txs: Mutex::new(HashMap::new()),
+            followup_txs: Mutex::new(HashMap::new()),
             event_seqs: Mutex::new(HashMap::new()),
             idempotency: Mutex::new(HashMap::new()),
         }

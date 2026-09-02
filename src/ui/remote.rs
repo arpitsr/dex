@@ -272,7 +272,19 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             // turn streams in on the worker thread.
             loop {
                 match remote.worker_rx.try_recv() {
-                    Ok(WorkerMessage::Stream(event)) => handle_stream_event(&mut remote, event),
+                    Ok(WorkerMessage::Stream(event)) => {
+                        if remote.app.cancel_requested {
+                            match &event {
+                                StreamEvent::TurnComplete { .. }
+                                | StreamEvent::TurnFailed { .. } => {
+                                    handle_stream_event(&mut remote, event);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        handle_stream_event(&mut remote, event);
+                    }
                     Ok(WorkerMessage::Finished(error)) => finish_turn(&mut remote, error),
                     Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
                 }
@@ -367,6 +379,33 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                 },
             );
         }
+        StreamEvent::SteeringAccepted { content } => {
+            if let Some(pos) = remote
+                .app
+                .pending_steering
+                .iter()
+                .position(|c| c == &content)
+            {
+                remote.app.pending_steering.remove(pos);
+            } else if !remote.app.pending_steering.is_empty() {
+                // Fallback: content may have been trimmed differently; pop oldest.
+                remote.app.pending_steering.remove(0);
+            }
+            render_user_prompt(&mut remote.app, &content);
+        }
+        StreamEvent::FollowupAccepted { content } => {
+            if let Some(pos) = remote
+                .app
+                .pending_followups
+                .iter()
+                .position(|c| c == &content)
+            {
+                remote.app.pending_followups.remove(pos);
+            } else if !remote.app.pending_followups.is_empty() {
+                remote.app.pending_followups.remove(0);
+            }
+            render_user_prompt(&mut remote.app, &content);
+        }
         StreamEvent::ApprovalRequired { name, input, .. } => {
             // Invariant: the daemon parks at most one approval per turn
             // (agent thread blocks until it is resolved), so overwriting would
@@ -433,6 +472,16 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
         append_sink_line(&mut remote.app, SinkLine::Error(error));
     }
     let app = &mut remote.app;
+    // If the turn was cancelled, restore queued steering/follow-ups to the
+    // composer so the user can retry (mirrors old local `event.rs` logic).
+    if app.cancel_requested {
+        let mut restored = Vec::new();
+        restored.append(&mut app.pending_steering);
+        restored.append(&mut app.pending_followups);
+        if !restored.is_empty() {
+            app.input = crate::ui::input::InputField::from_text(&restored.join("\n"));
+        }
+    }
     app.busy = false;
     app.cancel_requested = false;
     app.active_tool = None;
@@ -508,7 +557,10 @@ fn arrow_delta(code: KeyCode) -> i32 {
 
 /// How long to hold a suspicious char run while waiting for the rest of an
 /// OSC color report before giving up and replaying it as real input.
-const OSC_LOOKAHEAD: Duration = Duration::from_millis(25);
+/// Short poll for the next key in the burst, total window for a chunked
+/// terminal reply (some ttys split `\x1b]11;rgb:…\x07` across writes).
+const OSC_LOOKAHEAD: Duration = Duration::from_millis(35);
+const OSC_TOTAL_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// TUI startup instant, so swallowed reports can be attributed: uptime near
 /// zero means our own startup theme query (reply arrived late); a large
@@ -545,10 +597,7 @@ fn log_osc(kind: &str, body: &str) {
 /// Returns `None` when the run was swallowed; anything that doesn't fit the
 /// report shape is replayed untouched, so real input is never dropped —
 /// worst case it is delayed by one look-ahead window.
-fn strip_osc_report(
-    ev: Event,
-    pending: &mut VecDeque<Event>,
-) -> std::io::Result<Option<Event>> {
+fn strip_osc_report(ev: Event, pending: &mut VecDeque<Event>) -> std::io::Result<Option<Event>> {
     let lead_in = |e: &Event| {
         matches!(
             e,
@@ -560,24 +609,42 @@ fn strip_osc_report(
     }
     let terminator = |k: &crossterm::event::KeyEvent| {
         (k.code == KeyCode::Char('g') && k.modifiers == KeyModifiers::CONTROL) // BEL
-            || (k.code == KeyCode::Char('\\') && k.modifiers == KeyModifiers::ALT) // ST
+            || (k.code == KeyCode::Char('\\') && k.modifiers == KeyModifiers::ALT)
+        // ST
     };
 
     // Consume the run: plain chars accumulate into `body`, until a report
     // terminator, the next report's lead-in, any other key, or a gap.
+    // A chunked tty can split `\x1b]11;rgb:…\x07` across writes with a short
+    // gap; if the prefix so far could still become a valid report, keep
+    // waiting up to the total window instead of replaying the fragment.
     let mut run: Vec<Event> = vec![ev];
     let mut body = String::new();
+    let start = Instant::now();
     loop {
+        let elapsed = start.elapsed();
+        if elapsed >= OSC_TOTAL_TIMEOUT {
+            break;
+        }
+        let remaining = OSC_TOTAL_TIMEOUT - elapsed;
+        let short = remaining.min(OSC_LOOKAHEAD);
         let next = match pending.pop_front() {
             Some(e) => e,
-            None if event::poll(OSC_LOOKAHEAD)? => event::read()?,
-            None => break,
+            None if event::poll(short)? => event::read()?,
+            None => {
+                if is_osc_prefix(&body) && !body.is_empty() {
+                    continue;
+                }
+                break;
+            }
         };
         let (char_of, ends) = match &next {
-            Event::Key(k) if k.modifiers.is_empty() => match k.code {
-                KeyCode::Char(c) => (Some(c), false),
-                _ => (None, true),
-            },
+            Event::Key(k) if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT => {
+                match k.code {
+                    KeyCode::Char(c) => (Some(c), false),
+                    _ => (None, true),
+                }
+            }
             Event::Key(k) if terminator(k) => (None, true),
             e if lead_in(e) => (None, true),
             _ => (None, true),
@@ -653,9 +720,7 @@ fn is_loopback(host: &str) -> bool {
     }
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let octets: Vec<_> = bare.split('.').collect();
-    octets.len() == 4
-        && octets[0] == "127"
-        && octets[1..].iter().all(|o| o.parse::<u8>().is_ok())
+    octets.len() == 4 && octets[0] == "127" && octets[1..].iter().all(|o| o.parse::<u8>().is_ok())
 }
 
 /// Body grammar of an OSC 10/11 color report: `10;rgb:` / `11;rgb:` plus at
@@ -668,6 +733,22 @@ fn is_osc_report(body: &str) -> bool {
     !rest.is_empty()
         && rest.split('/').count() >= 3
         && rest.chars().all(|c| c.is_ascii_hexdigit() || c == '/')
+}
+
+fn is_osc_prefix(body: &str) -> bool {
+    if body.is_empty() {
+        return true;
+    }
+    if "10;rgb:".starts_with(body) || "11;rgb:".starts_with(body) {
+        return true;
+    }
+    if let Some(rest) = body
+        .strip_prefix("10;rgb:")
+        .or_else(|| body.strip_prefix("11;rgb:"))
+    {
+        return rest.chars().all(|c| c.is_ascii_hexdigit() || c == '/');
+    }
+    matches!(body, "1" | "10" | "11" | "10;" | "11;")
 }
 
 fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
@@ -758,7 +839,8 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             _ => app.input.handle_key(key),
         },
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            submit_prompt(remote);
+            let is_followup = key.modifiers.contains(KeyModifiers::ALT);
+            submit_prompt(remote, is_followup);
         }
         KeyCode::PageUp => {
             scroll_transcript(app, -20);
@@ -814,12 +896,62 @@ fn request_cancel(remote: &mut RemoteApp) {
     }
 }
 
-fn submit_prompt(remote: &mut RemoteApp) {
-    if remote.app.busy {
-        return;
-    }
+fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let line = remote.app.input.text().trim().to_string();
     if line.is_empty() {
+        return;
+    }
+    // While busy, queue steering (mid-turn) or follow-up (chained turn) to
+    // the daemon instead of starting a new turn. The daemon's `steering_rx` /
+    // `followup_rx` (consumed inside `process_turn` and the outer follow-up
+    // loop) mirrors the old in-memory `event.rs::submit(is_followup)` path.
+    if remote.app.busy {
+        if is_followup {
+            remote.app.pending_followups.push(line.clone());
+        } else {
+            remote.app.pending_steering.push(line.clone());
+        }
+        let history_line = line.clone();
+        remote.app.history_push(history_line);
+        remote.app.input.reset();
+        let client = remote.client.clone();
+        let sid = remote.session_id.clone();
+        let result = if is_followup {
+            client.followup(&sid, &line)
+        } else {
+            client.steer(&sid, &line)
+        };
+        if let Err(e) = result {
+            // No active turn to queue into (409) or network error: restore to
+            // pending badge error and keep input for retry.
+            if is_followup {
+                remote.app.pending_followups.retain(|c| c != &line);
+            } else {
+                remote.app.pending_steering.retain(|c| c != &line);
+            }
+            let msg = e.to_string();
+            if msg.contains("409") || msg.contains("CONFLICT") {
+                push_info(
+                    &mut remote.app,
+                    format!(
+                        "no active turn to queue {} into (turn may have just finished); sent as new prompt on next Enter",
+                        if is_followup { "follow-up" } else { "steer" }
+                    ),
+                );
+                remote.app.input = crate::ui::input::InputField::from_text(&line);
+            } else {
+                push_info(
+                    &mut remote.app,
+                    format!(
+                        "failed to queue {}: {e}",
+                        if is_followup { "follow-up" } else { "steer" }
+                    ),
+                );
+            }
+        }
+        // On success the daemon will emit `SteeringAccepted` / `FollowupAccepted`
+        // which clears `pending_*` and renders the prompt. Keep the badge
+        // visible until then.
         return;
     }
 
@@ -944,7 +1076,8 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "while working: Esc/Ctrl+C cancels the turn".to_string(),
+                "while working: Enter queues steer · Alt+Enter queues follow-up · Esc/Ctrl+C cancels and restores queued input"
+                    .to_string(),
             );
         }
         _ if line.starts_with("/skill:") => {

@@ -393,8 +393,7 @@ mod tests {
         let deepseek: StreamDelta =
             serde_json::from_str(r#"{"reasoning_content":"step 1"}"#).unwrap();
         assert_eq!(delta_thought(&deepseek), Some("step 1"));
-        let openrouter: StreamDelta =
-            serde_json::from_str(r#"{"reasoning":"step 2"}"#).unwrap();
+        let openrouter: StreamDelta = serde_json::from_str(r#"{"reasoning":"step 2"}"#).unwrap();
         assert_eq!(delta_thought(&openrouter), Some("step 2"));
         // Non-string shapes must not kill the chunk parse or yield text.
         let array: StreamDelta = serde_json::from_str(r#"{"reasoning":[{"a":1}]}"#).unwrap();
@@ -414,8 +413,7 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.prompt_details.map(|d| d.cached_tokens), Some(42));
 
-        let usage: StreamUsage =
-            serde_json::from_str(r#"{"prompt_tokens":100}"#).unwrap();
+        let usage: StreamUsage = serde_json::from_str(r#"{"prompt_tokens":100}"#).unwrap();
         assert!(usage.prompt_details.is_none());
     }
 }

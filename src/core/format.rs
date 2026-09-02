@@ -192,6 +192,19 @@ pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool
     preview
 }
 
+/// Full diff preview for write/edit tool results: one transcript row per diff
+/// line, tail-capped so a pathological diff cannot flood the transcript.
+/// ponytail: flat 400-row cap; collapse unchanged hunks instead if it bites.
+pub(crate) fn diff_preview_lines(diff: &str, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = diff.lines().map(|l| l.trim_end().to_string()).collect();
+    if lines.len() > max {
+        let rest = lines.len() - max;
+        lines.truncate(max);
+        lines.push(format!("… +{rest} more diff lines"));
+    }
+    lines
+}
+
 /// Outcome-first, human-sized result for the TUI transcript: the ✓/✗ glyph
 /// and its color already carry success/failure, so the summary leads with
 /// what actually happened (counts, diffstats, first output line). Failure
@@ -297,6 +310,9 @@ pub(crate) fn model_tool_result(text: &str) -> String {
 pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
     let branch = Command::new("git")
         .args(["-C", cwd, "branch", "--show-current"])
+        .stdin(std::process::Stdio::null())
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -305,6 +321,9 @@ pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
     let dirty = branch.is_some()
         && Command::new("git")
             .args(["-C", cwd, "status", "--porcelain"])
+            .stdin(std::process::Stdio::null())
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
             .output()
             .ok()
             .is_some_and(|output| !output.stdout.is_empty());
