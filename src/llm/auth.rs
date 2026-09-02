@@ -44,3 +44,58 @@ pub(crate) fn load_codex_credentials(
     }
     Ok((tokens.access_token, tokens.account_id))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn load_resolves_env_then_file() {
+        let prev_token = env::var_os("CODEX_ACCESS_TOKEN");
+        let prev_acct = env::var_os("CODEX_ACCOUNT_ID");
+        let prev_home = env::var_os("CODEX_HOME");
+
+        // env token wins, trimmed, empty account filtered
+        env::set_var("CODEX_ACCESS_TOKEN", " tok123 ");
+        env::set_var("CODEX_ACCOUNT_ID", "acct1");
+        let (tok, acct) = load_codex_credentials().unwrap();
+        assert_eq!(tok, "tok123");
+        assert_eq!(acct.as_deref(), Some("acct1"));
+        env::set_var("CODEX_ACCOUNT_ID", "");
+        let (_, acct2) = load_codex_credentials().unwrap();
+        assert!(acct2.is_none());
+
+        // no env -> auth.json under CODEX_HOME
+        env::remove_var("CODEX_ACCESS_TOKEN");
+        let dir = std::env::temp_dir().join(format!("dex-codex-auth-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"file-token","account_id":"file-acct"}}"#,
+        )
+        .unwrap();
+        env::set_var("CODEX_HOME", &dir);
+        let (tok, acct) = load_codex_credentials().unwrap();
+        assert_eq!(tok, "file-token");
+        assert_eq!(acct.as_deref(), Some("file-acct"));
+
+        // blank token in file is rejected
+        fs::write(dir.join("auth.json"), r#"{"tokens":{"access_token":"   "}}"#).unwrap();
+        assert!(load_codex_credentials().is_err());
+        let _ = fs::remove_dir_all(&dir);
+
+        match prev_token {
+            Some(v) => env::set_var("CODEX_ACCESS_TOKEN", v),
+            None => env::remove_var("CODEX_ACCESS_TOKEN"),
+        }
+        match prev_acct {
+            Some(v) => env::set_var("CODEX_ACCOUNT_ID", v),
+            None => env::remove_var("CODEX_ACCOUNT_ID"),
+        }
+        match prev_home {
+            Some(v) => env::set_var("CODEX_HOME", v),
+            None => env::remove_var("CODEX_HOME"),
+        }
+    }
+}

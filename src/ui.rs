@@ -513,6 +513,7 @@ mod tests {
                 base_url: String::new(),
                 model: "test".into(),
                 available_models: vec!["test".into()],
+                endpoints: Default::default(),
                 api: crate::core::types::ApiProtocol::Responses,
                 account_id: None,
                 thinking_effort: None,

@@ -360,8 +360,8 @@ pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
     renderer.render(&blocks, &ThemeConfig::default())
 }
 
-/// Render a streamed thinking block: collapsed = one dim italic preview line
-/// showing the latest thought line; expanded = the full text, dim italic.
+/// Render a streamed thinking block: collapsed = a single dim italic
+/// "Thinking…" indicator; expanded (Ctrl+T) = the full text, dim italic.
 fn thinking_display_lines(text: &str, expanded: bool, width: u16) -> Vec<Line<'static>> {
     let style = Style::default()
         .fg(theme::muted_fg())
@@ -374,12 +374,7 @@ fn thinking_display_lines(text: &str, expanded: bool, width: u16) -> Vec<Line<'s
             .flat_map(|l| wrap_line_display(&line(l), width))
             .collect();
     }
-    let tail = text
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or_default();
-    vec![line(&truncate_display(&format!("✻ {tail}"), width))]
+    vec![line(&truncate_display("Thinking…", width))]
 }
 
 struct TranscriptView;
@@ -1107,6 +1102,7 @@ mod tests {
                 base_url: "http://localhost".to_string(),
                 model: "test-model".to_string(),
                 available_models: vec!["test-model".to_string()],
+                endpoints: Default::default(),
                 api: ApiProtocol::Responses,
                 account_id: None,
                 thinking_effort: None,
@@ -1211,7 +1207,9 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(joined.contains("✻ second line"), "{joined}");
+        assert!(joined.contains("Thinking…"), "{joined}");
+        // Collapsed is a bare indicator: no thought content leaks through.
+        assert!(!joined.contains("second line"), "{joined}");
 
         let expanded = thinking_display_lines(text, true, 80);
         assert!(expanded.len() >= 3, "{}", expanded.len());

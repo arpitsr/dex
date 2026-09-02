@@ -285,13 +285,13 @@ pub(crate) struct ChatRequest {
     pub(crate) reasoning_effort: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ApiProtocol {
     ChatCompletions,
     Responses,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Provider {
     OpenCode,
     OpenAiCodex,

@@ -147,3 +147,31 @@ pub(crate) fn which(bin: &str) -> Result<PathBuf, io::Error> {
         format!("{} not found", bin),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn which_finds_existing_binary_and_fails_for_missing() {
+        // sh should exist on any unix test image
+        assert!(which("sh").is_ok());
+        assert!(which("definitely-not-a-real-binary-dex-test-12345").is_err());
+    }
+
+    #[test]
+    fn highlight_does_not_panic_on_various_langs() {
+        // Just ensure no panic; output goes to stdout and is not asserted.
+        print_ansi_highlighted_code("rust", "fn main() { let x = 42; // comment\n}");
+        print_ansi_highlighted_code("python", "def foo(): # hi\n    return \"str\"\n");
+        print_ansi_highlighted_code("unknown", "some plain text 123");
+        print_ansi_highlighted_code("", "");
+    }
+
+    #[test]
+    fn highlight_handles_hash_comments_per_lang() {
+        // hash-comments branch for python, plain for rust
+        print_ansi_highlighted_code("python", "# comment\nx = 1");
+        print_ansi_highlighted_code("rust", "# not a comment in rust\nlet x = 1;");
+    }
+}

@@ -65,6 +65,9 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         } else {
             info.available_models.clone()
         },
+        // The daemon routes endpoint-prefixed models; the display copy never
+        // talks to a provider.
+        endpoints: Default::default(),
         api: ApiProtocol::Responses,
         account_id: None,
         thinking_effort: None,

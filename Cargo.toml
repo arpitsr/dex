@@ -9,6 +9,7 @@ network-tests = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
 termimad = "0.31"
 chrono = "0.4"
@@ -42,3 +43,7 @@ async-stream = "0.3"
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 terminal-colorsaurus = "1.0.3"
+fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
+
+[dev-dependencies]
+http = "1"

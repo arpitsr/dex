@@ -111,7 +111,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
 
 fn run_interactive() {
     eprintln!("dex raw tool mode");
-    eprintln!("tools: read, bash, write, edit, grep, find, git");
+    eprintln!("tools: read, bash, write, edit, ffgrep, fffind, git");
     eprintln!("send JSON lines like: {{\"name\":\"read\",\"args\":{{\"path\":\"Cargo.toml\"}}}}");
     eprintln!("empty line quits");
 
