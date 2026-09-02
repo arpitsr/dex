@@ -1334,3 +1334,494 @@ async fn session_name(
     result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "status": "ok" })))
 }
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use axum::extract::{Path, Query};
+
+    fn state_with_session(path: &std::path::Path) -> (Arc<DaemonState>, String) {
+        let state = Arc::new(DaemonState::new());
+        let session = Session::from_path(path).unwrap();
+        let id = session.id().to_string();
+        state.sessions.lock().unwrap().insert(
+            id.clone(),
+            SessionEntry {
+                path: path.to_path_buf(),
+                name: None,
+                cwd: "/tmp/dex-test-cwd".into(),
+            },
+        );
+        (state, id)
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_unknown_session_and_bad_protocol_version() {
+        let state = Arc::new(DaemonState::new());
+        let req = ChatRequest {
+            prompt: "hi".into(),
+            skill_dirs: vec![],
+            base_url: None,
+            model: None,
+            permission: None,
+            plan: None,
+        };
+        // unknown session -> 404
+        let r = chat(
+            State(state.clone()),
+            Path("nope".into()),
+            axum::http::HeaderMap::new(),
+            Json(req.clone()),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+
+        // newer protocol version -> 400 (checked before session lookup)
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-dex-protocol", "2".parse().unwrap());
+        let r = chat(State(state), Path("nope".into()), headers, Json(req)).await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn steer_and_followup_validate_content_and_turn_state() {
+        let state = Arc::new(DaemonState::new());
+        // empty content -> 400
+        let r = steer(State(state.clone()), Path("s".into()), Json(SteerRequest { content: "  ".into() })).await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        let r = followup(State(state.clone()), Path("s".into()), Json(FollowupRequest { content: "".into() })).await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        // unknown session -> 404
+        let r = steer(State(state.clone()), Path("s".into()), Json(SteerRequest { content: "x".into() })).await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+        // registered session without active turn -> 409 (nothing to steer)
+        state.sessions.lock().unwrap().insert(
+            "s".into(),
+            SessionEntry { path: "/tmp/does-not-exist.jsonl".into(), name: None, cwd: "/tmp".into() },
+        );
+        let r = steer(State(state.clone()), Path("s".into()), Json(SteerRequest { content: "x".into() })).await;
+        assert!(matches!(r, Err(StatusCode::CONFLICT)));
+        let r = followup(State(state), Path("s".into()), Json(FollowupRequest { content: "x".into() })).await;
+        assert!(matches!(r, Err(StatusCode::CONFLICT)));
+    }
+
+    #[tokio::test]
+    async fn load_skill_rejects_bad_names() {
+        let state = Arc::new(DaemonState::new());
+        for bad in ["", "../evil", "has space", "slash/ed"] {
+            let r = load_skill(
+                State(state.clone()),
+                Path("s".into()),
+                Json(LoadSkillRequest { name: bad.into(), skill_dirs: vec![] }),
+            )
+            .await;
+            assert!(matches!(r, Err(StatusCode::BAD_REQUEST)), "expected 400 for {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
+    async fn approve_unknown_request_is_404_and_cross_session_is_restored() {
+        let state = Arc::new(DaemonState::new());
+        // no such request_id -> 404
+        let r = approve(
+            State(state.clone()),
+            Path("sess-a".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "missing".into(),
+                decision: crate::protocol::ApprovalDecision::AllowOnce,
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+
+        // pending parked under sess-a; decision sent against sess-b -> 404 and restored
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.pending_approvals.lock().unwrap().insert(
+            "req-1".into(),
+            PendingApproval {
+                session_id: "sess-a".into(),
+                response: tx,
+                name: "bash".into(),
+                input: "{}".into(),
+            },
+        );
+        let r = approve(
+            State(state.clone()),
+            Path("sess-b".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "req-1".into(),
+                decision: crate::protocol::ApprovalDecision::AllowOnce,
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+        assert!(state.pending_approvals.lock().unwrap().contains_key("req-1"), "pending must be restored for the legitimate session");
+        assert!(rx.try_recv().is_err(), "restored approval must not be resolved");
+
+        // correct session resolves it
+        let r = approve(
+            State(state.clone()),
+            Path("sess-a".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "req-1".into(),
+                decision: crate::protocol::ApprovalDecision::Deny,
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(rx.try_recv().ok(), Some(crate::core::types::ApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn cancel_denies_pending_approvals_for_the_session() {
+        let state = Arc::new(DaemonState::new());
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        {
+            let mut pending = state.pending_approvals.lock().unwrap();
+            pending.insert(
+                "r-a".into(),
+                PendingApproval { session_id: "s-a".into(), response: tx_a, name: "write".into(), input: "{}".into() },
+            );
+            pending.insert(
+                "r-b".into(),
+                PendingApproval { session_id: "s-b".into(), response: tx_b, name: "write".into(), input: "{}".into() },
+            );
+        }
+
+        let _ = cancel(State(state), Path("s-a".into())).await;
+
+        assert_eq!(rx_a.try_recv().ok(), Some(crate::core::types::ApprovalDecision::Deny));
+        assert!(rx_b.try_recv().is_err(), "other sessions must be untouched");
+    }
+
+    #[tokio::test]
+    async fn session_events_replay_after_cursor() {
+        // Hand-crafted session files: fully hermetic, no env redirects.
+        let dir = std::env::temp_dir().join(format!("dex-srv-events-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "test-events-1";
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            r#"{"type":"session","version":1,"id":"test-events-1","timestamp":"t","cwd":"/tmp/x"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.events.jsonl")),
+            r#"{"seq":0,"payload":{"type":"system","data":"one"}}
+{"seq":1,"payload":{"type":"system","data":"two"}}
+"#,
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("since".to_string(), "0".to_string());
+        // `since` is exclusive: seq 0 is skipped, seq 1 replays.
+        let r = session_events(State(state.clone()), Path(id.clone()), Query(params)).await.unwrap();
+        assert_eq!(r.events.len(), 1);
+        assert_eq!(r.events[0].seq, 1);
+        assert_eq!(r.next_seq, 2);
+        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "two"));
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("since".to_string(), "1".to_string());
+        let r = session_events(State(state), Path(id), Query(params)).await.unwrap();
+        assert!(r.events.is_empty(), "fully consumed cursor replays nothing");
+        assert_eq!(r.next_seq, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
+    async fn create_session_registers_and_lists_from_disk() {
+        // Redirects where ALL sessions live; serialize against other tests
+        // that read/write the sessions dir.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let data_dir = std::env::temp_dir().join(format!("dex-srv-create-{}", std::process::id()));
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+
+        let state = Arc::new(DaemonState::new());
+        let r = create_session(
+            State(state.clone()),
+            Json(CreateSessionRequest { cwd: "/tmp/dex-create-cwd".into(), name: Some("t".into()) }),
+        )
+        .await
+        .unwrap();
+        let id = r.0["session_id"].as_str().unwrap().to_string();
+        assert!(!id.is_empty());
+        assert!(state.sessions.lock().unwrap().contains_key(&id), "session must be registered");
+
+        let listed = list_sessions(State(state)).await.0["sessions"].as_array().unwrap().clone();
+        assert!(listed.iter().any(|s| s["session_id"].as_str() == Some(id.as_str())));
+
+        // cleanup: the created session file lives under data_dir
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[cfg(test)]
+mod permission_gate_tests {
+    use super::*;
+
+    /// The daemon permission ceiling is the security boundary between a
+    /// remote client and trusted-mode tool execution: a client may only
+    /// request a STRICTER mode than the daemon's own. Runs before any LLM
+    /// call, so it is testable with no provider.
+    #[test]
+    fn permission_ceiling_blocks_client_escalation_and_bad_plan() {
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Hermetic session storage.
+        let data_dir = std::env::temp_dir().join(format!("dex-perm-{}", std::process::id()));
+        let prev_data = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+
+        let session = Session::new("/tmp/dex-perm-cwd".into(), None).unwrap();
+        let path = session.path().unwrap().to_path_buf();
+        let id = session.id().to_string();
+        drop(session);
+
+        let state = Arc::new(DaemonState::new());
+        state.sessions.lock().unwrap().insert(
+            id.clone(),
+            SessionEntry { path: path.clone(), name: None, cwd: "/tmp".into() },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let cancel = CancellationToken::new();
+
+        // Deterministic provider config for the pass-through case: fake key,
+        // unroutable local base URL (connection refused, no network).
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["DEX_PERMISSION", "DEX_PROVIDER", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API"]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        std::env::set_var("DEX_PERMISSION", "read-only");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:9");
+        std::env::set_var("OPENAI_API", "chat");
+
+        let mk_req = |permission: Option<&str>, plan: Option<&str>| ChatRequest {
+            prompt: "go".into(),
+            skill_dirs: vec![],
+            base_url: None,
+            model: None,
+            permission: permission.map(String::from),
+            plan: plan.map(String::from),
+        };
+
+        // 1. Client escalating to trusted against a read-only daemon: rejected.
+        let err = run_turn_inner(
+            &state, &id, &mk_req(Some("trusted"), None), &cancel, &tx, None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(err.contains("escalation denied"), "got: {err}");
+        // Nothing journaled: the turn never started.
+        assert_ne!(
+            crate::session::Session::last_turn_state(&path),
+            "turn_start",
+            "rejected turn must not journal turn_start"
+        );
+
+        // 2. Client requesting the same (stricter-or-equal) mode passes the
+        // gate and fails later, at the LLM call — a different error.
+        let err = run_turn_inner(
+            &state, &id, &mk_req(Some("read-only"), None), &cancel, &tx, None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(!err.contains("escalation denied"), "gate must not fire for non-escalation: {err}");
+
+        // 3. Invalid plan JSON from the client is rejected, not stored.
+        let err = run_turn_inner(
+            &state, &id, &mk_req(Some("read-only"), Some("{not json")), &cancel, &tx, None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid plan JSON"), "got: {err}");
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        match prev_data {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("trace.jsonl"));
+    }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use crate::client::http::{ChatOptions, DaemonClient};
+    use axum::body::Body;
+    use axum::extract::State as AxumState;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn spawn_app(app: Router) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Full remote loop over real HTTP: real daemon router + real
+    /// DaemonClient + a fake chat-completions provider. The model asks to
+    /// `write` a file, the client denies the approval, the denied tool
+    /// result flows back, and the model finishes with plain text. Covers
+    /// client SSE parsing, the approval round trip, and the daemon turn
+    /// machinery in one pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
+    async fn client_denies_write_then_turn_completes() {
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Fake provider: request 0 asks for a write; later requests finish.
+        const TOOL_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"write","arguments":"{\"path\":\"evil.txt\",\"content\":\"hi\"}"}}]}}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        const DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\ndata: [DONE]\n\n";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let fake_llm = Router::new().route(
+            "/chat/completions",
+            post(move |AxumState(_): AxumState<Arc<AtomicUsize>>| {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let body = if n == 0 { TOOL_SSE } else { DONE_SSE };
+                    axum::http::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(body.to_string()))
+                        .unwrap()
+                }
+            }),
+        );
+        // Axum requires typed state; attach the counter (already Arc'd).
+        let fake_llm = fake_llm.with_state(calls.clone());
+        let llm_base = spawn_app(fake_llm).await;
+
+        let daemon_base = spawn_app(router(Arc::new(DaemonState::new()))).await;
+
+        // Deterministic daemon environment: no user config, approvals on,
+        // LLM pointed at the fake provider.
+        let data_dir = std::env::temp_dir().join(format!("dex-e2e-{}", std::process::id()));
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_DATA_HOME", "DEX_CONFIG", "DEX_PERMISSION", "DEX_PROVIDER",
+            "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API", "DEX_VERIFY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::env::set_var("DEX_CONFIG", "/tmp/dex-no-such-config-e2e.json");
+        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENAI_BASE_URL", &llm_base);
+        std::env::set_var("OPENAI_API", "chat");
+        std::env::set_var("DEX_VERIFY", "true");
+
+        // All client work happens on one blocking thread: reqwest::blocking
+        // panics if created or dropped inside an async context.
+        let (_session_id, events, chat_result) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&daemon_base).unwrap();
+            client.wait_until_ready(Duration::from_secs(10)).unwrap();
+            let session_id = client
+                .create_session("/tmp/dex-e2e-cwd", Some("e2e"))
+                .unwrap()
+                .session_id;
+            let mut events: Vec<crate::protocol::StreamEvent> = Vec::new();
+            let r = client
+                .chat(
+                    &session_id,
+                    "write a file please",
+                    ChatOptions::default(),
+                    &mut |event| {
+                        let decision = match &event {
+                            crate::protocol::StreamEvent::ApprovalRequired { .. } => {
+                                Some(crate::protocol::ApprovalDecision::Deny)
+                            }
+                            _ => None,
+                        };
+                        events.push(event);
+                        decision
+                    },
+                )
+                .map_err(|e| e.to_string());
+            (session_id, events, r)
+            // client drops here, on the blocking pool
+        })
+        .await
+        .unwrap();
+        chat_result.unwrap();
+
+        // The approval round trip happened exactly once.
+        let approvals: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::protocol::StreamEvent::ApprovalRequired { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(approvals, vec!["write".to_string()], "{events:?}");
+
+        // The denied tool is reported as a failed result...
+        assert!(
+            events.iter().any(|e| matches!(e,
+                crate::protocol::StreamEvent::ToolResult { name, success, .. }
+                if name == "write" && !success)),
+            "denied write must surface as failed ToolResult: {events:?}"
+        );
+        // ...and the file was never created.
+        assert!(!std::path::Path::new("evil.txt").exists(), "denied write must not touch disk");
+
+        // The turn completed with the model's final text.
+        let last = events.last().unwrap();
+        match last {
+            crate::protocol::StreamEvent::TurnComplete { response, .. } => {
+                assert_eq!(response, "all done");
+            }
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+        // The model was called twice: tool call, then final answer.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file("evil.txt");
+    }
+}

@@ -307,6 +307,7 @@ impl Console {
     }
 }
 
+
 /// Erase the drawn spinner frame, if any. Caller holds CONSOLE_LOCK.
 pub(crate) fn erase_spinner_frame() {
     if SPINNER_DRAWN.swap(false, Ordering::SeqCst) {
@@ -378,5 +379,62 @@ impl Drop for SpinnerGuard {
             SPINNER_RUNNING.store(false, Ordering::SeqCst);
             erase_spinner_frame();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_token_is_per_turn_not_global() {
+        let a = CancellationToken::new();
+        let b = a.clone();
+        assert!(!a.is_cancelled());
+        a.cancel();
+        assert!(a.is_cancelled());
+        assert!(b.is_cancelled()); // clone shares state
+        assert!(a.take_cancelled());
+        assert!(!a.is_cancelled());
+        // fresh token is independent
+        let c = CancellationToken::new();
+        assert!(!c.is_cancelled());
+    }
+
+    #[test]
+    fn approval_key_scopes_by_path_or_command() {
+        let k1 = Console::approval_key("write", r#"{"path":"a.txt","content":"hi"}"#);
+        let k2 = Console::approval_key("write", r#"{"path":"a.txt","content":"other"}"#);
+        let k3 = Console::approval_key("write", r#"{"path":"b.txt","content":"hi"}"#);
+        assert_eq!(k1, k2, "same path should share key regardless of content");
+        assert_ne!(k1, k3);
+
+        let kb1 = Console::approval_key("bash", r#"{"command":"rm -rf /"}"#);
+        let kb2 = Console::approval_key("bash", r#"{"command":"rm -rf /"}"#);
+        let kb3 = Console::approval_key("bash", r#"{"command":"ls"}"#);
+        assert_eq!(kb1, kb2);
+        assert_ne!(kb1, kb3);
+    }
+
+    #[test]
+    fn session_approvals_are_scoped_and_recorded() {
+        let (tx, _rx) = mpsc::channel();
+        let (atx, _arx) = mpsc::channel();
+        let console = Console::new(tx, atx);
+        let input = r#"{"path":"foo.rs","content":"x"}"#;
+        assert!(!console.session_approved("write", input));
+        console.record_session_approval("write", input);
+        assert!(console.session_approved("write", input));
+        // different path not approved
+        assert!(!console.session_approved("write", r#"{"path":"bar.rs"}"#));
+    }
+
+    #[test]
+    fn console_daemon_sets_remote_flag() {
+        let (tx, _rx) = mpsc::channel();
+        let (atx, _arx) = mpsc::channel();
+        let c = Console::daemon(tx, atx);
+        assert!(c.remote_approval);
+        assert!(c.sink().is_some());
     }
 }

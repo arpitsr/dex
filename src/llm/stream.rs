@@ -416,4 +416,134 @@ mod tests {
         let usage: StreamUsage = serde_json::from_str(r#"{"prompt_tokens":100}"#).unwrap();
         assert!(usage.prompt_details.is_none());
     }
+
+    // ---- SSE parser tests: real reqwest::blocking::Response built from an
+    // http::Response with a raw SSE body, so both wire parsers are exercised
+    // end to end without a server. ----
+
+    fn sse_response(lines: &[&str]) -> reqwest::blocking::Response {
+        let body = lines.join("\n\n") + "\n\n";
+        http::Response::builder()
+            .status(200)
+            .body(body)
+            .unwrap()
+            .into()
+    }
+
+    /// Chat-completions stream: content accumulates across chunks and splits
+    /// into complete sink lines; fragmented tool-call deltas merge into one
+    /// call; the usage chunk (with cache detail) surfaces as `Some(Usage)`.
+    #[test]
+    fn chat_stream_assembles_content_tools_and_usage() {
+        let (tx, rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"hello "}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"world\n"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"second line"}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"pa"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":123,"prompt_tokens_details":{"cached_tokens":7}}}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, usage) =
+            read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(msg.content.as_deref(), Some("hello world\nsecond line"));
+        let calls = msg.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(
+            usage,
+            Some(Usage { prompt_tokens: 123, cached_tokens: Some(7) })
+        );
+        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        assert!(matches!(&lines[0], SinkLine::Assistant(s) if s == "hello world"));
+        assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "second line"));
+    }
+
+    /// A code fence opened mid-stream is buffered and flushed as one block;
+    /// prose before/after streams line by line.
+    #[test]
+    fn chat_stream_buffers_code_fences() {
+        let (tx, rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"choices":[{"delta":{"content":"```rust\n"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"fn main() {}\n"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"```\n"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"trailing prose"}}]}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, _) = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(msg.content.as_deref(), Some("```rust\nfn main() {}\n```\ntrailing prose"));
+        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        // The fence body keeps its streamed trailing newline and the close
+        // adds one more — current sink contract; consumers re-parse the block.
+        assert!(matches!(&lines[0], SinkLine::Assistant(s)
+            if s == "```rust:\nfn main() {}\n\n```"), "{lines:?}");
+        assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "trailing prose"));
+    }
+
+    /// A pre-cancelled token unwinds before reading anything.
+    #[test]
+    fn chat_stream_returns_cancelled_error_when_token_set() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[r#"data: {"choices":[{"delta":{"content":"x"}}]}"#]);
+        let err = read_stream(resp, Some(tx), &token).unwrap_err();
+        assert_eq!(err.to_string(), "cancelled");
+    }
+
+    /// Responses API: the function-call state machine must survive deltas
+    /// that arrive BEFORE their item is added (buffered then flushed), and
+    /// completed calls without an id must be dropped, not executed.
+    #[test]
+    fn responses_stream_reassembles_tool_calls_with_early_deltas() {
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"type":"response.output_text.delta","delta":"hello\n"}"#,
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"read","arguments":""}}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"EARLY"}"#,
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item_2","call_id":"call_2","name":"bash","arguments":""}}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"LATER"}"#,
+            r#"data: {"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","name":"ghost"}}"#,
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"input_tokens_details":{"cached_tokens":5}}}}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, usage) =
+            read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(msg.content.as_deref(), Some("hello\n"));
+        let calls = msg.tool_calls.unwrap();
+        assert_eq!(calls.len(), 2, "ghost call (no id) and padding must be filtered: {calls:?}");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[1].id, "call_2");
+        assert_eq!(calls[1].function.arguments, "EARLYLATER");
+        assert_eq!(usage, Some(Usage { prompt_tokens: 50, cached_tokens: Some(5) }));
+    }
+
+    /// Garbage, empty, and keep-alive data lines are skipped; reasoning
+    /// deltas (both provider keys) land as Thinking sink lines; a stream
+    /// with no output yields an empty assistant message.
+    #[test]
+    fn responses_stream_tolerates_garbage_and_extracts_reasoning() {
+        let (tx, rx) = mpsc::channel();
+        let resp = sse_response(&[
+            "data: not json at all",
+            "data: ",
+            r#"data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
+            r#"data: {"type":"response.reasoning_text.delta","delta":" more"}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, usage) =
+            read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(msg.content, None);
+        assert!(msg.tool_calls.is_none());
+        assert_eq!(usage, None);
+        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        assert!(matches!(&lines[0], SinkLine::Thinking(s) if s == "thinking"));
+        assert!(matches!(&lines[1], SinkLine::Thinking(s) if s == " more"));
+    }
 }

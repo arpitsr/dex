@@ -1,8 +1,8 @@
 # dex
 
 A terminal-based coding agent written in Rust. `dex` talks to OpenAI-compatible
-Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`, `grep`,
-`find`) to operate on your local files, and offers an interactive TUI, a
+Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`, `ffgrep`,
+`fffind`) to operate on your local files, and offers an interactive TUI, a
 one-shot prompt mode, and a raw JSON tool mode. Conversations are persisted as
 sessions and can be resumed.
 
@@ -40,28 +40,28 @@ cargo build --release
 
 ## Configuration
 
-Configuration is read from a JSON file. The path is resolved in this order:
+Configuration is read from a YAML file. The path is resolved in this order:
 
 1. `$DEX_CONFIG` (if set)
-2. `$XDG_CONFIG_HOME/dex/config.json`
-3. `~/.config/dex/config.json`
+2. `$XDG_CONFIG_HOME/dex/config.yaml` (also `config.yml`; a legacy `config.json` still parses)
+3. `~/.config/dex/config.yaml`
 
 Copy the sample to get started:
 
 ```sh
 mkdir -p ~/.config/dex
-cp config.sample.json ~/.config/dex/config.json
+cp config.sample.yaml ~/.config/dex/config.yaml
 ```
 
-`config.json` fields:
+`config.yaml` fields:
 
 | Field            | Type     | Description                                                        |
 | ---------------- | -------- | ------------------------------------------------------------------ |
-| `provider`       | string   | `opencode` or `openai-codex`.                                     |
+| `provider`       | string   | `opencode` or `openai-codex`.                                      |
 | `api_key`        | string   | Default API key (overridable by `OPENAI_API_KEY`).                 |
 | `base_url`       | string   | Default API base URL (overridable by `OPENAI_BASE_URL`).           |
-| `model`          | string   | Default model (overridable by `OPENAI_MODEL`).                     |
-| `models`         | string[] | Models shown by `/model` autocomplete (also configurable via `DEX_MODELS`, comma-separated). |
+| `model`          | string   | Static model selection (overridable by `OPENAI_MODEL`).            |
+| `models`         | string[] | Pin the models shown by `/model` autocomplete. When unset, dex fetches the provider's live model list from `/models` (also configurable via `DEX_MODELS`, comma-separated). |
 | `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
 | `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
 | `context_window` | integer  | Token context window used for compaction/status (overridable by `DEX_CONTEXT_WINDOW`). |
@@ -73,12 +73,10 @@ The `api` field follows the provider/model API distinction used by Pi and Codex.
 For OpenCode, use its API key and endpoint. For ChatGPT-backed Codex, first run
 `codex --login`, then select the Codex provider:
 
-```json
-{
-  "provider": "openai-codex",
-  "model": "gpt-5.6-luna",
-  "api": "openai-responses"
-}
+```yaml
+provider: openai-codex
+model: gpt-5.6-luna
+api: openai-responses  # or openai-completions
 ```
 
 When `provider` is `openai-codex`, `dex` reads the current access token and
@@ -88,13 +86,11 @@ again when the local token expires.
 
 A minimal example:
 
-```json
-{
-  "api_key": "sk-...",
-  "base_url": "https://opencode.ai/zen/v1",
-  "model": "gpt-5.6-luna",
-  "api": "openai-responses"
-}
+```yaml
+api_key: sk-...
+base_url: https://opencode.ai/zen/v1
+model: gpt-5.6-luna
+api: openai-responses  # or openai-completions
 ```
 
 ## Usage
@@ -142,7 +138,7 @@ pipeline — search locally, read excerpts, print only the distilled result —
 while intermediate output never enters the conversation:
 
 ```sh
-"$DEX_BIN" run grep pattern=TODO output_mode=files | while IFS= read -r f; do
+"$DEX_BIN" run ffgrep pattern=TODO output_mode=files | while IFS= read -r f; do
   "$DEX_BIN" run read "path=$f" limit=3
 done
 ```
@@ -289,8 +285,8 @@ schema):
 | `bash`  | Run a shell command via `sh -c` (`command`).                     |
 | `write` | Write/overwrite a file (`path`, `content`).                      |
 | `edit`  | Replace exactly one occurrence of text (`path`, `oldText`, `newText`). |
-| `grep`  | Search file contents recursively for a literal pattern (`pattern`, `path`). |
-| `find`  | Find file paths matching a pattern (`pattern`, `path`).          |
+| `ffgrep` | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`). |
+| `fffind` | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`). |
 
 Tool results are truncated before being sent back to the model, and a result
 cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work.
@@ -299,7 +295,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work.
 
 | Variable             | Description                                              |
 | -------------------- | -------------------------------------------------------- |
-| `OPENAI_API_KEY`     | API key (takes precedence over `config.json`).           |
+| `OPENAI_API_KEY`     | API key (takes precedence over the config file).          |
 | `OPENAI_BASE_URL`    | API base URL override (non-empty).                       |
 | `OPENAI_MODEL`       | Model override.                                          |
 | `OPENAI_API`         | Wire protocol override (`openai-completions` or `openai-responses`). |
@@ -309,7 +305,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work.
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
 | `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
-| `DEX_CONFIG`    | Explicit path to `config.json`.                          |
+| `DEX_CONFIG`    | Explicit path to the config file.                        |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
 
@@ -323,7 +319,7 @@ dex/
 ├── Cargo.lock
 ├── Cargo.toml
 ├── README.md
-├── config.sample.json
+├── config.sample.yaml
 └── src/
     ├── main.rs           # entry point: mode resolution, daemon bootstrap
     ├── cli.rs            # argument parsing / invocation mode
@@ -334,7 +330,7 @@ dex/
     ├── core/             # console sinks, formatting, highlighting, types
     ├── llm/              # provider clients, streaming parsers, auth, config
     ├── session.rs        # JSONL session persistence
-    ├── tools/            # builtin tools: read, bash, write, edit, grep, find
+    ├── tools/            # builtin tools: read, bash, write, edit, ffgrep, fffind (fff engine)
     ├── skills.rs         # skill discovery
     └── ui/               # ratatui TUI (local event loop + remote client UI)
 ```

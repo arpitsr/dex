@@ -88,7 +88,7 @@ fn stuck_nudge(attempt: usize, reason: &str) -> String {
 
 pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<String> {
     let denied = match mode {
-        PermissionMode::ReadOnly => !matches!(name, "read" | "grep" | "find" | "git"),
+        PermissionMode::ReadOnly => !matches!(name, "read" | "ffgrep" | "fffind" | "git"),
         PermissionMode::AskWrites => matches!(name, "write" | "edit" | "bash"),
         PermissionMode::AskShell => name == "bash",
         PermissionMode::Trusted => false,
@@ -1181,6 +1181,7 @@ mod tests {
             base_url: String::new(),
             model: "mock".into(),
             available_models: vec!["mock".into()],
+            endpoints: Default::default(),
             api: ApiProtocol::Responses,
             account_id: None,
             thinking_effort: None,

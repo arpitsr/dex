@@ -116,3 +116,71 @@ pub(crate) fn format_skills_for_prompt(skills: &[Skill]) -> String {
     out.push_str("\nTo use a skill, type /skill:<name> or ask about it.\n");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn unquote_strips_quotes() {
+        assert_eq!(unquote(r#""hello""#), "hello");
+        assert_eq!(unquote("'world'"), "world");
+        assert_eq!(unquote("bare"), "bare");
+        assert_eq!(unquote("\"a\""), "a"); // trimmed then stripped
+        assert_eq!(unquote("\"\""), "");
+    }
+
+    #[test]
+    fn parse_skill_accepts_valid_frontmatter() {
+        let dir = std::env::temp_dir().join(format!("dex-skill-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("SKILL.md");
+        fs::write(&path, "---\nname: my-skill\ndescription: \"Does things\"\n---\nBody").unwrap();
+        let skill = parse_skill(&path).unwrap();
+        assert_eq!(skill.name, "my-skill");
+        assert_eq!(skill.description, "Does things");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_skill_rejects_missing_or_bad_name() {
+        let dir = std::env::temp_dir().join(format!("dex-skill-bad-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let bad = dir.join("bad.md");
+        fs::write(&bad, "---\nname: bad name with spaces\n---\n").unwrap();
+        assert!(parse_skill(&bad).is_none());
+        let no_front = dir.join("nofront.md");
+        fs::write(&no_front, "no frontmatter").unwrap();
+        assert!(parse_skill(&no_front).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_skills_sorts_and_dedups() {
+        let base = std::env::temp_dir().join(format!("dex-discover-{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        fs::create_dir_all(a.join("skill-a")).unwrap();
+        fs::create_dir_all(b.join("skill-a")).unwrap(); // duplicate name
+        fs::create_dir_all(b.join("skill-b")).unwrap();
+        fs::write(a.join("skill-a/SKILL.md"), "---\nname: alpha\ndescription: first\n---\n").unwrap();
+        fs::write(b.join("skill-a/SKILL.md"), "---\nname: alpha\ndescription: dup\n---\n").unwrap();
+        fs::write(b.join("skill-b/SKILL.md"), "---\nname: beta\ndescription: second\n---\n").unwrap();
+        let skills = discover_skills(&[a, b.clone()]);
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].name, "alpha");
+        assert_eq!(skills[1].name, "beta");
+        // first wins on duplicate
+        assert_eq!(skills[0].description, "first");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn format_skills_for_prompt_contains_names() {
+        let skills = vec![Skill { name: "x".into(), description: "does x".into(), path: PathBuf::from("/tmp") }];
+        let out = format_skills_for_prompt(&skills);
+        assert!(out.contains("x: does x"));
+        assert!(out.contains("/skill:"));
+    }
+}

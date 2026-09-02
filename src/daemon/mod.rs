@@ -224,6 +224,8 @@ mod tests {
 
     #[test]
     fn event_seq_is_seeded_from_disk_after_restart() {
+        // Touches the shared sessions dir; serialize against env-redirecting tests.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Simulate a prior run: a session with events already journaled.
         let mut s = crate::session::Session::new("/tmp/dex-seq-test".into(), None).unwrap();
         s.append_event(0, "{\"type\":\"system\",\"data\":\"x\"}")
@@ -240,6 +242,9 @@ mod tests {
 
     #[test]
     fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
+        // Depends on where the sessions dir resolves; serialize against tests
+        // that redirect XDG_DATA_HOME.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A session killed mid-turn: turn_start with no terminal entry.
         let mut s = crate::session::Session::new("/tmp/dex-rebuild-test".into(), None).unwrap();
         let id = s.id().to_string();
