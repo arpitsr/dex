@@ -2,7 +2,6 @@
 mod agent;
 mod cli;
 mod client;
-mod config;
 mod core;
 mod daemon;
 mod llm;
@@ -20,7 +19,7 @@ use crate::agent::r#loop::process_turn;
 use crate::agent::state::{GlobalCancellation, ToolState};
 use crate::core::console::install_sigint_handler;
 use crate::core::types::{ChatMessage, PermissionMode};
-use crate::llm::config::{load_file_config, permission_from_env_or_file, LlmConfig};
+use crate::llm::config::{permission_from_env, warn_if_legacy_config, LlmConfig};
 use crate::llm::prompt::system_prompt;
 use crate::skills::{discover_skills, skill_dirs};
 
@@ -116,9 +115,7 @@ fn run_interactive() {
     eprintln!("send JSON lines like: {{\"name\":\"read\",\"args\":{{\"path\":\"Cargo.toml\"}}}}");
     eprintln!("empty line quits");
 
-    let permission = load_file_config()
-        .and_then(|file| permission_from_env_or_file(&file))
-        .unwrap_or(PermissionMode::ReadOnly);
+    let permission = permission_from_env().unwrap_or(PermissionMode::ReadOnly);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -188,6 +185,7 @@ fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
 
 fn main() {
     install_sigint_handler();
+    warn_if_legacy_config();
     let args = cli::parse_args();
     let mode = cli::resolve_mode(&args);
 

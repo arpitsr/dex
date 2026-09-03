@@ -11,12 +11,12 @@ cargo test --all-targets       # must pass
 cargo clippy --all-targets -- -D warnings  # must pass
 ```
 
-Requires Rust edition 2021. See `README.md` for config (`~/.config/dex/config.yaml`, `DEX_*` env).
+Requires Rust edition 2021. No config file — see `README.md` for config (`DEX_*`/`OPENAI_*` env).
 
 ## Structure
 
 - `src/main.rs` — entry, mode resolution, daemon bootstrap
-- `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`)
+- `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Update`)
 - `src/daemon/` + `src/protocol/` + `src/client/` — daemon (axum + SSE), wire types, client
 - `src/agent/` — `loop.rs` turn loop, `state.rs`, `compaction.rs`
 - `src/llm/` — provider clients, streaming parsers, `prompt.rs` (system prompt)
@@ -39,7 +39,7 @@ Requires Rust edition 2021. See `README.md` for config (`~/.config/dex/config.ya
 - No new dependencies without clear need — check `Cargo.toml` first, prefer stdlib/native.
 - Keep `src/llm/prompt.rs` minimal; tool behavior belongs in `src/llm/protocol.rs` tool descriptions, not the prompt.
 - Skills: directory with `SKILL.md` frontmatter (`name`, `description`). Discovered via `skill_dirs()` — cwd `.dex/skills`, `.agents/skills`, then `$XDG_CONFIG_HOME/dex/skills`. Sorted, first `name` wins, duplicates warned.
-- Permissions default `ask-writes` (`read-only`/`ask-writes`/`ask-shell`/`trusted`); `bash` is mutating. `DEX_EXTRA_TOOLS=1` adds `git`/`chain`.
+- Permissions default `trusted` (`read-only`/`ask-writes`/`ask-shell`/`trusted`); `bash` is mutating. `DEX_EXTRA_TOOLS=1` adds `git`/`chain`.
 - Compaction is deterministic by default (`DEX_COMPACTION_LLM=1` for LLM). Keep `tokens > contextWindow - reserveTokens` logic intact.
 
 ## Before submitting

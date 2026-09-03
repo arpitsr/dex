@@ -325,7 +325,14 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             }
         }
         "/model" => {
-            push_info(app, format!("current model: {}", app.config.model));
+            push_info(
+                app,
+                format!(
+                    "current model: {} ({})",
+                    app.config.model,
+                    app.config.api.name()
+                ),
+            );
         }
         "/provider" => {
             push_info(
@@ -402,11 +409,21 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     Some(name) => push_info(
                         app,
                         format!(
-                            "switched to model: {} @ {} ({})",
-                            app.config.model, name, app.config.base_url
+                            "switched to model: {} @ {} ({}, {})",
+                            app.config.model,
+                            name,
+                            app.config.base_url,
+                            app.config.api.name()
                         ),
                     ),
-                    None => push_info(app, format!("switched to model: {}", app.config.model)),
+                    None => push_info(
+                        app,
+                        format!(
+                            "switched to model: {} ({})",
+                            app.config.model,
+                            app.config.api.name()
+                        ),
+                    ),
                 }
             }
         }
@@ -478,11 +495,17 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
                 Some(name) => push_info(
                     app,
                     format!(
-                        "restored model: {} @ {} ({})",
-                        app.config.model, name, app.config.base_url
+                        "restored model: {} @ {} ({}, {})",
+                        app.config.model,
+                        name,
+                        app.config.base_url,
+                        app.config.api.name()
                     ),
                 ),
-                None => push_info(app, format!("restored model: {}", model)),
+                None => push_info(
+                    app,
+                    format!("restored model: {} ({})", model, app.config.api.name()),
+                ),
             }
         }
     }

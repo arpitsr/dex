@@ -228,6 +228,26 @@ pub(crate) enum ApiProtocol {
     Responses,
 }
 
+impl ApiProtocol {
+    /// Parse pi's `api` names (`openai-completions` / `openai-responses`
+    /// plus pi's short aliases). None for anything else — including pi APIs
+    /// outside dex's OpenAI-compatible subset (`anthropic-messages`, …).
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "responses" | "openai-responses" => Some(Self::Responses),
+            "chat" | "chat-completions" | "openai-completions" => Some(Self::ChatCompletions),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Responses => "openai-responses",
+            Self::ChatCompletions => "openai-completions",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Provider {
     OpenCode,
