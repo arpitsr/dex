@@ -72,6 +72,8 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         account_id: None,
         thinking_effort: None,
         context_window: info.context_window,
+        reserve_tokens: 16_384,
+        keep_recent_tokens: 20_000,
         permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::AskWrites),
         max_tool_iterations: 0,
         max_prompt_tokens: 0,
@@ -708,9 +710,9 @@ pub(crate) fn connection_label(daemon_url: &str) -> String {
         }
     };
     if is_loopback(host) {
-        format!("connected to local at {host}")
+        format!("[L] {host}")
     } else {
-        format!("connected to daemon at {host}")
+        format!("[R] {host}")
     }
 }
 
@@ -1224,25 +1226,16 @@ mod tests {
 
     #[test]
     fn connection_labels_classify_host() {
-        assert_eq!(
-            connection_label("http://127.0.0.1:4113"),
-            "connected to local at 127.0.0.1"
-        );
-        assert_eq!(
-            connection_label("http://localhost:4113"),
-            "connected to local at localhost"
-        );
-        assert_eq!(
-            connection_label("http://[::1]:4113"),
-            "connected to local at [::1]"
-        );
+        assert_eq!(connection_label("http://127.0.0.1:4113"), "[L] 127.0.0.1");
+        assert_eq!(connection_label("http://localhost:4113"), "[L] localhost");
+        assert_eq!(connection_label("http://[::1]:4113"), "[L] [::1]");
         assert_eq!(
             connection_label("daemon.internal:4113"),
-            "connected to daemon at daemon.internal"
+            "[R] daemon.internal"
         );
         assert_eq!(
             connection_label("https://agent.example.com/api"),
-            "connected to daemon at agent.example.com"
+            "[R] agent.example.com"
         );
     }
 

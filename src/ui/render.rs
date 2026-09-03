@@ -199,12 +199,8 @@ pub(super) fn ui_status(app: &App) -> String {
             .checked_div(app.config.context_window)
             .unwrap_or(0)
     };
-    let conn = app
-        .connection
-        .clone()
-        .unwrap_or_else(|| "connected to local".to_string());
     let mut base = format!(
-        "{conn} · {} · {} / {}{} · {} / {} tokens ({}%)",
+        "{} · {} / {}{} · {} / {} tokens ({}%)",
         cwd,
         app.config.provider.name(),
         app.config.model,
@@ -266,11 +262,29 @@ pub(super) fn footer_text(app: &App, width: u16) -> String {
     }
     candidates.push(compact);
     candidates.push(model.clone());
+    // Connection badge pinned to the right edge. On a remote box knowing
+    // that beats any left-side detail, so it survives narrowing at the
+    // left's expense: first left candidate that leaves room for it wins,
+    // otherwise the widest left that fits alone, else bare model.
+    let conn = app
+        .connection
+        .clone()
+        .unwrap_or_else(|| "[L] local".to_string());
+    let conn_w = UnicodeWidthStr::width(conn.as_str());
+    let mut left_only = None;
     for status in candidates {
-        let candidate = format!("{}{}", hint, status);
-        if UnicodeWidthStr::width(candidate.as_str()) <= width as usize {
-            return candidate;
+        let left = format!("{}{}", hint, status);
+        let lw = UnicodeWidthStr::width(left.as_str());
+        if lw + 1 + conn_w <= width as usize {
+            let pad = " ".repeat(width as usize - lw - conn_w);
+            return format!("{left}{pad}{conn}");
         }
+        if left_only.is_none() && lw <= width as usize {
+            left_only = Some(left);
+        }
+    }
+    if let Some(left) = left_only {
+        return left;
     }
     truncate_display(&format!("{}{}", hint, model), width)
 }
@@ -1206,6 +1220,8 @@ mod tests {
                 account_id: None,
                 thinking_effort: None,
                 context_window: 128_000,
+                reserve_tokens: 16_384,
+                keep_recent_tokens: 20_000,
                 permission: PermissionMode::Trusted,
                 max_tool_iterations: 60,
                 max_prompt_tokens: 128_000,
@@ -1356,6 +1372,21 @@ mod tests {
         assert_eq!(truncate_display("abcdef", 0), "");
         let app = test_app();
         assert_eq!(footer_text(&app, 8), "test-mo…");
+    }
+
+    #[test]
+    fn footer_pins_connection_badge_right() {
+        let mut app = test_app();
+        app.connection = Some("[R] daemon.internal".into());
+        // Wide enough for left + badge: badge flush right, left at column 0.
+        let text = footer_text(&app, 60);
+        assert!(text.starts_with("/tmp/dex-ui-test"), "{text}");
+        assert!(text.ends_with("[R] daemon.internal"), "{text}");
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 60);
+        // Narrow: badge survives, left degrades to the bare model name.
+        let text = footer_text(&app, 30);
+        assert!(text.ends_with("[R] daemon.internal"), "{text}");
+        assert!(text.starts_with("test-model"), "{text}");
     }
 
     #[test]

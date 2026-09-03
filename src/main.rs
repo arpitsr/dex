@@ -250,6 +250,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Mode::Update { models } => {
+            if models {
+                if let Err(e) = crate::llm::config::refresh_models_cache() {
+                    eprintln!("update --models failed: {e}");
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("usage: dex update --models  (like pi update --models)");
+                std::process::exit(1);
+            }
+        }
         Mode::Default => {
             // Start server in background, then launch TUI connected to it.
             let addr = match start_daemon_background() {

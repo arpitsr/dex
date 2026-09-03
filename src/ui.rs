@@ -125,9 +125,9 @@ pub(crate) struct App {
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: String,
     pub(crate) slash_selected: usize,
-    /// How this TUI reached its agent engine, e.g. "connected to local" or
-    /// "connected to daemon at 127.0.0.1:4113". Shown in the status bar only;
-    /// the transcript stays free of startup banners.
+    /// How this TUI reached its agent engine, e.g. "[L] 127.0.0.1" (local
+    /// loopback) or "[R] daemon.internal" (remote). Pinned to the right edge
+    /// of the status bar; the transcript stays free of startup banners.
     pub(crate) connection: Option<String>,
     /// Whether the tail `Assistant` block is still open for streaming
     /// coalescence. Tracked so an initial transcript block (e.g. in tests)
@@ -519,6 +519,8 @@ mod tests {
                 account_id: None,
                 thinking_effort: None,
                 context_window: 128_000,
+                reserve_tokens: 16_384,
+                keep_recent_tokens: 20_000,
                 permission: crate::core::types::PermissionMode::Trusted,
                 max_tool_iterations: 60,
                 max_prompt_tokens: 128_000,

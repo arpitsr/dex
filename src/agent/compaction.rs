@@ -67,7 +67,11 @@ pub(crate) fn effective_tokens(
 /// Compact the conversation history to keep requests bounded:
 /// replace old turns with a short summary, keeping the system prompt,
 /// the first user message, and everything from the recent window intact.
+/// Pi: keepRecentTokens=20000 (token-based); dex keeps 12 messages as
+/// fallback when total tokens < keep_recent.
 pub(crate) const KEEP_RECENT_MESSAGES: usize = 12;
+#[allow(dead_code)]
+pub(crate) const KEEP_RECENT_TOKENS: u64 = 20_000;
 
 pub(crate) const MIN_MESSAGES_TO_SUMMARIZE: usize = 8;
 
@@ -222,12 +226,51 @@ fn deterministic_summary(old: &[ChatMessage]) -> String {
 /// after the cutoff is kept whole, so an assistant-with-tool_calls at the
 /// cutoff is fine (its results follow it). Returns None if there is nothing
 /// large enough to summarize.
+/// Pi: walk back until keepRecentTokens (20000) is reached; dex falls back
+/// to KEEP_RECENT_MESSAGES (12) when total tokens < keep_recent.
+#[allow(dead_code)]
 pub(crate) fn find_cutoff(messages: &[ChatMessage]) -> Option<usize> {
+    find_cutoff_by_tokens(messages, KEEP_RECENT_TOKENS)
+}
+
+pub(crate) fn find_cutoff_by_tokens(
+    messages: &[ChatMessage],
+    keep_recent_tokens: u64,
+) -> Option<usize> {
     let total = messages.len();
-    if total <= 1 + KEEP_RECENT_MESSAGES {
-        return None;
+    // Pi: token-based walk (keepRecentTokens)
+    let mut tokens: u64 = 0;
+    let mut cutoff = total;
+    for i in (1..total).rev() {
+        // single-message estimate: chars/4 + overhead
+        let m = &messages[i];
+        let len = m.content.as_deref().map_or(0, str::len)
+            + m.tool_calls.as_ref().map_or(0, |calls| {
+                calls
+                    .iter()
+                    .map(|c| c.function.arguments.len() + c.function.name.len() + c.id.len())
+                    .sum()
+            })
+            + m.role.len()
+            + m.name.as_deref().map_or(0, str::len)
+            + m.tool_call_id.as_deref().map_or(0, str::len);
+        let est = (len as u64) / 4 + PER_MESSAGE_OVERHEAD;
+        tokens += est;
+        if tokens >= keep_recent_tokens {
+            cutoff = i;
+            break;
+        }
     }
-    let mut cutoff = total - KEEP_RECENT_MESSAGES;
+    // If token walk consumed whole history (total < keep_recent), fallback to
+    // message-count window so many short messages still compact (dex compat).
+    let mut cutoff = if cutoff == total {
+        if total <= 1 + KEEP_RECENT_MESSAGES {
+            return None;
+        }
+        total - KEEP_RECENT_MESSAGES
+    } else {
+        cutoff
+    };
     while cutoff > 1 && messages[cutoff].role == "tool" {
         cutoff -= 1;
     }
@@ -242,7 +285,7 @@ pub(crate) fn compact_history(
     messages: &mut Vec<ChatMessage>,
     _cancel: &dyn CancellationSource,
 ) -> Result<bool, String> {
-    let cutoff = match find_cutoff(messages) {
+    let cutoff = match find_cutoff_by_tokens(messages, _config.keep_recent_tokens()) {
         Some(c) => c,
         None => return Ok(false),
     };

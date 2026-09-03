@@ -531,8 +531,8 @@ pub(crate) fn process_turn(
             }
         }
         // Ephemeral preamble this iteration: plan + optional wrap-up nudge.
-        // pi has no nudge; dex enables it only with DEX_WRAPUP_NUDGE=1.
-        let nudge_text: Option<String> = if std::env::var("DEX_WRAPUP_NUDGE").as_deref() == Ok("1")
+        // Enabled by default; set DEX_WRAPUP_NUDGE=0 to disable.
+        let nudge_text: Option<String> = if std::env::var("DEX_WRAPUP_NUDGE").as_deref() != Ok("0")
             && iteration_cap.saturating_sub(iteration) == WRAP_UP_THRESHOLD
         {
             Some(
@@ -1228,6 +1228,8 @@ mod tests {
             account_id: None,
             thinking_effort: None,
             context_window: 128_000,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
             permission: PermissionMode::Trusted,
             max_tool_iterations: 8,
             max_prompt_tokens: 128_000,

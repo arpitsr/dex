@@ -21,6 +21,8 @@ pub(crate) struct FileConfig {
     pub(crate) api: Option<String>,
     pub(crate) thinking_effort: Option<String>,
     pub(crate) context_window: Option<u64>,
+    pub(crate) reserve_tokens: Option<u64>,
+    pub(crate) keep_recent_tokens: Option<u64>,
     pub(crate) permission: Option<String>,
     pub(crate) max_tool_iterations: Option<usize>,
     pub(crate) max_prompt_tokens: Option<u64>,
@@ -36,6 +38,247 @@ pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
         Provider::OpenCode => 128_000,
         Provider::OpenAiCodex => 128_000,
     }
+}
+
+/// Per-model context window, matching pi's catalog (models-store.json).
+/// Kept static to avoid network probe; DEX_CONTEXT_WINDOW / file override wins.
+/// Pi catalog: gpt-5* 400k (5.6* 1050k), claude 200k/1M, muse 1048576, deepseek/glm 1M.
+/// Update when pi catalog changes — grep models-store.json for contextWindow.
+pub(crate) fn model_context_window(model: &str, provider: Provider) -> u64 {
+    let m = model.to_ascii_lowercase();
+    // ponytail: static table, pi's models-store.json is the source of truth
+    if m.contains("muse-spark") {
+        return 1_048_576;
+    }
+    if m.contains("gpt-5.6") {
+        return 1_050_000;
+    }
+    if m.contains("gpt-5.5") {
+        return 1_050_000;
+    }
+    if m.contains("gpt-5.4-pro") {
+        return 1_050_000;
+    }
+    if m.contains("gpt-5.4") {
+        return 272_000;
+    }
+    if m.contains("gpt-5") {
+        return 400_000;
+    }
+    if m.contains("claude-fable") {
+        return 1_000_000;
+    }
+    if m.contains("claude") {
+        return 200_000;
+    }
+    if m.contains("deepseek") {
+        return 1_000_000;
+    }
+    if m.contains("glm-5.3") || m.contains("glm-5.2") {
+        return 1_000_000;
+    }
+    if m.contains("glm-5") {
+        return 202_752;
+    }
+    if m.contains("kimi") || m.contains("qwen") {
+        return 128_000;
+    }
+    provider_default_context_window(provider)
+}
+
+pub(crate) fn dex_models_cache_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+        return Some(std::path::PathBuf::from(dir).join("dex/models.json"));
+    }
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.json"))
+}
+
+fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+        return Some(std::path::PathBuf::from(dir).join("dex/models.dev.json"));
+    }
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.dev.json"))
+}
+
+fn load_dex_catalog() -> Option<serde_json::Value> {
+    let path = dex_catalog_cache_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u64> {
+    let needle = model.to_ascii_lowercase();
+    // catalog is api.json (providers) or catalog.json (models+providers) — try both shapes
+    if let Some(providers) = catalog.as_object() {
+        // api.json shape: { "opencode": { models: { "id": { limit:{context} } } } }
+        for (_prov, entry) in providers {
+            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+                if let Some(m) = models.get(needle.as_str()).or_else(|| {
+                    // fallback case-insensitive scan
+                    models
+                        .iter()
+                        .find(|(k, _)| k.to_ascii_lowercase() == needle)
+                        .map(|(_, v)| v)
+                }) {
+                    if let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(|c| c.as_u64()) {
+                        return Some(ctx);
+                    }
+                }
+            }
+        }
+        // catalog.json shape: { models: { "id": { limit } }, providers: { } }
+        if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
+            if let Some(m) = models.get(needle.as_str()) {
+                if let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(|c| c.as_u64()) {
+                    return Some(ctx);
+                }
+            }
+            for (k, m) in models {
+                if k.to_ascii_lowercase() == needle {
+                    if let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(|c| c.as_u64()) {
+                        return Some(ctx);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn load_dex_models_cache() -> Option<Vec<String>> {
+    // dex cache is now models.dev catalog — extract opencode ids from it
+    if let Some(catalog) = load_dex_catalog() {
+        if let Some(providers) = catalog.as_object() {
+            if let Some(op) = providers.get("opencode") {
+                if let Some(models) = op.get("models").and_then(|m| m.as_object()) {
+                    let mut ids: Vec<String> = models.keys().cloned().collect();
+                    if let Some(go) = providers.get("opencode-go") {
+                        if let Some(gmodels) = go.get("models").and_then(|m| m.as_object()) {
+                            for id in gmodels.keys() {
+                                ids.push(format!("go/{id}"));
+                                ids.push(id.clone());
+                            }
+                        }
+                    }
+                    if !ids.is_empty() {
+                        return Some(ids);
+                    }
+                }
+            }
+        }
+        if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
+            let ids: Vec<String> = models.keys().cloned().collect();
+            if !ids.is_empty() {
+                return Some(ids);
+            }
+        }
+    }
+    // fallback: dex cache array
+    if let Some(p) = dex_models_cache_path() {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(arr) = v.as_array() {
+                    let ids: Vec<String> = arr
+                        .iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if !ids.is_empty() {
+                        return Some(ids);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Refresh dex models cache — like `pi update --models`, now via models.dev.
+/// Fetches https://models.dev/api.json (no auth) and caches to
+/// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
+/// and autocomplete without network. Falls back to opencode /models if needed.
+pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
+    let mut fetched = false;
+    for url in ["https://models.dev/api.json", "https://models.dev/catalog.json"] {
+        if let Ok(resp) = client.get(url).send().and_then(|r| r.error_for_status()) {
+            if let Ok(text) = resp.text() {
+                if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+                    if let Some(path) = dex_catalog_cache_path() {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        std::fs::write(&path, &text)?;
+                        println!("cached models.dev {} to {}", url, path.display());
+                        fetched = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if fetched {
+        // also refresh legacy ids cache for fast autocomplete
+        if let Some(catalog) = load_dex_catalog() {
+            if let Some(ids) = load_dex_models_cache() {
+                let _ = ids; // already derived from catalog
+            }
+            let _ = catalog; // keep file
+        }
+        return Ok(());
+    }
+    // Fallback: opencode /models (needs auth) — old behavior
+    let file = load_file_config()?;
+    let provider_name = std::env::var("DEX_PROVIDER")
+        .ok()
+        .or(file.provider.clone())
+        .unwrap_or_else(|| "opencode".to_string());
+    let provider = Provider::parse(&provider_name)?;
+    if provider != Provider::OpenCode {
+        return Err("models.dev fetch failed and provider is not opencode".into());
+    }
+    let env_base_url = std::env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
+    let base_url = env_base_url
+        .or(file.base_url.clone())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .or(file.api_key.clone())
+        .ok_or("models.dev unavailable and OPENAI_API_KEY not set for fallback")?;
+    let endpoints: BTreeMap<String, String> = match &file.endpoints {
+        Some(map) => map.clone(),
+        None if base_url.starts_with("https://opencode.ai/") => [
+            ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
+            ("go".to_string(), "https://opencode.ai/zen/go/v1".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        None => BTreeMap::new(),
+    };
+    let mut all: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in fetch_provider_models(&client, provider, &base_url, &api_key) {
+        if seen.insert(id.clone()) { all.push(id); }
+    }
+    for (name, url) in &endpoints {
+        for id in fetch_provider_models(&client, provider, url, &api_key) {
+            let prefixed = format!("{name}/{id}");
+            if seen.insert(prefixed.clone()) { all.push(prefixed); }
+            if seen.insert(id.clone()) { all.push(id); }
+        }
+    }
+    if all.is_empty() {
+        return Err("no models fetched — check network".into());
+    }
+    all.sort(); all.dedup();
+    let path = dex_models_cache_path().ok_or("could not determine cache path")?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(&path, serde_json::to_string_pretty(&all)?)?;
+    println!("cached {} models to {} (fallback)", all.len(), path.display());
+    Ok(())
 }
 
 /// Auto-detect a verification command (P9) when none is configured: a
@@ -132,7 +375,10 @@ pub(crate) struct LlmConfig {
     pub(crate) account_id: Option<String>,
     pub(crate) thinking_effort: Option<String>,
     /// Model context window size in tokens (used for compaction + status bar).
+    /// Per-model (pi catalog) unless overridden by DEX_CONTEXT_WINDOW / file.
     pub(crate) context_window: u64,
+    pub(crate) reserve_tokens: u64,
+    pub(crate) keep_recent_tokens: u64,
     pub(crate) permission: PermissionMode,
     pub(crate) max_tool_iterations: usize,
     pub(crate) max_prompt_tokens: u64,
@@ -224,15 +470,27 @@ impl LlmConfig {
             Provider::OpenAiCodex => load_codex_credentials()?,
         };
         // Resolve context window once, then derive max_prompt_tokens from it
-        // so the two limits can never disagree (old default: both 128k).
+        // Dex: models.dev catalog > static table. DEX_CONTEXT_WINDOW / file override wins. No pi dependency.
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
             .or(file.context_window)
-            .unwrap_or_else(|| provider_default_context_window(provider));
+            .or_else(|| load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)))
+            .unwrap_or_else(|| model_context_window(&model, provider));
         let derived_max_prompt = context_window
             .saturating_sub(16_000)
             .min(context_window * 3 / 4);
+        // Pi: reserve 16384, keep 20000 tokens recent (not 12 messages)
+        let reserve_tokens = env::var("DEX_RESERVE_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.reserve_tokens)
+            .unwrap_or(16_384);
+        let keep_recent_tokens = env::var("DEX_KEEP_RECENT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.keep_recent_tokens)
+            .unwrap_or(20_000);
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(
                 env::var("DEX_HTTP_CONNECT_TIMEOUT_SECS")
@@ -252,9 +510,9 @@ impl LlmConfig {
                     .unwrap_or(300),
             ))
             .build()?;
-        // No static model list (DEX_MODELS / `models:`) and the resolved
-        // base_url isn't itself a named endpoint -> live /models fetch so
-        // /model autocomplete lists everything.
+        // Dex standalone: no network at startup — models come from config/DEX_MODELS
+        // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
+        // live /models fetch (was 5s+ blocking per endpoint).
         let endpoints: BTreeMap<String, String> = match &file.endpoints {
             Some(map) => map.clone(),
             // Already pointed at opencode.ai: expose its zen/go gateways by
@@ -274,14 +532,10 @@ impl LlmConfig {
             }
             None => BTreeMap::new(),
         };
-        if available_models.is_empty() && !endpoints.values().any(|url| url == &base_url) {
-            available_models = fetch_provider_models(&client, provider, &base_url, &api_key);
-        }
-        // Each named endpoint contributes `<name>/<model-id>` entries; picking
-        // one routes requests to that endpoint (apply_model).
-        for (name, url) in &endpoints {
-            for id in fetch_provider_models(&client, provider, url, &api_key) {
-                available_models.push(format!("{name}/{id}"));
+        // Dex own cache (no pi dependency) — bootstraps with just current model if missing.
+        if available_models.is_empty() {
+            if let Some(cached) = load_dex_models_cache() {
+                available_models = cached;
             }
         }
         if !available_models.iter().any(|candidate| candidate == &model) {
@@ -297,13 +551,15 @@ impl LlmConfig {
             account_id,
             thinking_effort: file.thinking_effort,
             context_window,
+            reserve_tokens,
+            keep_recent_tokens,
             verify_command: env::var("DEX_VERIFY").ok().or(file.verify_command.clone()),
             permission,
             max_tool_iterations: env::var("DEX_MAX_TOOL_ITERATIONS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_tool_iterations)
-                .unwrap_or(25),
+                .unwrap_or(60),
             max_prompt_tokens: env::var("DEX_MAX_PROMPT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -332,26 +588,54 @@ impl LlmConfig {
     /// else is a plain model id on the current base_url. Returns the endpoint
     /// name when a route was taken.
     pub(crate) fn apply_model(&mut self, selection: &str) -> Option<String> {
-        if let Some((name, rest)) = selection.split_once('/') {
+        let result = if let Some((name, rest)) = selection.split_once('/') {
             if let Some(url) = self.endpoints.get(name) {
                 self.base_url = url.clone();
                 self.model = rest.to_string();
-                return Some(name.to_string());
+                Some(name.to_string())
+            } else {
+                self.model = selection.to_string();
+                None
+            }
+        } else {
+            self.model = selection.to_string();
+            None
+        };
+        // Dex standalone: contextWindow from models.dev catalog > static table; refresh unless env/file pinned it.
+        if env::var("DEX_CONTEXT_WINDOW").is_err() {
+            let file_ctx = load_file_config().ok().and_then(|f| f.context_window);
+            if file_ctx.is_none() {
+                if let Some(catalog) = load_dex_catalog() {
+                    if let Some(ctx) = catalog_context_window(&self.model, &catalog) {
+                        self.context_window = ctx;
+                    } else {
+                        self.context_window = model_context_window(&self.model, self.provider);
+                    }
+                } else {
+                    self.context_window = model_context_window(&self.model, self.provider);
+                }
+                self.max_prompt_tokens = self
+                    .context_window
+                    .saturating_sub(16_000)
+                    .min(self.context_window * 3 / 4);
             }
         }
-        self.model = selection.to_string();
-        None
+        result
     }
 
     /// Trigger compaction when prompt exceeds this many tokens.
-    /// Half the window leaves room for completion + tool overhead.
+    /// Pi: contextWindow - reserveTokens (16384) leaves room for reply.
     pub(crate) fn compaction_threshold(&self) -> u64 {
-        self.context_window / 2
+        self.context_window.saturating_sub(self.reserve_tokens)
     }
 
-    /// Tokens reserved for the model's reply.
+    /// Tokens reserved for the model's reply (pi default 16384).
     pub(crate) fn reserve_tokens(&self) -> u64 {
-        8192
+        self.reserve_tokens
+    }
+
+    pub(crate) fn keep_recent_tokens(&self) -> u64 {
+        self.keep_recent_tokens
     }
 
     pub(crate) fn switch_provider(
@@ -415,6 +699,8 @@ mod tests {
             account_id: None,
             thinking_effort: None,
             context_window: 128_000,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
             permission: PermissionMode::AskWrites,
             max_tool_iterations: 60,
             max_prompt_tokens: 96_000,

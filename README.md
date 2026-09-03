@@ -63,7 +63,7 @@ cp config.sample.yaml ~/.config/dex/config.yaml
 | `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
 | `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
 | `context_window` | integer  | Token context window used for compaction/status (overridable by `DEX_CONTEXT_WINDOW`). |
-| `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits (`max_tool_iterations` default 25, pi p95 ~8). |
+| `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits (`max_tool_iterations` default 60, pi p95 ~8). |
 | `http_connect_timeout_secs` / `http_request_timeout_secs` | integer | HTTP connection and request limits. |
 
 The `api` field follows the provider/model API distinction used by Pi and Codex. It defaults to `openai-responses`.
@@ -306,7 +306,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `DEX_CONFIG`    | Explicit path to the config file.                        |
 | `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
 | `DEX_GIT_CONTEXT` | `1` to inject `git status/diff --stat` per turn (off by default). |
-| `DEX_WRAPUP_NUDGE` | `1` to inject wrap-up nudge at 5 iterations remaining. |
+| `DEX_WRAPUP_NUDGE` | Wrap-up nudge at 5 iterations remaining (on by default, `0` to disable). |
 | `DEX_STUCK_DETECT` | `1` to enable stuck detection (identical failures / repeated edits). |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
@@ -314,7 +314,10 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
 | `DEX_TAB_WIDTH` | Override tab width (1-16) for `read` line numbers.       |
 | `DEX_COST_PER_1K` | Prompt cost per 1k tok for `trace.jsonl` (default `0.002`). |
-| `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap (default 25, was 60). |
+| `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap (default 60, nudge at 5 remaining). |
+| `DEX_CONTEXT_WINDOW` | Override model context window (pi: per-model from catalog, e.g. gpt-5.6 1050000, claude 200k, muse 1048576). |
+| `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384, pi: `compaction.reserveTokens`). |
+| `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000, pi: `compaction.keepRecentTokens`). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
 
@@ -350,8 +353,7 @@ dex/
 
 A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
 model with tools enabled, executes any requested tool calls in parallel ( `write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
-results back, and compacts history deterministically once the message count or estimated token
-budget is exceeded. Optional `DEX_WRAPUP_NUDGE`/`DEX_STUCK_DETECT`/`DEX_VERIFY` hooks and `git` context are off by default for pi-fast latency. Progress is reported through a `Console` (streamed lines + approval
+results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (pi: `reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). Optional `DEX_WRAPUP_NUDGE`/`DEX_STUCK_DETECT`/`DEX_VERIFY` hooks and `git` context are off by default for pi-fast latency. Progress is reported through a `Console` (streamed lines + approval
 requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and
