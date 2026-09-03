@@ -16,7 +16,9 @@ pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
     let chars: usize = messages
         .iter()
         .map(|message| {
-            // Content + tool call payload + name/role
+            // Content + tool call payload + name/role + replayed reasoning
+            // (reasoning_items blobs and reasoning_content are re-sent
+            // verbatim next request, so they count toward the window).
             let mut len = message.content.as_deref().map_or(0, str::len)
                 + message.tool_calls.as_ref().map_or(0, |calls| {
                     calls
@@ -25,6 +27,10 @@ pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
                             call.function.arguments.len() + call.function.name.len() + call.id.len()
                         })
                         .sum()
+                })
+                + message.reasoning_content.as_deref().map_or(0, str::len)
+                + message.reasoning_items.as_ref().map_or(0, |items| {
+                    items.iter().map(|item| item.to_string().len()).sum()
                 });
             // Role and name framing
             len += message.role.len();
@@ -148,6 +154,10 @@ fn find_cut_point(
                     .iter()
                     .map(|c| c.function.arguments.len() + c.function.name.len() + c.id.len())
                     .sum()
+            })
+            + m.reasoning_content.as_deref().map_or(0, str::len)
+            + m.reasoning_items.as_ref().map_or(0, |items| {
+                items.iter().map(|item| item.to_string().len()).sum()
             })
             + m.role.len()
             + m.name.as_deref().map_or(0, str::len)
@@ -914,6 +924,28 @@ mod tests {
         assert!(est >= 2, "estimator must not undercount to zero: {est}");
         // Empty history estimates to zero, not garbage.
         assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimator_counts_replayed_reasoning() {
+        let plain = vec![msg("assistant", "hello")];
+        let with_reasoning = vec![ChatMessage {
+            role: "assistant".into(),
+            content: Some("hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_items: Some(vec![serde_json::json!({
+                "type": "reasoning",
+                "id": "r1",
+                "encrypted_content": "blob1",
+            })]),
+            reasoning_content: Some("step 1".to_string()),
+        }];
+        assert!(
+            estimate_tokens(&with_reasoning) > estimate_tokens(&plain),
+            "replayed reasoning must count toward the window"
+        );
     }
 
     #[test]

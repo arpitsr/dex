@@ -340,11 +340,9 @@ pub(crate) fn read_responses_stream(
                     // request; summary-only items (no encrypted_content)
                     // can't be replayed and would corrupt the thread.
                     let item = event.get("item").unwrap_or(&Value::Null);
-                    if item
-                        .get("encrypted_content")
-                        .map(|v| !v.is_null())
-                        .unwrap_or(false)
-                    {
+                    if item.get("encrypted_content").map_or(false, |v| {
+                        !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(true)
+                    }) {
                         reasoning_items.push(item.clone());
                     }
                 }
@@ -476,6 +474,24 @@ mod tests {
         assert_eq!(items.len(), 1, "summary-only item must be skipped");
         assert_eq!(items[0]["encrypted_content"], "blob1");
         assert!(msg.reasoning_content.is_none());
+    }
+
+    /// Null AND empty-string `encrypted_content` are both unreplayable:
+    /// an empty blob would corrupt the thread if sent back.
+    #[test]
+    fn responses_stream_skips_null_and_empty_encrypted_content() {
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r1","summary":[],"encrypted_content":""}}"#,
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"r2","summary":[],"encrypted_content":null}}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, _) = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert!(
+            msg.reasoning_items.is_none(),
+            "empty/null blobs must not be captured: {:?}",
+            msg.reasoning_items
+        );
     }
 
     /// DeepSeek-style chat-completions reasoning: `reasoning_content` deltas

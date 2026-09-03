@@ -608,17 +608,14 @@ impl LlmConfig {
                         Provider::OpenAiCodex => load_codex_credentials().ok(),
                     };
                     if let Some((k, acct)) = creds {
-                        self.provider = new_provider;
                         self.api_key = k;
                         self.account_id = acct;
-                        self.base_url = new_provider.default_base_url().to_string();
-                        self.endpoints = provider_endpoints(new_provider);
-                    } else {
-                        // No creds for target provider — still switch base_url so /model shows intent; LLM call will error clearly
-                        self.provider = new_provider;
-                        self.base_url = new_provider.default_base_url().to_string();
-                        self.endpoints = provider_endpoints(new_provider);
                     }
+                    // Switch even without creds so /model shows intent;
+                    // auth failure surfaces at the next LLM call.
+                    self.provider = new_provider;
+                    self.base_url = new_provider.default_base_url().to_string();
+                    self.endpoints = provider_endpoints(new_provider);
                 }
                 sel = rest;
             }
