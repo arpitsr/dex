@@ -19,7 +19,7 @@ use crate::agent::r#loop::process_turn;
 use crate::agent::state::{GlobalCancellation, ToolState};
 use crate::core::console::install_sigint_handler;
 use crate::core::types::{ChatMessage, PermissionMode};
-use crate::llm::config::{permission_from_env, warn_if_legacy_config, LlmConfig};
+use crate::llm::config::{permission_from_env, LlmConfig};
 use crate::llm::prompt::system_prompt;
 use crate::skills::{discover_skills, skill_dirs};
 
@@ -187,7 +187,6 @@ fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
 
 fn main() {
     install_sigint_handler();
-    warn_if_legacy_config();
     let args = cli::parse_args();
     let mode = cli::resolve_mode(&args);
 

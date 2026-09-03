@@ -11,7 +11,7 @@ cargo test --all-targets       # must pass
 cargo clippy --all-targets -- -D warnings  # must pass
 ```
 
-Requires Rust edition 2021. No config file — see `README.md` for config (`DEX_*`/`OPENAI_*` env).
+Requires Rust edition 2021. Config: `~/.config/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; env (`DEX_*`/`OPENAI_*`) and CLI flags override — see `README.md`.
 
 ## Structure
 

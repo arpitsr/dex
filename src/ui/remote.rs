@@ -55,8 +55,9 @@ struct RemoteApp {
 /// client never talks to the model provider itself; this only feeds the
 /// status footer and slash-command suggestions.
 fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
+    let provider = Provider::parse(&info.provider).unwrap_or(Provider::OpenCode);
     crate::llm::config::LlmConfig {
-        provider: Provider::parse(&info.provider).unwrap_or(Provider::OpenCode),
+        provider,
         api_key: String::new(),
         base_url: String::new(),
         model: info.model.clone(),
@@ -65,9 +66,10 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         } else {
             info.available_models.clone()
         },
-        // The daemon routes endpoint-prefixed models; the display copy never
-        // talks to a provider.
-        endpoints: Default::default(),
+        // Mirror the daemon's endpoint table so `/model endpoint/id`
+        // strips and displays exactly what the daemon will route.
+        // (The display copy never talks to a provider itself.)
+        endpoints: crate::llm::config::provider_endpoints(provider),
         api: ApiProtocol::parse(&info.api).unwrap_or(ApiProtocol::Responses),
         account_id: None,
         thinking_effort: None,
