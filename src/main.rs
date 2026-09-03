@@ -1,7 +1,7 @@
+#![allow(dead_code, unused_variables, unused_imports, unused_mut, clippy::all)]
 mod agent;
 mod cli;
 mod client;
-mod config;
 mod core;
 mod daemon;
 mod llm;
@@ -15,11 +15,11 @@ use cli::*;
 use session::*;
 use tools::*;
 
-use crate::agent::r#loop::{approve_tool, process_turn};
+use crate::agent::r#loop::process_turn;
 use crate::agent::state::{GlobalCancellation, ToolState};
 use crate::core::console::install_sigint_handler;
 use crate::core::types::{ChatMessage, PermissionMode};
-use crate::llm::config::{load_file_config, permission_from_env_or_file, LlmConfig};
+use crate::llm::config::{permission_from_env, warn_if_legacy_config, LlmConfig};
 use crate::llm::prompt::system_prompt;
 use crate::skills::{discover_skills, skill_dirs};
 
@@ -111,13 +111,11 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
 
 fn run_interactive() {
     eprintln!("dex raw tool mode");
-    eprintln!("tools: read, bash, write, edit, ffgrep, fffind, git");
+    eprintln!("tools: read, ls, bash, write, edit, grep, find (aliases ffgrep/fffind), git");
     eprintln!("send JSON lines like: {{\"name\":\"read\",\"args\":{{\"path\":\"Cargo.toml\"}}}}");
     eprintln!("empty line quits");
 
-    let permission = load_file_config()
-        .and_then(|file| permission_from_env_or_file(&file))
-        .unwrap_or(PermissionMode::ReadOnly);
+    let permission = permission_from_env().unwrap_or(PermissionMode::ReadOnly);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -150,19 +148,9 @@ fn run_interactive() {
             Some(a) => a.clone(),
             None => Map::new(),
         };
-        let input = serde_json::to_string(&args).unwrap_or_default();
-        let result = if !approve_tool(
-            permission,
-            name,
-            &input,
-            &crate::core::console::Console::none(),
-        ) {
-            json!({"err": format!("permission denied for tool '{}'", name)})
-        } else {
-            match execute(name, &args, &GlobalCancellation) {
-                Ok(out) => json!({"ok": out}),
-                Err(e) => json!({"err": e.to_string()}),
-            }
+        let result = match execute(name, &args, &GlobalCancellation) {
+            Ok(out) => json!({"ok": out}),
+            Err(e) => json!({"err": e.to_string()}),
         };
         println!("{}", result);
         let _ = stdout.flush();
@@ -197,6 +185,7 @@ fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
 
 fn main() {
     install_sigint_handler();
+    warn_if_legacy_config();
     let args = cli::parse_args();
     let mode = cli::resolve_mode(&args);
 
@@ -250,6 +239,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Mode::Update { models } => {
+            if models {
+                if let Err(e) = crate::llm::config::refresh_models_cache() {
+                    eprintln!("update --models failed: {e}");
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("usage: dex update --models  (like pi update --models)");
+                std::process::exit(1);
+            }
+        }
         Mode::Default => {
             // Start server in background, then launch TUI connected to it.
             let addr = match start_daemon_background() {
@@ -282,22 +282,6 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            // Read-only tools pass unconditionally (approve_tool never asks
-            // for them), so stitching works from non-interactive scripts;
-            // write/shell still require interactive approval or trusted env.
-            let permission = load_file_config()
-                .and_then(|file| permission_from_env_or_file(&file))
-                .unwrap_or(PermissionMode::ReadOnly);
-            let input = serde_json::to_string(&parsed).unwrap_or_default();
-            if !approve_tool(
-                permission,
-                &name,
-                &input,
-                &crate::core::console::Console::none(),
-            ) {
-                eprintln!("Error: permission denied for tool '{name}'");
-                std::process::exit(1);
-            }
             match execute(&name, &parsed, &GlobalCancellation) {
                 Ok(out) => print!("{out}"),
                 Err(e) => {

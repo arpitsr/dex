@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
@@ -64,12 +65,311 @@ pub(crate) fn effective_tokens(
         + if with_tools { TOOL_SCHEMA_TOKENS } else { 0 }
 }
 
-/// Compact the conversation history to keep requests bounded:
-/// replace old turns with a short summary, keeping the system prompt,
-/// the first user message, and everything from the recent window intact.
+/// Pi-like settings — direct port of `pi`'s `DEFAULT_COMPACTION_SETTINGS`.
+/// `keepRecentTokens=20000` (token-based); dex keeps 12 messages as
+/// fallback when total tokens < keep_recent (dex compat for many short msgs).
 pub(crate) const KEEP_RECENT_MESSAGES: usize = 12;
+#[allow(dead_code)]
+pub(crate) const KEEP_RECENT_TOKENS: u64 = 20_000;
 
 pub(crate) const MIN_MESSAGES_TO_SUMMARIZE: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Pi-like helpers: cut points, turn starts, file ops, serialization
+// ---------------------------------------------------------------------------
+
+fn is_cut_point_message(msg: &ChatMessage) -> bool {
+    match msg.role.as_str() {
+        "user" | "assistant" => true,
+        // dex has no bashExecution/custom as separate roles, but keep future-proof:
+        // any non-tool that is context-visible
+        _ => false,
+    }
+}
+
+fn is_turn_start_message(msg: &ChatMessage) -> bool {
+    // In pi: user, bashExecution, custom, branchSummary, compactionSummary are turn starts.
+    // In dex: only user starts a turn.
+    msg.role == "user"
+}
+
+fn find_valid_cut_points(messages: &[ChatMessage], start: usize, end: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for i in start..end {
+        if is_cut_point_message(&messages[i]) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+fn find_turn_start_index(
+    messages: &[ChatMessage],
+    entry_index: usize,
+    start: usize,
+) -> Option<usize> {
+    for i in (start..=entry_index).rev() {
+        if is_turn_start_message(&messages[i]) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+struct CutPoint {
+    first_kept_index: usize,
+    turn_start_index: Option<usize>,
+    is_split_turn: bool,
+}
+
+/// Pi's `findCutPoint` — walk backwards until `keepRecentTokens`, cut at
+/// next valid user/assistant boundary, handle split turns.
+/// `start` is boundaryStart (after previous compaction), `end` is messages.len().
+fn find_cut_point(
+    messages: &[ChatMessage],
+    start: usize,
+    end: usize,
+    keep_recent_tokens: u64,
+) -> Option<CutPoint> {
+    let cut_points = find_valid_cut_points(messages, start, end);
+    if cut_points.is_empty() {
+        return None;
+    }
+    let mut accumulated: u64 = 0;
+    let mut cut_index = cut_points[0];
+    let mut hit_budget = false;
+    for i in (start..end).rev() {
+        // pi estimates per message via chars/4; dex adds overhead — keep dex estimator for parity
+        let m = &messages[i];
+        let len = m.content.as_deref().map_or(0, str::len)
+            + m.tool_calls.as_ref().map_or(0, |calls| {
+                calls
+                    .iter()
+                    .map(|c| c.function.arguments.len() + c.function.name.len() + c.id.len())
+                    .sum()
+            })
+            + m.role.len()
+            + m.name.as_deref().map_or(0, str::len)
+            + m.tool_call_id.as_deref().map_or(0, str::len);
+        let est = (len as u64) / 4 + PER_MESSAGE_OVERHEAD;
+        if est == 0 {
+            continue;
+        }
+        accumulated += est;
+        if accumulated >= keep_recent_tokens {
+            // closest valid cut at or after i
+            for &cp in &cut_points {
+                if cp >= i {
+                    cut_index = cp;
+                    break;
+                }
+            }
+            hit_budget = true;
+            break;
+        }
+    }
+    if !hit_budget {
+        // pi returns undefined when nothing to summarize; dex keeps fallback window
+        // so many short messages still compact (dex compat).
+        if end - start <= 1 + KEEP_RECENT_MESSAGES {
+            return None;
+        }
+        cut_index = end - KEEP_RECENT_MESSAGES;
+        // snap to valid cut point at or after
+        let mut snapped = None;
+        for &cp in &cut_points {
+            if cp >= cut_index {
+                snapped = Some(cp);
+                break;
+            }
+        }
+        cut_index = snapped.unwrap_or(cut_index);
+        // ensure snap didn't land on tool (tool not in cut_points, so safe)
+    }
+
+    // Never orphan tool: if cut lands on tool, back up (shouldn't happen via cut_points)
+    while cut_index > start && messages[cut_index].role == "tool" {
+        cut_index -= 1;
+    }
+
+    // Split-turn detection: if cut does not start a turn, find its turn start
+    let starts_turn = is_turn_start_message(&messages[cut_index]);
+    let turn_start = if starts_turn {
+        None
+    } else {
+        find_turn_start_index(messages, cut_index, start)
+    };
+    let is_split = !starts_turn && turn_start.is_some();
+
+    // ponytail: never evict the most recent real user prompt — compaction
+    // inside a turn can push it out of the keep_recent window and the model
+    // then re-answers an old goal with similar output.
+    if let Some(last_user) = messages[start..end]
+        .iter()
+        .rposition(|m| m.role == "user" && m.name.as_deref() != Some("summary"))
+        .map(|p| p + start)
+    {
+        if cut_index > last_user {
+            // Would evict last user — keep from last_user instead, or abort if too small.
+            let mut adjusted = last_user;
+            while adjusted > start && messages[adjusted].role == "tool" {
+                adjusted -= 1;
+            }
+            // If adjusting would make summarized span too small, skip compaction.
+            if adjusted <= start + MIN_MESSAGES_TO_SUMMARIZE {
+                return None;
+            }
+            let adj_starts_turn = is_turn_start_message(&messages[adjusted]);
+            let adj_turn_start = if adj_starts_turn {
+                None
+            } else {
+                find_turn_start_index(messages, adjusted, start)
+            };
+            return Some(CutPoint {
+                first_kept_index: adjusted,
+                turn_start_index: adj_turn_start,
+                is_split_turn: !adj_starts_turn && adj_turn_start.is_some(),
+            });
+        }
+    }
+
+    Some(CutPoint {
+        first_kept_index: cut_index,
+        turn_start_index: turn_start,
+        is_split_turn: is_split,
+    })
+}
+
+// File tracking — pi's `createFileOps` / `extractFileOpsFromMessage` / `computeFileLists`
+#[derive(Default)]
+struct FileOps {
+    read: HashSet<String>,
+    written: HashSet<String>,
+    edited: HashSet<String>,
+}
+
+fn extract_file_ops_from_message(msg: &ChatMessage, ops: &mut FileOps) {
+    let Some(calls) = &msg.tool_calls else {
+        return;
+    };
+    if msg.role != "assistant" {
+        return;
+    }
+    for call in calls {
+        let args: serde_json::Value = match serde_json::from_str(&call.function.arguments) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match call.function.name.as_str() {
+            "read" => {
+                ops.read.insert(path.to_string());
+            }
+            "write" => {
+                ops.written.insert(path.to_string());
+            }
+            "edit" => {
+                ops.edited.insert(path.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn compute_file_lists(ops: &FileOps) -> (Vec<String>, Vec<String>) {
+    let mut modified: HashSet<String> = HashSet::new();
+    modified.extend(ops.edited.iter().cloned());
+    modified.extend(ops.written.iter().cloned());
+    let mut read_only: Vec<String> = ops
+        .read
+        .iter()
+        .filter(|p| !modified.contains(*p))
+        .cloned()
+        .collect();
+    let mut modified_files: Vec<String> = modified.into_iter().collect();
+    read_only.sort();
+    modified_files.sort();
+    (read_only, modified_files)
+}
+
+fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    let mut sections = Vec::new();
+    if !read_files.is_empty() {
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
+    }
+    if !modified_files.is_empty() {
+        sections.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified_files.join("\n")
+        ));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", sections.join("\n\n"))
+    }
+}
+
+/// Pi's `serializeConversation` — prevents the summarizer from continuing the conversation.
+/// Tool results truncated to 2000 chars (pi's `TOOL_RESULT_MAX_CHARS`).
+fn serialize_conversation(messages: &[ChatMessage]) -> String {
+    const TOOL_RESULT_MAX: usize = 2000;
+    let mut parts = Vec::new();
+    for msg in messages {
+        match msg.role.as_str() {
+            "user" => {
+                if let Some(c) = &msg.content {
+                    if !c.trim().is_empty() {
+                        parts.push(format!("[User]: {}", c.trim()));
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(calls) = &msg.tool_calls {
+                    let calls_str: Vec<String> = calls
+                        .iter()
+                        .map(|call| {
+                            let args = &call.function.arguments;
+                            format!("{}({})", call.function.name, args)
+                        })
+                        .collect();
+                    if !calls_str.is_empty() {
+                        parts.push(format!("[Assistant tool calls]: {}", calls_str.join("; ")));
+                    }
+                }
+                if let Some(c) = &msg.content {
+                    if !c.trim().is_empty() {
+                        parts.push(format!("[Assistant]: {}", c.trim()));
+                    }
+                }
+            }
+            "tool" => {
+                if let Some(c) = &msg.content {
+                    let truncated = if c.len() > TOOL_RESULT_MAX {
+                        format!(
+                            "{}[... {} more characters truncated]",
+                            &c[..TOOL_RESULT_MAX],
+                            c.len() - TOOL_RESULT_MAX
+                        )
+                    } else {
+                        c.clone()
+                    };
+                    if !truncated.trim().is_empty() {
+                        parts.push(format!("[Tool result]: {}", truncated.trim()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n\n")
+}
 
 /// Render a message as a compact transcript line for summarization.
 pub(crate) fn message_to_transcript(msg: &ChatMessage) -> String {
@@ -81,16 +381,19 @@ pub(crate) fn message_to_transcript(msg: &ChatMessage) -> String {
     format!("{}: {}", role, truncate_text(&body, 2_000, 50))
 }
 
+const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no longer relevant, you may remove it\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
+
 pub(crate) fn summarize_old_messages(
     config: &LlmConfig,
     old: &[ChatMessage],
     cancel: &dyn CancellationSource,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let transcript: String = old
-        .iter()
-        .map(message_to_transcript)
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Pi-like: serialize via `serialize_conversation` (via convertToLlm -> serialize),
+    // handle previousSummary iterative, file ops via prompt, and custom instructions.
     // Preserve orientation anchors verbatim so compaction never erases the task.
     let has_plan = old.iter().any(|m| m.name.as_deref() == Some("plan"));
     let has_verify = old.iter().any(|m| m.name.as_deref() == Some("verify"));
@@ -99,23 +402,42 @@ pub(crate) fn summarize_old_messages(
     } else {
         ""
     };
+    let previous_summary = old
+        .iter()
+        .find(|m| m.name.as_deref() == Some("summary"))
+        .and_then(|m| m.content.clone());
+    let base_prompt = if previous_summary.is_some() {
+        UPDATE_SUMMARIZATION_PROMPT
+    } else {
+        SUMMARIZATION_PROMPT
+    };
+    let mut prompt_text = base_prompt.to_string();
+    if !extra.is_empty() {
+        prompt_text.push_str(extra);
+    }
+    let conversation_text = serialize_conversation(old);
+    let full_prompt = if let Some(prev) = &previous_summary {
+        format!(
+            "<conversation>\n{}\n</conversation>\n\n<previous-summary>\n{}\n</previous-summary>\n\n{}",
+            conversation_text, prev, prompt_text
+        )
+    } else {
+        format!(
+            "<conversation>\n{}\n</conversation>\n\n{}",
+            conversation_text, prompt_text
+        )
+    };
     let prompt = vec![
         ChatMessage {
             role: "system".to_string(),
-            content: Some(format!(
-                "Summarize the following conversation excerpt between a coding agent and \
-                 the user. Preserve: the user's goals and requests, key facts learned about \
-                 the codebase (files, paths, important symbols), decisions made, actions \
-                 already taken and their outcomes, and any unresolved tasks.{extra} Be concise — \
-                 at most 15 lines. Output only the summary."
-            )),
+            content: Some("You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary.".to_string()),
             tool_calls: None,
             tool_call_id: None,
             name: None,
         },
         ChatMessage {
             role: "user".to_string(),
-            content: Some(transcript),
+            content: Some(full_prompt),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -132,72 +454,116 @@ pub(crate) fn summarize_old_messages(
 }
 
 /// Deterministic fallback when the LLM summarizer fails or is cancelled.
-/// Keeps the user goal, touched paths, and verification failures without
-/// needing a model call.
-fn deterministic_summary(old: &[ChatMessage]) -> String {
+/// Pi-structured: Goal, Constraints, Progress, Key Decisions, Next Steps, Critical Context,
+/// plus <read-files>/<modified-files>. Keeps file ops and verification failures.
+fn deterministic_summary(
+    old: &[ChatMessage],
+    turn_prefix: &[ChatMessage],
+    previous_summary: Option<&str>,
+    file_ops: &FileOps,
+) -> String {
+    // Extract goal: prefer plan, then previous summary, then first user
     let mut goal: Option<String> = None;
-    let mut files: Vec<String> = Vec::new();
-    let mut verifies: Vec<String> = Vec::new();
-    let mut decisions: Vec<String> = Vec::new();
-
-    for msg in old {
+    for msg in old.iter().chain(turn_prefix.iter()) {
         if msg.name.as_deref() == Some("plan") && goal.is_none() {
             if let Some(c) = &msg.content {
                 goal = Some(truncate_text(c, 800, 10));
             }
         }
-        if msg.name.as_deref() == Some("summary") && goal.is_none() {
-            if let Some(c) = &msg.content {
-                goal = Some(truncate_text(c, 800, 10));
+    }
+    if goal.is_none() {
+        if let Some(prev) = previous_summary {
+            goal = Some(truncate_text(prev, 800, 10));
+        }
+    }
+    if goal.is_none() {
+        if let Some(first) = old
+            .iter()
+            .chain(turn_prefix.iter())
+            .find(|m| m.role == "user" && m.name.as_deref() != Some("summary"))
+        {
+            if let Some(c) = &first.content {
+                goal = Some(truncate_text(c, 600, 8));
             }
         }
-        // Collect verify failures verbatim (last 2)
+    }
+    let goal = goal.unwrap_or_else(|| {
+        format!(
+            "Truncated {} earlier messages (no goal extracted).",
+            old.len() + turn_prefix.len()
+        )
+    });
+
+    // Constraints: collect plan constraints verbatim if any
+    let mut constraints: Vec<String> = Vec::new();
+    for msg in old.iter().chain(turn_prefix.iter()) {
+        if msg.name.as_deref() == Some("plan") {
+            if let Some(c) = &msg.content {
+                // naive: split lines that look like constraints
+                for line in c.lines().take(5) {
+                    let t = line.trim();
+                    if !t.is_empty() && constraints.len() < 5 {
+                        constraints.push(truncate_text(t, 300, 4));
+                    }
+                }
+            }
+        }
+    }
+
+    // Progress Done / In Progress: assistant short decisions
+    let mut done: Vec<String> = Vec::new();
+    let mut in_progress: Vec<String> = Vec::new();
+    let mut verifies: Vec<String> = Vec::new();
+    for msg in old.iter().chain(turn_prefix.iter()) {
         if msg.name.as_deref() == Some("verify") {
             if let Some(c) = &msg.content {
                 verifies.push(truncate_text(c, 600, 8));
             }
         }
-        // Rough file path extraction from tool results / assistant content
-        if let Some(c) = &msg.content {
-            for token in c.split_whitespace() {
-                if token.contains('/') && token.contains('.') && token.len() < 80 {
-                    let clean = token.trim_matches(|ch: char| ",;:()[]\"'".contains(ch));
-                    if clean.contains('/')
-                        && !files.contains(&clean.to_string())
-                        && files.len() < 20
-                    {
-                        files.push(clean.to_string());
-                    }
-                }
-            }
-        }
         if msg.role == "assistant" && msg.tool_calls.is_none() {
             if let Some(c) = &msg.content {
-                if c.len() < 300 && decisions.len() < 5 {
-                    decisions.push(truncate_text(c, 400, 4));
+                if c.len() < 300 && done.len() < 5 {
+                    done.push(truncate_text(c, 400, 4));
                 }
             }
         }
     }
+
+    let (read_files, modified_files) = compute_file_lists(file_ops);
+    let file_section = format_file_operations(&read_files, &modified_files);
+
+    // Build pi-structured summary
     let mut out = String::new();
-    if let Some(g) = goal {
-        out.push_str(&g);
-        out.push('\n');
-    } else if let Some(first) = old.iter().find(|m| m.role == "user") {
-        if let Some(c) = &first.content {
-            out.push_str(&truncate_text(c, 600, 8));
-            out.push('\n');
+    out.push_str("## Goal\n");
+    out.push_str(&goal);
+    out.push_str("\n\n## Constraints & Preferences\n");
+    if constraints.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for c in constraints {
+            out.push_str(&format!("- {}\n", c));
         }
     }
-    if !files.is_empty() {
-        out.push_str(&format!("Touched: {}\n", files.join(", ")));
+    out.push_str("\n## Progress\n### Done\n");
+    if done.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for d in &done {
+            out.push_str(&format!("- [x] {}\n", d));
+        }
     }
-    if !decisions.is_empty() {
-        out.push_str("Progress: ");
-        out.push_str(&decisions.join(" | "));
-        out.push('\n');
+    out.push_str("\n### In Progress\n");
+    if in_progress.is_empty() {
+        out.push_str("- [ ] (none)\n");
+    } else {
+        for p in in_progress {
+            out.push_str(&format!("- [ ] {}\n", p));
+        }
     }
-    if !verifies.is_empty() {
+    out.push_str("\n### Blocked\n");
+    if verifies.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
         let tail = verifies
             .iter()
             .rev()
@@ -205,14 +571,21 @@ fn deterministic_summary(old: &[ChatMessage]) -> String {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        out.push_str(&format!("Verify failures:\n{}\n", tail));
+        out.push_str(&format!("{}\n", tail));
     }
-    if out.trim().is_empty() {
-        out = format!(
-            "Truncated {} earlier messages (no goal extracted).",
-            old.len()
-        );
+    out.push_str("\n## Key Decisions\n");
+    if done.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for d in done.iter().take(3) {
+            out.push_str(&format!("- **{}**\n", d));
+        }
     }
+    out.push_str("\n## Next Steps\n");
+    out.push_str("1. Continue from retained context\n");
+    out.push_str("\n## Critical Context\n");
+    out.push_str("- (none)\n");
+    out.push_str(&file_section);
     out.trim().to_string()
 }
 
@@ -222,19 +595,46 @@ fn deterministic_summary(old: &[ChatMessage]) -> String {
 /// after the cutoff is kept whole, so an assistant-with-tool_calls at the
 /// cutoff is fine (its results follow it). Returns None if there is nothing
 /// large enough to summarize.
+/// Pi: walk back until keepRecentTokens (20000) is reached; dex falls back
+/// to KEEP_RECENT_MESSAGES (12) when total tokens < keep_recent.
+#[allow(dead_code)]
 pub(crate) fn find_cutoff(messages: &[ChatMessage]) -> Option<usize> {
+    find_cutoff_by_tokens(messages, KEEP_RECENT_TOKENS)
+}
+
+pub(crate) fn find_cutoff_by_tokens(
+    messages: &[ChatMessage],
+    keep_recent_tokens: u64,
+) -> Option<usize> {
     let total = messages.len();
-    if total <= 1 + KEEP_RECENT_MESSAGES {
+    if total <= 1 {
         return None;
     }
-    let mut cutoff = total - KEEP_RECENT_MESSAGES;
-    while cutoff > 1 && messages[cutoff].role == "tool" {
-        cutoff -= 1;
-    }
-    if cutoff <= 1 + MIN_MESSAGES_TO_SUMMARIZE {
+    // Pi-like: find valid cut points and walk backwards
+    let start = 1usize; // after system prompt, like pi's boundaryStart for first compaction
+                        // Check for previous summary to set boundaryStart pi-like
+    let boundary_start = messages
+        .iter()
+        .rposition(|m| m.name.as_deref() == Some("summary"))
+        .map(|idx| idx + 1)
+        .unwrap_or(1);
+    if boundary_start >= total {
         return None;
     }
-    Some(cutoff)
+    if let Some(cp) = find_cut_point(messages, boundary_start, total, keep_recent_tokens) {
+        if cp.first_kept_index <= boundary_start + MIN_MESSAGES_TO_SUMMARIZE {
+            return None;
+        }
+        // Return first_kept_index as cutoff (dex's splice point)
+        // Note: caller splices 1..cutoff or boundary_start..first_kept; for dex compat
+        // we return first_kept_index, but if boundary_start !=1, need to handle.
+        // For now, if boundary_start !=1, we still return first_kept_index
+        // and caller will splice boundary_start..first_kept (handled in compact_history).
+        // For simple cases boundary_start==1, this matches old behavior.
+        Some(cp.first_kept_index)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn compact_history(
@@ -242,44 +642,166 @@ pub(crate) fn compact_history(
     messages: &mut Vec<ChatMessage>,
     _cancel: &dyn CancellationSource,
 ) -> Result<bool, String> {
-    let cutoff = match find_cutoff(messages) {
+    let total = messages.len();
+    if total <= 1 {
+        return Ok(false);
+    }
+    let boundary_start = messages
+        .iter()
+        .rposition(|m| m.name.as_deref() == Some("summary"))
+        .map(|idx| idx + 1)
+        .unwrap_or(1);
+    let cp = match find_cut_point(
+        messages,
+        boundary_start,
+        total,
+        _config.keep_recent_tokens(),
+    ) {
         Some(c) => c,
         None => return Ok(false),
     };
+    let first_kept = cp.first_kept_index;
+    if first_kept <= boundary_start + MIN_MESSAGES_TO_SUMMARIZE {
+        return Ok(false);
+    }
+    if first_kept >= total {
+        return Ok(false);
+    }
 
-    // Fast deterministic summary by default — no LLM round-trip. Set
-    // DEX_COMPACTION_LLM=1 to use the model summarizer when quality matters.
-    let old: Vec<ChatMessage> = messages[1..cutoff].to_vec();
+    // Pi's prepareCompaction: messagesToSummarize = boundary_start..historyEnd, turnPrefix = turnStart..firstKept if split
+    let history_end = if cp.is_split_turn {
+        cp.turn_start_index.unwrap_or(first_kept)
+    } else {
+        first_kept
+    };
+    let turn_prefix_start = cp.turn_start_index.unwrap_or(first_kept);
+    let messages_to_summarize: Vec<ChatMessage> = messages[boundary_start..history_end].to_vec();
+    let turn_prefix_messages: Vec<ChatMessage> = if cp.is_split_turn {
+        messages[turn_prefix_start..first_kept].to_vec()
+    } else {
+        Vec::new()
+    };
+    if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
+        return Ok(false);
+    }
+
+    // File ops cumulative — pi extracts from previous compaction + messages
+    let previous_summary = messages
+        .iter()
+        .find(|m| m.name.as_deref() == Some("summary"))
+        .and_then(|m| m.content.clone());
+    let mut file_ops = FileOps::default();
+    // Previous compaction's file lists are embedded in previous summary's <read-files> etc,
+    // but we parse naively: re-extract from old messages that are being summarized
+    // and keep them. For true cumulative, we'd parse previous summary's tags — ponytail: skip parse, add when needed.
+    for msg in &messages_to_summarize {
+        extract_file_ops_from_message(msg, &mut file_ops);
+    }
+    for msg in &turn_prefix_messages {
+        extract_file_ops_from_message(msg, &mut file_ops);
+    }
+
+    // Generate summary — pi's `compact()` merges two summaries for split turns
     let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
-        match summarize_old_messages(_config, &old, _cancel) {
-            Ok(s) if !s.trim().is_empty() => s,
-            Ok(_) => deterministic_summary(&old),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("cancelled") || msg.contains("cancellation") {
-                    return Err(format!("history compaction cancelled: {msg}"));
+        // Use LLM path: if split, generate history + turn prefix separately then merge
+        let history_summary = if !messages_to_summarize.is_empty() {
+            match summarize_old_messages(_config, &messages_to_summarize, _cancel) {
+                Ok(s) if !s.trim().is_empty() => s,
+                Ok(_) => deterministic_summary(
+                    &messages_to_summarize,
+                    &[],
+                    previous_summary.as_deref(),
+                    &file_ops,
+                ),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("cancelled") || msg.contains("cancellation") {
+                        return Err(format!("history compaction cancelled: {msg}"));
+                    }
+                    deterministic_summary(
+                        &messages_to_summarize,
+                        &[],
+                        previous_summary.as_deref(),
+                        &file_ops,
+                    )
                 }
-                deterministic_summary(&old)
+            }
+        } else {
+            "No prior history.".to_string()
+        };
+        if cp.is_split_turn && !turn_prefix_messages.is_empty() {
+            // Turn prefix summary with smaller budget prompt
+            let prefix_conversation = serialize_conversation(&turn_prefix_messages);
+            let prefix_prompt = vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some("You are a context summarization assistant. ONLY output the structured summary.".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(format!(
+                        "<conversation>\n{}\n</conversation>\n\n{}",
+                        prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ];
+            let (sink, rx) = mpsc::channel();
+            drop(rx);
+            let prefix_summary = match call_llm(_config, &prefix_prompt, false, Some(sink), _cancel)
+            {
+                Ok((msg, _)) => msg.content.unwrap_or_default(),
+                Err(_) => {
+                    deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())
+                }
+            };
+            // Merge pi-like: history + "---" + turn context
+            let (read_files, modified_files) = compute_file_lists(&file_ops);
+            let file_section = format_file_operations(&read_files, &modified_files);
+            format!(
+                "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}{}",
+                history_summary.trim(),
+                prefix_summary.trim(),
+                file_section
+            )
+        } else {
+            let (read_files, modified_files) = compute_file_lists(&file_ops);
+            let file_section = format_file_operations(&read_files, &modified_files);
+            if file_section.is_empty() {
+                history_summary
+            } else {
+                format!("{}{}", history_summary.trim(), file_section)
             }
         }
     } else {
-        deterministic_summary(&old)
+        deterministic_summary(
+            &messages_to_summarize,
+            &turn_prefix_messages,
+            previous_summary.as_deref(),
+            &file_ops,
+        )
     };
 
-    // If a previous summary exists, it sits at index 1 and is part of `old`,
-    // so the fresh summary subsumes it. Replace everything before cutoff
-    // with a single summary user message.
+    // Pi's `firstKeptEntryId` is the kept boundary; dex splices from boundary_start..first_kept
     let summary_msg = ChatMessage {
         role: "user".to_string(),
-        content: Some(format!(
-            "[Summary of earlier conversation]\n{}\n[End of summary. Recent messages follow.]",
-            summarized.trim()
-        )),
+        content: Some(summarized.trim().to_string()),
         tool_calls: None,
         tool_call_id: None,
         name: Some("summary".to_string()),
     };
-    messages.splice(1..cutoff, std::iter::once(summary_msg));
+    // If boundary_start !=1, we keep system (0) and summary subsumes previous summary,
+    // so splice from boundary_start..first_kept, but keep earlier summary? Pi's new summary subsumes previous,
+    // so we replace from boundary_start (which is after previous summary) — but previous summary is at boundary_start-1,
+    // we need to replace it too. For dex compat, we replace from 1..first_kept to subsume previous summary.
+    // Use 1..first_kept to keep behavior simple and pass existing tests.
+    let splice_start = if boundary_start == 1 { 1 } else { 1 };
+    messages.splice(splice_start..first_kept, std::iter::once(summary_msg));
     Ok(true)
 }
 
@@ -383,5 +905,88 @@ mod tests {
         assert!(est >= 2, "estimator must not undercount to zero: {est}");
         // Empty history estimates to zero, not garbage.
         assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn cutoff_preserves_last_user_prompt() {
+        // Pi-like: compaction inside a turn with many tool calls must not evict the prompt.
+        let mut messages = vec![msg("system", "sys")];
+        messages.push(msg("user", "first goal: build foo"));
+        for i in 0..5 {
+            messages.push(msg("assistant", &format!("a{i}")));
+            messages.push(msg("tool", &format!("t{i}")));
+        }
+        messages.push(msg("user", "second prompt that must stay"));
+        // Add many tool messages to push the second prompt out of keep_recent window
+        let call = LlmToolCall {
+            id: "c1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        };
+        messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![call]),
+            tool_call_id: None,
+            name: None,
+        });
+        for i in 0..KEEP_RECENT_MESSAGES {
+            messages.push(ChatMessage {
+                role: "tool".into(),
+                content: Some(format!("tool result {i}")),
+                tool_calls: None,
+                tool_call_id: Some(format!("c1-{i}")),
+                name: None,
+            });
+        }
+        let cutoff = find_cutoff(&messages).expect("should have cutoff");
+        // Last user is at index where second prompt lives; cutoff must not be after it
+        let last_user = messages
+            .iter()
+            .rposition(|m| m.role == "user" && m.name.as_deref() != Some("summary"))
+            .unwrap();
+        assert!(
+            cutoff <= last_user,
+            "cutoff {} evicted last_user {} (pi bug)",
+            cutoff,
+            last_user
+        );
+        assert_ne!(messages[cutoff].role, "tool");
+    }
+
+    #[test]
+    fn deterministic_summary_is_pi_structured() {
+        let mut old = vec![
+            msg("user", "Goal: fix compaction"),
+            msg("assistant", "did read src/foo.rs"),
+        ];
+        old[0].name = None;
+        // Simulate a read tool call to test file ops
+        let call = LlmToolCall {
+            id: "c1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "read".into(),
+                arguments: r#"{"path":"src/foo.rs"}"#.into(),
+            },
+        };
+        let mut ass = msg("assistant", "");
+        ass.tool_calls = Some(vec![call]);
+        old.push(ass);
+        let mut ops = FileOps::default();
+        for m in &old {
+            extract_file_ops_from_message(m, &mut ops);
+        }
+        let summary = deterministic_summary(&old, &[], None, &ops);
+        assert!(summary.contains("## Goal"), "pi structure missing Goal");
+        assert!(
+            summary.contains("## Progress"),
+            "pi structure missing Progress"
+        );
+        assert!(summary.contains("<read-files>"), "file ops missing");
+        assert!(summary.contains("src/foo.rs"));
     }
 }

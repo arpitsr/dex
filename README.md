@@ -38,58 +38,38 @@ cargo build --release
 
 ## Configuration
 
-Configuration is read from a YAML file. The path is resolved in this order:
-
-1. `$DEX_CONFIG` (if set)
-2. `$XDG_CONFIG_HOME/dex/config.yaml` (also `config.yml`; a legacy `config.json` still parses)
-3. `~/.config/dex/config.yaml`
-
-Copy the sample to get started:
+There is no config file — everything is environment variables (plus `--model` /
+`--base-url` CLI flags and `/model` + `/provider` session switches, which persist
+across resumes via session state). To get started:
 
 ```sh
-mkdir -p ~/.config/dex
-cp config.sample.yaml ~/.config/dex/config.yaml
+export OPENAI_API_KEY=sk-...                    # the only required setting
+# OpenCode Zen instead of api.openai.com:
+export OPENAI_BASE_URL=https://opencode.ai/zen/v1
+# which talks completions for some models:
+export DEX_MODEL_APIS=kimi-k2.6=openai-completions
+dex
 ```
 
-`config.yaml` fields:
+The model carries its own wire protocol: `/model` switches it automatically
+(e.g. `kimi-k2.6` speaks `openai-completions` while `gpt-5.6-luna` speaks
+`openai-responses` on the same provider), resolved from `DEX_MODEL_APIS` by bare
+id or full `endpoint/id` selection (full selection wins). `OPENAI_API` pins one
+protocol for everything when set.
 
-| Field            | Type     | Description                                                        |
-| ---------------- | -------- | ------------------------------------------------------------------ |
-| `provider`       | string   | `opencode` or `openai-codex`.                                      |
-| `api_key`        | string   | Default API key (overridable by `OPENAI_API_KEY`).                 |
-| `base_url`       | string   | Default API base URL (overridable by `OPENAI_BASE_URL`).           |
-| `model`          | string   | Static model selection (overridable by `OPENAI_MODEL`).            |
-| `models`         | string[] | Pin the models shown by `/model` autocomplete. When unset, dex fetches the provider's live model list from `/models` (also configurable via `DEX_MODELS`, comma-separated). |
-| `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
-| `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
-| `context_window` | integer  | Token context window used for compaction/status (overridable by `DEX_CONTEXT_WINDOW`). |
-| `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits (`max_tool_iterations` default 25, pi p95 ~8). |
-| `http_connect_timeout_secs` / `http_request_timeout_secs` | integer | HTTP connection and request limits. |
+For ChatGPT-backed Codex, first run `codex --login`, then:
 
-The `api` field follows the provider/model API distinction used by Pi and Codex. It defaults to `openai-responses`.
-
-For OpenCode, use its API key and endpoint. For ChatGPT-backed Codex, first run
-`codex --login`, then select the Codex provider:
-
-```yaml
-provider: openai-codex
-model: gpt-5.6-luna
-api: openai-responses  # or openai-completions
+```sh
+DEX_PROVIDER=openai-codex dex
 ```
 
-When `provider` is `openai-codex`, `dex` reads the current access token and
-account ID from `CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or
-`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`). Run `codex --login`
-again when the local token expires.
+`dex` reads the current access token and account ID from
+`CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or `$CODEX_HOME/auth.json`
+(default `~/.codex/auth.json`). Run `codex --login` again when the local token
+expires.
 
-A minimal example:
-
-```yaml
-api_key: sk-...
-base_url: https://opencode.ai/zen/v1
-model: gpt-5.6-luna
-api: openai-responses  # or openai-completions
-```
+If a legacy `~/.config/dex/config.yaml` exists, dex prints a warning and
+ignores it — translate its fields to the variables below and delete it.
 
 ## Usage
 
@@ -141,6 +121,15 @@ while intermediate output never enters the conversation:
 done
 ```
 
+### Model catalog
+
+`dex update --models` refreshes the cached model catalog (context windows
+and `/model` autocomplete; like `pi update --models`).
+
+```sh
+dex update --models
+```
+
 ### Client–server mode
 
 The TUI is a pure HTTP client; all agent work (LLM calls, tools, sessions)
@@ -165,7 +154,7 @@ The TUI behaves exactly like the local one: assistant text streams live,
 tool calls and results appear as they happen, tool approvals pop up as an
 overlay (the daemon parks the turn until you decide), and Ctrl+C/Esc cancels
 the in-flight turn. API keys, the model, and the permission mode are
-resolved by the daemon's own environment/config file; client flags like
+resolved by the daemon's own environment; client flags like
 `--model` and `--permission` are forwarded as per-request overrides.
 
 Note that tools execute on the machine where the daemon runs, confined to
@@ -180,16 +169,19 @@ the daemon's working directory.
 | `-s`, `--session <path>` | Open/continue a specific session file.             |
 | `--no-session`     | Disable session persistence for this run.                |
 | `-n`, `--new`      | Start a new session (the default).                       |
-| `--permission <mode>` | Tool permissions: `read-only`, `ask-writes`, `ask-shell`, or `trusted`. |
+| `--permission <mode>` | Tool permissions: `read-only`, `ask-writes`, `ask-shell`, or `trusted` (default `trusted`). |
+| `--name <name>`    | Name the session.                                    |
+| `--reattach <id>`  | Attach to an existing daemon session and replay its event journal. |
 | `--skill <dir>`    | Add an extra skill directory to discover skills from.    |
 | `--tool`           | Run raw JSON tool mode (read JSON lines from stdin).     |
 
-Tool safety defaults to `ask-writes`. Paths are confined to the current
+Tool safety defaults to `trusted` (no approval popups). Set `DEX_PERMISSION=ask-writes`
+or pass `--permission` to approve writes and shell commands. Paths are confined to the current
 workspace; `bash` can execute arbitrary commands in that workspace and should
 only be enabled in trusted environments. Shell commands default to 120
 seconds and 1 MiB per output stream. HTTP requests default to 10 seconds to
-connect and 300 seconds overall. Sessions journal to `$XDG_DATA_HOME/dex/sessions/*.jsonl` with `fsync` only on `turn_*`/`effect_*` (set `DEX_DURABLE=1` for per-line). Audit to `audit.jsonl` is off by default (`DEX_AUDIT=1` to enable). Configure limits with `DEX_TOOL_*`, `DEX_HTTP_*`, and
-`DEX_MAX_*` environment variables or the corresponding JSON config fields.
+connect and 300 seconds overall. Sessions journal to `$XDG_DATA_HOME/dex/sessions/*.jsonl` with `fsync` only on `turn_*`/`effect_*` (set `DEX_DURABLE=1` for per-line). Audit to `audit.jsonl` is off by default (`DEX_AUDIT=1` to enable). Configure limits with `DEX_TOOL_*` and `DEX_HTTP_*` environment variables
+(see table below).
 
 In the interactive TUI, actions requiring approval open a dedicated overlay.
 Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`,
@@ -202,14 +194,17 @@ Any other arguments are treated as a one-shot prompt.
 | Command             | Description                                          |
 | ------------------- | ---------------------------------------------------- |
 | `/quit`             | Exit the REPL.                                       |
+| `/permissions`      | Show permission mode and workspace.                  |
 | `/clear`            | Clear the conversation history (keeps the system prompt). |
 | `/new`              | Start a new session and clear history.               |
 | `/session`          | Show the current session id, path, and turn count.   |
 | `/resume [index|path]` | List sessions, or resume one by index/path.       |
 | `/name <name>`      | Rename the current session.                          |
 | `/skill:<name>`     | Load a skill's full content into the conversation.    |
-| `/model`           | Show the current model.                               |
+| `/model`           | Show the current model and wire protocol.            |
 | `/model <name>`     | Switch the model for the rest of the session.         |
+| `/waive <reason>`   | Waive verification with a reason.                    |
+| `/undo`             | Undo the last recorded file change.                  |
 | `/provider`        | Show the current and available providers.             |
 | `/provider <name>` | Switch provider for the rest of the session.          |
 | `/help` (unknown)   | Unknown commands print a hint.                        |
@@ -222,6 +217,7 @@ Any other arguments are treated as a one-shot prompt.
 - **Enter while working** — queue a steering message for the next model boundary.
 - **Alt+Enter while working** — queue a follow-up for after the current task.
 - **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages.
+- **Ctrl+T** — expand/collapse the full thinking block.
 - **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the transcript.
 - **Paste** — pasted text is inserted at the cursor.
 - **Mouse drag** — selects text natively for copying; the TUI does not capture the mouse.
@@ -293,32 +289,34 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 
 | Variable             | Description                                              |
 | -------------------- | -------------------------------------------------------- |
-| `OPENAI_API_KEY`     | API key (takes precedence over the config file).          |
-| `OPENAI_BASE_URL`    | API base URL override (non-empty).                       |
-| `OPENAI_MODEL`       | Model override.                                          |
-| `OPENAI_API`         | Wire protocol override (`openai-completions` or `openai-responses`). |
-| `DEX_PROVIDER`        | Provider override (`opencode` or `openai-codex`).          |
+| `OPENAI_API_KEY`     | API key (required for `opencode`; export it in your shell profile). |
+| `OPENAI_BASE_URL`    | API base URL (default `https://api.openai.com/v1`; e.g. `https://opencode.ai/zen/v1`). |
+| `OPENAI_MODEL`       | Model selection (default `gpt-5.6-luna`).                |
+| `OPENAI_API`         | Wire protocol default (`openai-completions` or `openai-responses`); pins one protocol for everything. |
+| `DEX_PROVIDER`        | Provider selection (`opencode` or `openai-codex`, default `opencode`). |
 | `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |
 | `CODEX_ACCOUNT_ID`   | Account ID paired with `CODEX_ACCESS_TOKEN`.               |
+| `DEX_MODELS` | Comma-separated models for `/model` autocomplete (default: catalog cache). |
+| `DEX_HTTP_CONNECT_TIMEOUT_SECS` | HTTP connect timeout (default 10). |
+| `DEX_HTTP_REQUEST_TIMEOUT_SECS` | HTTP per-read timeout (default 300; streaming-safe). |
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
-| `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
-| `DEX_CONFIG`    | Explicit path to the config file.                        |
+| `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
+| `DEX_THINKING_EFFORT` | Reasoning effort passed to the API (e.g. `medium`). |
+| `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`). |
 | `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
-| `DEX_GIT_CONTEXT` | `1` to inject `git status/diff --stat` per turn (off by default). |
-| `DEX_WRAPUP_NUDGE` | `1` to inject wrap-up nudge at 5 iterations remaining. |
-| `DEX_STUCK_DETECT` | `1` to enable stuck detection (identical failures / repeated edits). |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
-| `DEX_TAB_WIDTH` | Override tab width (1-16) for `read` line numbers.       |
 | `DEX_COST_PER_1K` | Prompt cost per 1k tok for `trace.jsonl` (default `0.002`). |
-| `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap (default 25, was 60). |
+| `DEX_CONTEXT_WINDOW` | Override model context window (pi: per-model from catalog, e.g. gpt-5.6 1050000, claude 200k, muse 1048576). |
+| `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384, pi: `compaction.reserveTokens`). |
+| `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000, pi: `compaction.keepRecentTokens`). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
 
-Restore strict harness: `DEX_DURABLE=1 DEX_AUDIT=1 DEX_EXTRA_TOOLS=1 DEX_GIT_CONTEXT=1 DEX_VERIFY=1 DEX_STUCK_DETECT=1 DEX_WRAPUP_NUDGE=1 DEX_COMPACTION_LLM=1 dex`
+Restore strict harness: `DEX_DURABLE=1 DEX_AUDIT=1 DEX_EXTRA_TOOLS=1 DEX_VERIFY=1 DEX_COMPACTION_LLM=1 dex`
 
 ## Project structure
 
@@ -330,7 +328,6 @@ dex/
 ├── Cargo.lock
 ├── Cargo.toml
 ├── README.md
-├── config.sample.yaml
 └── src/
     ├── main.rs           # entry point: mode resolution, daemon bootstrap
     ├── cli.rs            # argument parsing / invocation mode
@@ -350,8 +347,7 @@ dex/
 
 A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
 model with tools enabled, executes any requested tool calls in parallel ( `write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
-results back, and compacts history deterministically once the message count or estimated token
-budget is exceeded. Optional `DEX_WRAPUP_NUDGE`/`DEX_STUCK_DETECT`/`DEX_VERIFY` hooks and `git` context are off by default for pi-fast latency. Progress is reported through a `Console` (streamed lines + approval
+results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (pi: `reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default for pi-fast latency. Progress is reported through a `Console` (streamed lines + approval
 requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and
