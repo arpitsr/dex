@@ -434,6 +434,7 @@ pub(crate) fn summarize_old_messages(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+                    ..Default::default()
         },
         ChatMessage {
             role: "user".to_string(),
@@ -441,6 +442,7 @@ pub(crate) fn summarize_old_messages(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+                    ..Default::default()
         },
     ];
     // Dead-drop sink: with sink=None, StreamPrinter prints streamed deltas
@@ -739,6 +741,7 @@ pub(crate) fn compact_history(
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                                    ..Default::default()
                 },
                 ChatMessage {
                     role: "user".to_string(),
@@ -749,6 +752,7 @@ pub(crate) fn compact_history(
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                                    ..Default::default()
                 },
             ];
             let (sink, rx) = mpsc::channel();
@@ -794,6 +798,7 @@ pub(crate) fn compact_history(
         tool_calls: None,
         tool_call_id: None,
         name: Some("summary".to_string()),
+        ..Default::default()
     };
     // If boundary_start !=1, we keep system (0) and summary subsumes previous summary,
     // so splice from boundary_start..first_kept, but keep earlier summary? Pi's new summary subsumes previous,
@@ -816,6 +821,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            ..Default::default()
         }
     }
 
@@ -842,6 +848,7 @@ mod tests {
             tool_calls: Some(vec![call]),
             tool_call_id: None,
             name: None,
+            ..Default::default()
         });
         for i in 0..KEEP_RECENT_MESSAGES - 1 {
             messages.push(ChatMessage {
@@ -850,6 +857,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some(format!("c1-{i}")),
                 name: None,
+                ..Default::default()
             });
         }
         let cutoff = find_cutoff(&messages).expect("should have a cutoff");
@@ -898,6 +906,7 @@ mod tests {
                 tool_calls: Some(vec![call]),
                 tool_call_id: None,
                 name: None,
+                ..Default::default()
             },
         ];
         // 5 content chars + 30 tool-call chars + framing, /4 + overhead.
@@ -932,6 +941,7 @@ mod tests {
             tool_calls: Some(vec![call]),
             tool_call_id: None,
             name: None,
+            ..Default::default()
         });
         for i in 0..KEEP_RECENT_MESSAGES {
             messages.push(ChatMessage {
@@ -940,6 +950,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some(format!("c1-{i}")),
                 name: None,
+                ..Default::default()
             });
         }
         let cutoff = find_cutoff(&messages).expect("should have cutoff");
