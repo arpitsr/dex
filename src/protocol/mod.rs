@@ -252,15 +252,37 @@ mod tests {
         let events = vec![
             StreamEvent::AssistantText("hello".into()),
             StreamEvent::Thinking("step".into()),
-            StreamEvent::ToolCall { name: "read".into(), args: serde_json::json!({"path":"a.rs"}) },
-            StreamEvent::ToolResult { name: "read".into(), summary: "ok".into(), success: true, preview: vec!["line".into()], duration: 0.1 },
-            StreamEvent::TurnComplete { response: "done".into(), usage: Some(42), cached: None },
-            StreamEvent::TurnFailed { error: "oops".into() },
+            StreamEvent::ToolCall {
+                name: "read".into(),
+                args: serde_json::json!({"path":"a.rs"}),
+            },
+            StreamEvent::ToolResult {
+                name: "read".into(),
+                summary: "ok".into(),
+                success: true,
+                preview: vec!["line".into()],
+                duration: 0.1,
+            },
+            StreamEvent::TurnComplete {
+                response: "done".into(),
+                usage: Some(42),
+                cached: None,
+            },
+            StreamEvent::TurnFailed {
+                error: "oops".into(),
+            },
             StreamEvent::System("sys".into()),
             StreamEvent::Error("err".into()),
-            StreamEvent::Usage { tokens: 10, cached: Some(2) },
-            StreamEvent::SteeringAccepted { content: "steer".into() },
-            StreamEvent::FollowupAccepted { content: "follow".into() },
+            StreamEvent::Usage {
+                tokens: 10,
+                cached: Some(2),
+            },
+            StreamEvent::SteeringAccepted {
+                content: "steer".into(),
+            },
+            StreamEvent::FollowupAccepted {
+                content: "follow".into(),
+            },
         ];
         for ev in events {
             let json = serde_json::to_string(&ev).unwrap();
@@ -272,7 +294,10 @@ mod tests {
 
     #[test]
     fn stream_envelope_preserves_seq() {
-        let env = StreamEnvelope { seq: 99, event: StreamEvent::System("hi".into()) };
+        let env = StreamEnvelope {
+            seq: 99,
+            event: StreamEvent::System("hi".into()),
+        };
         let json = serde_json::to_string(&env).unwrap();
         let back: StreamEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.seq, 99);
@@ -280,9 +305,18 @@ mod tests {
 
     #[test]
     fn approval_decision_snake_case() {
-        assert_eq!(serde_json::to_string(&ApprovalDecision::AllowOnce).unwrap(), "\"allow_once\"");
-        assert_eq!(serde_json::to_string(&ApprovalDecision::AllowSession).unwrap(), "\"allow_session\"");
-        assert_eq!(serde_json::to_string(&ApprovalDecision::Deny).unwrap(), "\"deny\"");
+        assert_eq!(
+            serde_json::to_string(&ApprovalDecision::AllowOnce).unwrap(),
+            "\"allow_once\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApprovalDecision::AllowSession).unwrap(),
+            "\"allow_session\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApprovalDecision::Deny).unwrap(),
+            "\"deny\""
+        );
     }
 
     #[test]
@@ -300,7 +334,11 @@ mod tests {
             steps: vec![("s".into(), false)],
             constraints: vec!["c".into()],
             acceptance: vec![],
-            budget: Some(crate::core::types::Budget { max_seconds: Some(60), max_tool_iterations: None, max_cost_usd: None }),
+            budget: Some(crate::core::types::Budget {
+                max_seconds: Some(60),
+                max_tool_iterations: None,
+                max_cost_usd: None,
+            }),
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("budget"));

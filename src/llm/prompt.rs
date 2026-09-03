@@ -79,8 +79,17 @@ mod tests {
     fn base_prompt_does_not_duplicate_tool_schema_detail() {
         // Pagination/chain/stitching guidance lives in tool descriptions, not here.
         let base = system_prompt(&[]);
-        for needle in ["offset/limit", "from/take", "`chain`", "$DEX_BIN", "output_mode"] {
-            assert!(!base.contains(needle), "tool-schema detail leaked: {needle}");
+        for needle in [
+            "offset/limit",
+            "from/take",
+            "`chain`",
+            "$DEX_BIN",
+            "output_mode",
+        ] {
+            assert!(
+                !base.contains(needle),
+                "tool-schema detail leaked: {needle}"
+            );
         }
     }
 }

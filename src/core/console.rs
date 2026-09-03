@@ -252,6 +252,17 @@ impl Console {
         }
     }
 
+    /// Seed the per-console session-approval set from the daemon's
+    /// persisted map (so “allow for session” survives across turns).
+    pub(crate) fn seed_session_approvals(&self, set: std::collections::HashSet<String>) {
+        let mut guard = self
+            .session_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get_or_insert_with(std::collections::HashSet::new);
+        entry.extend(set);
+    }
+
     pub(crate) fn sink(&self) -> Option<&mpsc::Sender<SinkLine>> {
         self.sink.as_ref()
     }
@@ -306,7 +317,6 @@ impl Console {
             .insert(key);
     }
 }
-
 
 /// Erase the drawn spinner frame, if any. Caller holds CONSOLE_LOCK.
 pub(crate) fn erase_spinner_frame() {
