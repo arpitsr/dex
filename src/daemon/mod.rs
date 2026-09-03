@@ -58,6 +58,10 @@ pub(crate) struct DaemonState {
     pub event_seqs: Mutex<HashMap<String, u64>>,
     /// `Idempotency-Key` → completed turn, for 60s dedup (P10).
     pub idempotency: Mutex<HashMap<String, IdempotentTurn>>,
+    /// Persisted “allow for session” approvals, keyed by `name:hash` (same
+    /// scope as `Console::approval_key`). Lives on the daemon so a decision
+    /// survives across turns; previously `Console` was per-turn and lost it.
+    pub session_approvals: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 /// 60-second window during which an `Idempotency-Key` replays its recorded
@@ -82,7 +86,31 @@ impl DaemonState {
             followup_txs: Mutex::new(HashMap::new()),
             event_seqs: Mutex::new(HashMap::new()),
             idempotency: Mutex::new(HashMap::new()),
+            session_approvals: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[allow(dead_code)]
+    /// Scoped “allow for session” check — mirrors `Console::approval_key`
+    /// so daemon and console agree on scope. `write`/`edit` → path, `bash` →
+    /// command, else full input hash.
+    pub(crate) fn is_session_approved(&self, session_id: &str, name: &str, input: &str) -> bool {
+        let key = crate::core::console::Console::approval_key(name, input);
+        self.session_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .is_some_and(|set| set.contains(&key))
+    }
+
+    pub(crate) fn record_session_approval(&self, session_id: &str, name: &str, input: &str) {
+        let key = crate::core::console::Console::approval_key(name, input);
+        self.session_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(key);
     }
 
     /// Check for a replayable turn under `Idempotency-Key`. Falls through
@@ -225,7 +253,9 @@ mod tests {
     #[test]
     fn event_seq_is_seeded_from_disk_after_restart() {
         // Touches the shared sessions dir; serialize against env-redirecting tests.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Simulate a prior run: a session with events already journaled.
         let mut s = crate::session::Session::new("/tmp/dex-seq-test".into(), None).unwrap();
         s.append_event(0, "{\"type\":\"system\",\"data\":\"x\"}")
@@ -244,7 +274,9 @@ mod tests {
     fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
         // Depends on where the sessions dir resolves; serialize against tests
         // that redirect XDG_DATA_HOME.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A session killed mid-turn: turn_start with no terminal entry.
         let mut s = crate::session::Session::new("/tmp/dex-rebuild-test".into(), None).unwrap();
         let id = s.id().to_string();

@@ -40,18 +40,27 @@ mod tests {
         let prev_home = env::var_os("HOME");
 
         env::set_var("DEX_CONFIG", "/tmp/custom-dex-config.yaml");
-        assert_eq!(path().unwrap(), PathBuf::from("/tmp/custom-dex-config.yaml"));
+        assert_eq!(
+            path().unwrap(),
+            PathBuf::from("/tmp/custom-dex-config.yaml")
+        );
 
         env::remove_var("DEX_CONFIG");
         env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test");
         // nothing exists -> new default location
-        assert_eq!(path().unwrap(), PathBuf::from("/tmp/xdg-test/dex/config.yaml"));
+        assert_eq!(
+            path().unwrap(),
+            PathBuf::from("/tmp/xdg-test/dex/config.yaml")
+        );
 
         // legacy JSON and ak/ locations are still found, in precedence order
         env::set_var("HOME", "/tmp/fakehome");
         std::fs::create_dir_all("/tmp/xdg-test/ak").unwrap();
         std::fs::write("/tmp/xdg-test/ak/config.json", "{}").unwrap();
-        assert_eq!(path().unwrap(), PathBuf::from("/tmp/xdg-test/ak/config.json"));
+        assert_eq!(
+            path().unwrap(),
+            PathBuf::from("/tmp/xdg-test/ak/config.json")
+        );
         let _ = std::fs::remove_dir_all("/tmp/xdg-test");
 
         env::remove_var("XDG_CONFIG_HOME");

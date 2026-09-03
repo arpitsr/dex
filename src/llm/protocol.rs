@@ -318,7 +318,10 @@ mod tests {
     fn tools_schema_contains_all_tools() {
         let schema = tools_schema();
         let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
-        assert_eq!(names, ["read", "bash", "write", "edit", "ffgrep", "fffind", "git", "chain"]);
+        assert_eq!(
+            names,
+            ["read", "bash", "write", "edit", "ffgrep", "fffind", "git", "chain"]
+        );
     }
 
     #[test]
@@ -368,7 +371,10 @@ mod tests {
             tool_calls: Some(vec![LlmToolCall {
                 id: "c1".into(),
                 call_type: "function".into(),
-                function: FunctionCall { name: "read".into(), arguments: "{}".into() },
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
             }]),
             tool_call_id: None,
             name: None,
@@ -385,15 +391,25 @@ mod tests {
         let mut calls = vec![LlmToolCall {
             id: "a".into(),
             call_type: "function".into(),
-            function: FunctionCall { name: "old".into(), arguments: String::new() },
+            function: FunctionCall {
+                name: "old".into(),
+                arguments: String::new(),
+            },
         }];
         // Resolve existing id to index 0 even when suggested index is 5.
         let idx = response_call_index(&calls, 5, &json!({"call_id":"a"}));
         assert_eq!(idx, 0);
         // Unknown id falls back to suggested index.
-        assert_eq!(response_call_index(&calls, 5, &json!({"call_id":"miss"})), 5);
+        assert_eq!(
+            response_call_index(&calls, 5, &json!({"call_id":"miss"})),
+            5
+        );
         // Append a new call via response_tool_call.
-        response_tool_call(&mut calls, 1, &json!({"call_id":"b","name":"write","arguments":"{}"}));
+        response_tool_call(
+            &mut calls,
+            1,
+            &json!({"call_id":"b","name":"write","arguments":"{}"}),
+        );
         assert_eq!(calls[1].id, "b");
         assert_eq!(calls[1].function.name, "write");
     }
