@@ -69,6 +69,9 @@ pub(crate) struct ToolState {
     /// TUI process (in-memory only, resets on restart). The status bar shows
     /// `last_usage` as live context utilization and this as the spend figure.
     pub(crate) total_usage: u64,
+    /// Session-cumulative completion (output) tokens across every LLM call,
+    /// fed by the same `Usage` events as `total_usage`. In-memory only.
+    pub(crate) total_output: u64,
     /// Session-cumulative cost in USD, mirroring pi's `usageTotals.cost`.
     /// Accumulated per `Usage` event from provider pricing (catalog) or
     /// `DEX_COST_PER_1K` fallback. In-memory only, like `total_usage`.

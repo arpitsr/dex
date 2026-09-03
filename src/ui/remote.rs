@@ -431,24 +431,24 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             }
             remote.app.tool_state.last_cached = cached;
         }
-        StreamEvent::Usage { tokens, cached } => {
+        StreamEvent::Usage {
+            tokens,
+            cached,
+            cost,
+            output,
+        } => {
             // Live context usage: emitted by the daemon after every LLM call
             // so the status bar updates mid-turn, not just at completion.
             remote.app.tool_state.last_usage = Some(tokens);
             remote.app.tool_state.last_cached = cached;
-            // Cumulative spend across turns. TurnComplete.usage repeats the
-            // final call's count, so only Usage events accumulate.
+            // Cumulative spend across turns, priced once daemon-side
+            // (catalog or DEX_COST_PER_1K) so client and daemon agree.
+            // TurnComplete.usage repeats the final call's count, so only
+            // Usage events accumulate.
             remote.app.tool_state.total_usage =
                 remote.app.tool_state.total_usage.saturating_add(tokens);
-            let cost =
-                crate::llm::config::cost_for_prompt(&remote.app.config.model, tokens, cached)
-                    .unwrap_or_else(|| {
-                        let rate = std::env::var("DEX_COST_PER_1K")
-                            .ok()
-                            .and_then(|v| v.parse::<f64>().ok())
-                            .unwrap_or(0.002);
-                        tokens as f64 * rate / 1000.0
-                    });
+            remote.app.tool_state.total_output =
+                remote.app.tool_state.total_output.saturating_add(output);
             remote.app.tool_state.total_cost += cost;
         }
         StreamEvent::TurnFailed { error } => {
