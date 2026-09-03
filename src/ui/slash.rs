@@ -457,7 +457,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             let m = line["/model ".len()..].trim().to_string();
             if !m.is_empty() {
                 let old_provider = app.config.provider;
-                let endpoint = app.config.apply_model(&m);
+                let endpoint = app.config.apply_model(&m, true);
                 if !app
                     .config
                     .available_models
@@ -511,7 +511,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                         format!("provider already selected: {}", provider.name()),
                     );
                 }
-                Ok(provider) => match app.config.switch_provider(provider) {
+                Ok(provider) => match app.config.switch_provider(provider, true) {
                     Ok(()) => {
                         let _ = app.session.set_state("provider", provider.name());
                         push_info(app, format!("switched to provider: {}", provider.name()));
@@ -544,7 +544,7 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
     if let Some(name) = state.get("provider") {
         match Provider::parse(name) {
             Ok(provider) if provider != app.config.provider => {
-                match app.config.switch_provider(provider) {
+                match app.config.switch_provider(provider, false) {
                     Ok(()) => push_info(app, format!("restored provider: {}", provider.name())),
                     Err(error) => push_info(
                         app,
@@ -557,7 +557,7 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
     }
     if let Some(model) = state.get("model") {
         if app.config.model != *model {
-            let endpoint = app.config.apply_model(model);
+            let endpoint = app.config.apply_model(model, false);
             if !app
                 .config
                 .available_models

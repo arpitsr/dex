@@ -151,6 +151,16 @@ fn post_with_retry(
                 continue;
             }
             provider_log("api_error", &format!("{}: {}", status, body_text));
+            // Opaque 5xx from `/responses` usually means the model only speaks
+            // chat-completions (proven for e.g. glm-5.3-flash on zen/go) —
+            // point at the per-model override instead of a bare body.
+            if url.ends_with("/responses") && env::var("OPENAI_API").is_err() {
+                return Err(format!(
+                    "API error: {} (hint: {} may speak openai-completions; set DEX_MODEL_APIS={}=openai-completions)",
+                    body_text, config.model, config.model
+                )
+                .into());
+            }
             return Err(format!("API error: {}", body_text).into());
         }
 
