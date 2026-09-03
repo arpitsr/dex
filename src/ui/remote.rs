@@ -75,9 +75,6 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         reserve_tokens: 16_384,
         keep_recent_tokens: 20_000,
         permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::AskWrites),
-        max_tool_iterations: 0,
-        max_prompt_tokens: 0,
-        max_turn_seconds: 0,
         verify_command: None,
         client: reqwest::blocking::Client::new(),
     }
@@ -441,6 +438,16 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             // final call's count, so only Usage events accumulate.
             remote.app.tool_state.total_usage =
                 remote.app.tool_state.total_usage.saturating_add(tokens);
+            let cost =
+                crate::llm::config::cost_for_prompt(&remote.app.config.model, tokens, cached)
+                    .unwrap_or_else(|| {
+                        let rate = std::env::var("DEX_COST_PER_1K")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.002);
+                        tokens as f64 * rate / 1000.0
+                    });
+            remote.app.tool_state.total_cost += cost;
         }
         StreamEvent::TurnFailed { error } => {
             append_sink_line(&mut remote.app, SinkLine::Error(error));
@@ -456,14 +463,12 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             steps,
             constraints,
             acceptance,
-            budget,
         } => {
             remote.app.plan = crate::core::types::Plan {
                 goal,
                 steps,
                 constraints,
                 acceptance,
-                budget,
             };
         }
     }
@@ -854,7 +859,13 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 complete_slash(app);
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // Single Enter both completes the highlighted suggestion
+                // and submits. The old two-step (complete → second Enter)
+                // made `/resume` feel broken — selecting 0 left an empty
+                // transcript until the next Enter.
                 complete_slash(app);
+                let is_followup = key.modifiers.contains(KeyModifiers::ALT);
+                submit_prompt(remote, is_followup);
             }
             _ => app.input.handle_key(key),
         },
@@ -1082,7 +1093,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
         "/help" => {
             push_info(
                 &mut remote.app,
-                "commands: /quit /clear /new /session /undo /waive <reason> /permissions /model [<m>] /skill:<name> /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear] /budget [<seconds> <iterations>]"
+                "commands: /quit /clear /new /session /undo /waive <reason> /permissions /model [<m>] /skill:<name> /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear]"
                     .to_string(),
             );
             push_info(
@@ -1184,12 +1195,221 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     .to_string(),
             );
         }
-        l if l.starts_with("/resume") => {
-            push_info(
-                &mut remote.app,
-                "sessions persist on the daemon; resume with `dex connect <url> --reattach <session_id>` (see /session for the id)"
-                    .to_string(),
-            );
+        "/resume" => {
+            // Prefer daemon listing (works over network); fall back to local files for offline.
+            let daemon_sessions = remote.client.list_sessions().ok();
+            if let Some(mut sessions) = daemon_sessions {
+                sessions.retain(|s| {
+                    s.cwd == remote.app.cwd
+                        && s.session_id != remote.session_id
+                        && s.message_count > 0
+                });
+                if sessions.is_empty() {
+                    push_info(&mut remote.app, "no sessions found.".to_string());
+                } else {
+                    push_info(&mut remote.app, "sessions:".to_string());
+                    for (i, s) in sessions.iter().enumerate() {
+                        let name = s.name.as_deref().unwrap_or("(unnamed)");
+                        push_info(
+                            &mut remote.app,
+                            format!("  {}: {} ({})", i, name, s.session_id),
+                        );
+                    }
+                    push_info(
+                        &mut remote.app,
+                        "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
+                    );
+                }
+            } else {
+                let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
+                let filtered: Vec<_> = sessions
+                    .into_iter()
+                    .filter(|(path, header)| {
+                        if header.id() == remote.app.session.id() {
+                            return false;
+                        }
+                        matches!(
+                            crate::session::load_messages_from_session(path),
+                            Ok(msgs) if !msgs.is_empty()
+                        )
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    push_info(&mut remote.app, "no sessions found.".to_string());
+                } else {
+                    push_info(&mut remote.app, "sessions:".to_string());
+                    for (i, (path, header)) in filtered.iter().enumerate() {
+                        let name = header.name().unwrap_or("(unnamed)");
+                        push_info(
+                            &mut remote.app,
+                            format!("  {}: {} ({})", i, name, path.display()),
+                        );
+                    }
+                    push_info(
+                        &mut remote.app,
+                        "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
+                    );
+                }
+            }
+        }
+        _ if line.starts_with("/resume ") => {
+            let selector = line["/resume ".len()..].trim().to_string();
+            // Resolve selector to a daemon session_id: index or id prefix.
+            // Filter the same way as the listing so indices line up.
+            let sid = remote
+                .client
+                .list_sessions()
+                .ok()
+                .and_then(|mut sessions| {
+                    sessions.retain(|s| {
+                        s.cwd == remote.app.cwd
+                            && s.session_id != remote.session_id
+                            && s.message_count > 0
+                    });
+                    if let Ok(idx) = selector.parse::<usize>() {
+                        return sessions.get(idx).map(|s| s.session_id.clone());
+                    }
+                    // prefix or exact id/name match
+                    let q = selector.to_ascii_lowercase();
+                    sessions
+                        .iter()
+                        .find(|s| {
+                            s.session_id.to_ascii_lowercase().starts_with(&q)
+                                || s.name
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase()
+                                    .contains(&q)
+                        })
+                        .map(|s| s.session_id.clone())
+                })
+                .or_else(|| {
+                    let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
+                    let filtered: Vec<_> = sessions
+                        .into_iter()
+                        .filter(|(path, header)| {
+                            if header.id() == remote.app.session.id() {
+                                return false;
+                            }
+                            matches!(
+                                crate::session::load_messages_from_session(path),
+                                Ok(msgs) if !msgs.is_empty()
+                            )
+                        })
+                        .collect();
+                    if let Ok(idx) = selector.parse::<usize>() {
+                        return filtered.get(idx).map(|(p, _)| {
+                            // Resolve id from file header for local fallback.
+                            crate::session::Session::from_path(p)
+                                .map(|s| s.id().to_string())
+                                .unwrap_or_default()
+                        });
+                    }
+                    let q = selector.to_ascii_lowercase();
+                    filtered
+                        .iter()
+                        .find(|(p, h)| {
+                            h.id().to_ascii_lowercase().starts_with(&q)
+                                || h.name().unwrap_or("").to_ascii_lowercase().contains(&q)
+                                || p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase()
+                                    .starts_with(&q)
+                        })
+                        .and_then(|(p, _)| crate::session::Session::from_path(p).ok())
+                        .map(|s| s.id().to_string())
+                });
+            let Some(sid) = sid else {
+                push_info(
+                    &mut remote.app,
+                    format!("could not resume session: {selector} not found"),
+                );
+                return false;
+            };
+            // Try to keep local Session in sync when files are shared.
+            let local_path = Session::resume(&remote.app.cwd, &sid)
+                .ok()
+                .and_then(|s| s.path().map(|p| p.to_path_buf()))
+                .or_else(|| {
+                    Session::resume(&remote.app.cwd, &selector)
+                        .ok()
+                        .and_then(|s| s.path().map(|p| p.to_path_buf()))
+                });
+            remote.app.transcript.clear();
+            remote.app.transcript_version = remote.app.transcript_version.wrapping_add(1);
+            remote.app.assistant_open = false;
+            remote.app.active_tool = None;
+            match remote.client.reattach(&sid) {
+                Ok(resp) => {
+                    remote.session_id = resp.session_id.clone();
+                    if let Some(p) = local_path.as_deref() {
+                        if let Ok(s) = Session::from_path(p) {
+                            remote.app.session = s;
+                        }
+                    }
+                    let mut since = 0u64;
+                    let mut batches = 0;
+                    loop {
+                        match remote.client.events(&remote.session_id, since) {
+                            Ok(resp) => {
+                                if resp.events.is_empty() {
+                                    break;
+                                }
+                                for env in resp.events {
+                                    if !matches!(env.event, StreamEvent::ApprovalRequired { .. }) {
+                                        handle_stream_event(remote, env.event);
+                                    }
+                                }
+                                since = resp.next_seq;
+                                batches += 1;
+                                if batches > 10_000 {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                push_info(&mut remote.app, format!("replay failed: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                    // Fallback when the events journal is missing/empty
+                    // (old sessions, or journal not yet flushed): rebuild
+                    // from the JSONL messages so the terminal isn't blank.
+                    if remote.app.transcript.is_empty() {
+                        if let Some(p) = local_path.as_deref().or(remote.app.session.path()) {
+                            if let Ok(loaded) = crate::session::load_messages_from_session(p) {
+                                if !loaded.is_empty() {
+                                    let system = remote.app.messages.first().cloned().unwrap_or(
+                                        crate::core::types::ChatMessage {
+                                            role: "system".into(),
+                                            content: Some(String::new()),
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                            name: None,
+                                        },
+                                    );
+                                    remote.app.messages.clear();
+                                    remote.app.messages.push(system);
+                                    remote.app.messages.extend(loaded);
+                                    super::rebuild_transcript(&mut remote.app);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(p) = remote.app.session.path() {
+                        let plan = crate::session::load_plan(p);
+                        if !plan.is_empty() {
+                            remote.app.plan = plan;
+                        }
+                    }
+                    push_info(
+                        &mut remote.app,
+                        format!("resumed session: {}", remote.session_id),
+                    );
+                }
+                Err(e) => push_info(&mut remote.app, format!("could not reattach session: {e}")),
+            }
         }
         _ => {
             let had_model = remote.app.config.model.clone();

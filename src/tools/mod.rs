@@ -156,7 +156,14 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             permission: PermissionRequirement::Read,
         },
         // fff tools run in-process; only git shells out.
-        "ffgrep" | "fffind" => ToolMetadata {
+        "grep" | "ffgrep" | "find" | "fffind" => ToolMetadata {
+            read_only: true,
+            mutating: false,
+            idempotent: true,
+            requires_shell: false,
+            permission: PermissionRequirement::Read,
+        },
+        "ls" => ToolMetadata {
             read_only: true,
             mutating: false,
             idempotent: true,
@@ -515,16 +522,12 @@ fn read_file_numbered(
             path.display()
         )));
     }
-    let tab_width = detect_tab_width(path);
     let numbered: Vec<String> = lines
         .iter()
         .skip(offset - 1)
         .take(limit)
         .enumerate()
-        .map(|(index, line)| {
-            let expanded = expand_tabs(line, tab_width);
-            format!("{:>4}  {}", offset + index, expanded)
-        })
+        .map(|(index, line)| format!("{:>4}  {}", offset + index, line))
         .collect();
     let mut out = clamp_lines(&numbered.join("\n"), READ_MAX_LINES, READ_MAX_BYTES);
     let shown = numbered.len();
@@ -840,176 +843,33 @@ fn apply_edit(
     Ok((updated, note))
 }
 
-fn expand_tabs(line: &str, width: usize) -> String {
-    let width = width.clamp(1, 16);
-    if !line.contains('\t') {
-        return line.to_string();
+fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
+    let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let path = workspace_path(raw)?;
+    let meta = std::fs::metadata(&path).map_err(ToolError::Io)?;
+    if !meta.is_dir() {
+        return Ok(path.display().to_string());
     }
-    let mut out = String::with_capacity(line.len() + width);
-    let mut col: usize = 0;
-    for ch in line.chars() {
-        if ch == '\t' {
-            let spaces = width - (col % width);
-            out.push_str(&" ".repeat(spaces));
-            col += spaces;
-        } else {
-            // use display width for tabstop tracking (CJK etc.), but at
-            // tool layer we only need byte-column for indentation; unicode
-            // width keeps generic correctness for any file.
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            out.push(ch);
-            col += w;
-        }
-    }
-    out
-}
-
-fn detect_tab_width(path: &Path) -> usize {
-    if let Ok(raw) = env::var("DEX_TAB_WIDTH") {
-        if let Ok(v) = raw.parse::<usize>() {
-            if (1..=16).contains(&v) {
-                return v;
+    let mut entries: Vec<String> = std::fs::read_dir(&path)
+        .map_err(ToolError::Io)?
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                format!("{name}/")
+            } else {
+                name
             }
-        }
+        })
+        .collect();
+    entries.sort();
+    if entries.is_empty() {
+        return Ok("(empty)".to_string());
     }
-    // Cache per-extension + per-directory editorconfig result — pi never
-    // re-reads .editorconfig per file. Cache key is parent dir + extension.
-    {
-        use std::collections::HashMap;
-        use std::sync::{LazyLock, Mutex};
-        static CACHE: LazyLock<Mutex<HashMap<String, usize>>> =
-            LazyLock::new(|| Mutex::new(HashMap::new()));
-        let key = format!(
-            "{}:{}",
-            path.parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            path.extension().and_then(|e| e.to_str()).unwrap_or("")
-        );
-        if let Ok(cache) = CACHE.lock() {
-            if let Some(&v) = cache.get(&key) {
-                return v;
-            }
-        }
-        let v = editorconfig_tab_width(path).unwrap_or_else(|| language_tab_width(path));
-        if let Ok(mut cache) = CACHE.lock() {
-            cache.insert(key, v);
-        }
-        v
-    }
-}
-
-fn editorconfig_tab_width(path: &Path) -> Option<usize> {
-    let root = workspace_root().ok()?.canonicalize().ok()?;
-    let mut dir = path.parent()?.canonicalize().ok()?;
-    loop {
-        let cfg = dir.join(".editorconfig");
-        if let Ok(text) = fs::read_to_string(&cfg) {
-            // Minimal parser: last matching indent_size/tab_width wins.
-            // Handles `[*]`, `[*.rs]`, `[*.{js,ts}]` via simple substring/glob.
-            let file_name = path.file_name()?.to_string_lossy().to_string();
-            let ext = path.extension()?.to_string_lossy().to_string();
-            let mut best: Option<usize> = None;
-            let mut in_matching_section = true; // global pre-section
-            for raw_line in text.lines() {
-                let line = raw_line.trim();
-                if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-                    continue;
-                }
-                if line.starts_with('[') && line.ends_with(']') {
-                    let pat = line[1..line.len() - 1].trim().to_ascii_lowercase();
-                    // very small glob: * matches all, *.ext matches extension,
-                    // otherwise substring check
-                    in_matching_section = if pat == "*" || pat == "[*]" {
-                        true
-                    } else if pat.contains('*') {
-                        // crude: check extension or substring
-                        pat.contains(&ext.to_ascii_lowercase())
-                            || pat.contains(&file_name.to_ascii_lowercase())
-                    } else {
-                        file_name.eq_ignore_ascii_case(&pat)
-                    };
-                    continue;
-                }
-                if !in_matching_section {
-                    continue;
-                }
-                let lower = line.to_ascii_lowercase();
-                for key in ["tab_width", "indent_size", "tabwidth"] {
-                    if lower.starts_with(key) {
-                        if let Some(eq) = line.find('=') {
-                            let val = line[eq + 1..].trim();
-                            if let Ok(v) = val.parse::<usize>() {
-                                if (1..=16).contains(&v) {
-                                    best = Some(v);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(v) = best {
-                return Some(v);
-            }
-        }
-        if dir == root {
-            break;
-        }
-        let parent = dir.parent()?;
-        if !parent.starts_with(&root) && dir != root {
-            // also check one level above root for repo-level config
-            // then stop
-            if parent == root.parent().unwrap_or(Path::new("/")) {
-                break;
-            }
-        }
-        dir = parent.to_path_buf();
-        if dir.parent().is_none() {
-            break;
-        }
-    }
-    None
-}
-
-fn language_tab_width(path: &Path) -> usize {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
-        return 8;
-    }
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-    {
-        Some(ext) if matches!(ext.as_str(), "go") => 4, // gofmt uses tabs but 4 is readable; 8 is terminal-faithful, choose 4 for preview density like pi
-        Some(ext)
-            if matches!(
-                ext.as_str(),
-                "py" | "rs"
-                    | "js"
-                    | "ts"
-                    | "jsx"
-                    | "tsx"
-                    | "c"
-                    | "cpp"
-                    | "h"
-                    | "hpp"
-                    | "java"
-                    | "json"
-                    | "toml"
-                    | "yaml"
-                    | "yml"
-                    | "md"
-                    | "sh"
-                    | "bash"
-                    | "rb"
-                    | "php"
-            ) =>
-        {
-            4
-        }
-        _ => 4,
-    }
+    // Clamp to avoid flooding context; pi truncates similarly.
+    let limited = clamp_lines(&entries.join("\n"), 500, 32 * 1024);
+    Ok(limited)
 }
 
 fn tool_git(
@@ -1140,9 +1000,12 @@ fn run_chain_step(
             return Err(invalid("'from' routing requires the read tool".to_string()));
         }
         let (source_tool, source_output) = &completed[from];
-        if !matches!(source_tool.as_str(), "ffgrep" | "fffind" | "chain") {
+        if !matches!(
+            source_tool.as_str(),
+            "grep" | "ffgrep" | "find" | "fffind" | "chain"
+        ) {
             return Err(invalid(format!(
-                "'from' step {from} is '{source_tool}', which produces no file paths; use ffgrep (files mode) or fffind"
+                "'from' step {from} is '{source_tool}', which produces no file paths; use grep (files mode) or find"
             )));
         }
         let max_files = obj
@@ -1214,8 +1077,9 @@ pub(crate) fn execute(
         "bash" => tool_bash(args, cancel),
         "write" => tool_write(args),
         "edit" => tool_edit(args),
-        "ffgrep" => tool_ffgrep(args),
-        "fffind" => tool_fffind(args),
+        "grep" | "ffgrep" => tool_ffgrep(args),
+        "find" | "fffind" => tool_fffind(args),
+        "ls" => tool_ls(args),
         "git" => tool_git(args, cancel),
         "chain" => tool_chain(args, cancel),
         _ => unreachable!("metadata and dispatch must stay in sync"),

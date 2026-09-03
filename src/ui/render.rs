@@ -152,32 +152,9 @@ pub(super) fn compact_path(path: &str) -> String {
     path.to_string()
 }
 
-pub(super) fn plan_status(app: &App) -> Option<String> {
-    if app.plan.is_empty() {
-        return None;
-    }
-    let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
-    let total = app.plan.steps.len();
-    let mut parts = Vec::new();
-    if let Some(g) = &app.plan.goal {
-        let short = if g.len() > 40 {
-            format!("{}…", &g[..40])
-        } else {
-            g.clone()
-        };
-        parts.push(format!("Goal: {short}"));
-    }
-    if total > 0 {
-        parts.push(format!("Plan {done}/{total}"));
-    }
-    let a_done = app.plan.acceptance.iter().filter(|(_, d)| *d).count();
-    if !app.plan.acceptance.is_empty() {
-        parts.push(format!("✓ {a_done}/{}", app.plan.acceptance.len()));
-    }
-    if app.plan.is_complete() {
-        parts.push("complete".to_string());
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+pub(super) fn plan_status(_app: &App) -> Option<String> {
+    // pi has no plan mode — plans are files, not footer state
+    None
 }
 
 pub(super) fn ui_status(app: &App) -> String {
@@ -237,6 +214,11 @@ pub(super) fn ui_status(app: &App) -> String {
             " · {} total",
             format_tokens(app.tool_state.total_usage)
         ));
+    }
+    // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
+    // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
+    if app.tool_state.total_cost > 0.0005 {
+        base.push_str(&format!(" · ${:.3}", app.tool_state.total_cost));
     }
     if let Some(plan) = plan_status(app) {
         format!("{} · {}", base, plan)
@@ -1223,9 +1205,6 @@ mod tests {
                 reserve_tokens: 16_384,
                 keep_recent_tokens: 20_000,
                 permission: PermissionMode::Trusted,
-                max_tool_iterations: 60,
-                max_prompt_tokens: 128_000,
-                max_turn_seconds: 900,
                 verify_command: None,
                 client: reqwest::blocking::Client::new(),
             },

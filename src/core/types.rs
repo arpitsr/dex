@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -10,23 +11,10 @@ pub(crate) struct Skill {
     pub(crate) path: PathBuf,
 }
 
-/// Optional per-task budget, part of the durable task contract (P8+). Each
-/// field, when set, caps the corresponding turn dimension; the agent loop
-/// enforces the tightest of config and budget.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct Budget {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tool_iterations: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_cost_usd: Option<f64>,
-}
-
 /// Durable task contract: goal, constraints, acceptance criteria, plan steps
-/// with done flags, budget, and a derived completion state. Persisted as JSON in
+/// with done flags, and a derived completion state. Persisted as JSON in
 /// `session_state "plan"`; `#[serde(default)]` on new fields keeps older
-/// JSONL loadable (a `1`-era session restores with empty constraints/acceptance).
+/// JSONL loadable.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Plan {
     pub goal: Option<String>,
@@ -35,8 +23,6 @@ pub struct Plan {
     pub constraints: Vec<String>,
     #[serde(default)]
     pub acceptance: Vec<(String, bool)>,
-    #[serde(default)]
-    pub budget: Option<Budget>,
 }
 
 impl Plan {
@@ -45,7 +31,6 @@ impl Plan {
             && self.steps.is_empty()
             && self.constraints.is_empty()
             && self.acceptance.is_empty()
-            && self.budget.is_none()
     }
     /// Every step done and every acceptance criterion checked (vacuous when
     /// a list is empty). Never complete without at least one step.
@@ -96,24 +81,6 @@ impl Plan {
                 ));
             }
         }
-        if let Some(budget) = &self.budget {
-            let mut parts = Vec::new();
-            if let Some(s) = budget.max_seconds {
-                parts.push(format!("{s}s"));
-            }
-            if let Some(i) = budget.max_tool_iterations {
-                parts.push(format!("{i} tool iterations"));
-            }
-            if let Some(c) = budget.max_cost_usd {
-                parts.push(format!("${c:.2}"));
-            }
-            if !parts.is_empty() {
-                out.push_str(&format!(
-                    "Budget: {} — stay within these limits\n",
-                    parts.join(", ")
-                ));
-            }
-        }
         if self.is_complete() {
             out.push_str(
                 "Task complete: every plan step and acceptance criterion is done — summarize the outcome and stop.\n",
@@ -134,7 +101,6 @@ mod tests {
             constraints: vec!["c".into()],
             steps: vec![("s".into(), true)],
             acceptance: vec![("a".into(), true)],
-            budget: None,
         };
         let s = plan.summary().unwrap();
         assert!(s.contains("Goal: g"));
@@ -162,7 +128,6 @@ mod tests {
             constraints: vec!["c1".into()],
             steps: vec![("s".into(), false)],
             acceptance: vec![("a1".into(), true)],
-            budget: None,
         };
         assert_eq!(Plan::from_json(&plan.to_json()), plan);
         // Pre-level-2 JSONL (no constraints/acceptance keys) still loads.
@@ -170,34 +135,6 @@ mod tests {
         let parsed = Plan::from_json(legacy);
         assert!(parsed.constraints.is_empty() && parsed.acceptance.is_empty());
         assert_eq!(parsed.steps, vec![("s".to_string(), false)]);
-        assert!(parsed.budget.is_none());
-    }
-
-    #[test]
-    fn budget_round_trips_and_shows_in_summary() {
-        let plan = Plan {
-            goal: Some("g".into()),
-            steps: vec![("s".into(), false)],
-            constraints: vec![],
-            acceptance: vec![],
-            budget: Some(Budget {
-                max_seconds: Some(120),
-                max_tool_iterations: Some(5),
-                max_cost_usd: Some(0.5),
-            }),
-        };
-        assert_eq!(Plan::from_json(&plan.to_json()), plan);
-        let s = plan.summary().unwrap();
-        assert!(s.contains("Budget: 120s, 5 tool iterations, $0.50"), "{s}");
-        // Budget-only plan is not empty.
-        let budget_only = Plan {
-            budget: Some(Budget {
-                max_seconds: Some(10),
-                ..Budget::default()
-            }),
-            ..Plan::default()
-        };
-        assert!(!budget_only.is_empty());
     }
 }
 

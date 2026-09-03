@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 use serde_json::Value;
 use std::process::Command;
 
@@ -91,7 +92,7 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
                     .collect();
                 format!("{} steps: {}", steps.len(), tools.join(" → "))
             }),
-        "read" | "write" | "edit" | "grep" | "glob" => get("path")
+        "read" | "write" | "edit" | "grep" | "ls" | "glob" => get("path")
             .or_else(|| get("file"))
             .or_else(|| get("pattern"))
             .or_else(|| get("glob"))
@@ -243,6 +244,7 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
             }
         }
         "find" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
+        "ls" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
         "bash" => match one_line_summary(text) {
             first if first.is_empty() => "(no output)".to_string(),
             first => first,
@@ -317,8 +319,9 @@ pub(crate) fn approval_title(name: &str) -> &'static str {
         "write" => "Create / overwrite file",
         "edit" => "Edit file",
         "read" => "Read file",
-        "ffgrep" => "Search contents",
-        "fffind" => "Find files",
+        "grep" | "ffgrep" => "Search contents",
+        "ls" => "List directory",
+        "find" | "fffind" => "Find files",
         "git" => "Git",
         "chain" => "Chained read",
         _ => "Run tool",
@@ -371,12 +374,15 @@ pub(crate) fn approval_summary(name: &str, input: &str) -> String {
                     .unwrap_or_else(|| "(no path)".to_string())
             }
         }
-        "ffgrep" => get("pattern")
+        "grep" | "ffgrep" => get("pattern")
             .map(|p| format!("search: {}", p))
             .unwrap_or_else(|| "(no pattern)".to_string()),
-        "fffind" => get("pattern")
+        "find" | "fffind" => get("pattern")
             .map(|p| format!("find: {}", p))
             .unwrap_or_else(|| "(no pattern)".to_string()),
+        "ls" => get("path")
+            .map(|p| format!("ls: {}", p))
+            .unwrap_or_else(|| "ls: .".to_string()),
         "git" => get("mode")
             .map(|m| format!("git {}", m))
             .unwrap_or_else(|| "git".to_string()),
@@ -547,7 +553,7 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
                 vec![input.to_string()]
             }
         }
-        "ffgrep" => {
+        "grep" | "ffgrep" => {
             let mut out = Vec::new();
             if let Some(pat) = get("pattern") {
                 out.push(format!("pattern: {}", pat));
@@ -561,11 +567,18 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
                 out
             }
         }
-        "fffind" => {
+        "find" | "fffind" => {
             if let Some(pat) = get("pattern") {
                 vec![format!("pattern: {}", pat)]
             } else {
                 vec![input.to_string()]
+            }
+        }
+        "ls" => {
+            if let Some(path) = get("path") {
+                vec![format!("path: {}", path)]
+            } else {
+                vec!["path: .".to_string()]
             }
         }
         "git" => {

@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::core::types::Budget;
-
 /// Request to create a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -164,8 +162,6 @@ pub enum StreamEvent {
         constraints: Vec<String>,
         #[serde(default)]
         acceptance: Vec<(String, bool)>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        budget: Option<Budget>,
     },
 
     /// Steering message was accepted by the agent loop (mid-turn injection).
@@ -328,23 +324,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_event_carries_budget() {
+    fn plan_event_carries_no_budget() {
         let ev = StreamEvent::Plan {
             goal: Some("g".into()),
             steps: vec![("s".into(), false)],
             constraints: vec!["c".into()],
             acceptance: vec![],
-            budget: Some(crate::core::types::Budget {
-                max_seconds: Some(60),
-                max_tool_iterations: None,
-                max_cost_usd: None,
-            }),
         };
         let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("budget"));
         let back: StreamEvent = serde_json::from_str(&json).unwrap();
         match back {
-            StreamEvent::Plan { budget, .. } => assert_eq!(budget.unwrap().max_seconds, Some(60)),
+            StreamEvent::Plan { goal, .. } => assert_eq!(goal.as_deref(), Some("g")),
             _ => panic!("wrong variant"),
         }
     }
