@@ -1,13 +1,9 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TurnLimits {
-    pub elapsed_seconds: u64,
-}
 
 pub(crate) trait CancellationSource {
     fn is_cancelled(&self) -> bool;
@@ -40,7 +36,7 @@ pub(crate) fn cache_file_path() -> Option<PathBuf> {
 
 pub(crate) fn cache_fingerprint(name: &str, input: &str) -> String {
     let mut fingerprint = String::new();
-    if matches!(name, "read" | "grep" | "find") {
+    if matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls") {
         if let Ok(args) = serde_json::from_str::<Value>(input) {
             if let Some(path) = args.get("path").and_then(Value::as_str) {
                 if let Ok(meta) = fs::metadata(path) {
@@ -73,6 +69,10 @@ pub(crate) struct ToolState {
     /// TUI process (in-memory only, resets on restart). The status bar shows
     /// `last_usage` as live context utilization and this as the spend figure.
     pub(crate) total_usage: u64,
+    /// Session-cumulative cost in USD, mirroring pi's `usageTotals.cost`.
+    /// Accumulated per `Usage` event from provider pricing (catalog) or
+    /// `DEX_COST_PER_1K` fallback. In-memory only, like `total_usage`.
+    pub(crate) total_cost: f64,
     pub(crate) verify_dirty: bool,
 }
 

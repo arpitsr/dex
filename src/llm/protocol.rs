@@ -38,7 +38,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "read".to_string(),
-                description: "Read file(s) with line numbers (right-aligned number + two spaces + expanded content, tabs expanded per .editorconfig/language), which you can reference in edits. Returns at most 2000 lines; paginate with offset/limit. To avoid extra round trips, pass `paths` (up to 10 files) or `glob` to read several files in ONE call; sections are returned per file.".to_string(),
+                description: "Read file contents with line numbers. Use offset/limit for large files. Batch independent reads with paths:[...] or glob:'src/**/*.rs' (up to 10 files) in ONE call.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -56,7 +56,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "bash".to_string(),
-                description: "Run a shell command. Output is capped (head and tail kept, middle elided). Prefer the read/ffgrep/fffind tools over cat/grep/find here, and prefer targeted commands (grep -n, tail -N, wc) over dumping whole files. For a distilled result (matched files, counts, short excerpts, an aggregate), run the whole pipeline in ONE call: the dex binary is available as \"$DEX_BIN\" and `\"$DEX_BIN\" run <tool> <key>=<value>...` executes read/ffgrep/fffind/git locally with raw output on stdout (exit 1 on error); only what it prints enters the conversation. Example: `\"$DEX_BIN\" run ffgrep pattern=TODO output_mode=files | while IFS= read -r f; do \"$DEX_BIN\" run read \"path=$f\" limit=3; done` (read-only; use dedicated tools when you need to see full output yourself).".to_string(),
+                description: "Run a shell command. Output is capped. Prefer read/grep/find over cat/grep/find; use targeted commands (grep -n, tail -N) over dumping files.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": { "command": { "type": "string", "description": "shell command to run" } },
@@ -99,8 +99,8 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
-                name: "ffgrep".to_string(),
-                description: "Fast frecency-ranked content search (respects .gitignore, git-aware). Regex when the pattern has metacharacters, plain text otherwise; a zero-match query is automatically retried as fuzzy, so typos still hit. Default output is matching file paths; content mode returns path:line:text (with optional context lines) so a follow-up read is often unnecessary. Keep queries SHORT — one term or one regex; multiple words narrow the search (AND), not OR. Narrow with a path prefix ('src/ TODO') or an exclude ('TODO !test/').".to_string(),
+                name: "grep".to_string(),
+                description: "Fast content search (respects .gitignore). Regex when pattern has metacharacters, plain text otherwise; zero matches are retried as fuzzy. Default returns file paths; content mode gives path:line:text. Keep queries short — one term. Use path prefix 'src/ TODO' or exclude 'TODO !test/'.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -116,8 +116,8 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
-                name: "fffind".to_string(),
-                description: "Fuzzy file-path search (frecency-ranked, git-aware, typo-tolerant). Matches the whole workspace-relative path, not just the filename; supports path prefixes ('src/') and globs ('**/*.rs'). Keep queries SHORT — 1-2 terms; multiple words narrow (AND), not OR. Start broad with one term and refine.".to_string(),
+                name: "find".to_string(),
+                description: "Fuzzy file search (respects .gitignore, typo-tolerant). Matches workspace-relative paths; supports globs '**/*.rs'. Keep queries short — 1-2 terms.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -125,6 +125,20 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                         "limit": { "type": "integer", "description": "maximum paths returned (default 20)" }
                     },
                     "required": ["pattern"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "ls".to_string(),
+                description: "List files and directories. Shows entries in the given path (default '.'). Use to explore project structure.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "directory to list (default '.')" }
+                    },
+                    "required": []
                 }),
             },
         },
@@ -142,7 +156,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "chain".to_string(),
-                description: "Run a bounded read-only sequence in ONE round trip: a search step (ffgrep files-mode or fffind) followed by read steps that consume the matched files via from/take. Use when later steps depend on earlier output; for independent calls, batch them as parallel calls instead. Mutating and shell tools are not allowed in chains.".to_string(),
+                description: "Run a bounded read-only sequence in ONE round trip: a search step (grep files-mode or find) followed by read steps that consume the matched files via from/take. Use when later steps depend on earlier output; for independent calls, batch them as parallel calls instead. Mutating and shell tools are not allowed in chains.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -152,7 +166,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "tool": { "type": "string", "description": "read, ffgrep, fffind, or git" },
+                                    "tool": { "type": "string", "description": "read, grep, find, or git" },
                                     "args": { "type": "object", "description": "arguments passed to that tool" },
                                     "from": { "type": "integer", "description": "index of an earlier step whose matched files this read consumes" },
                                     "take": { "type": "string", "enum": ["paths"], "description": "route the referenced step's file paths into this read" },
@@ -330,10 +344,13 @@ mod tests {
         if std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1") {
             assert_eq!(
                 names,
-                ["read", "bash", "write", "edit", "ffgrep", "fffind", "git", "chain"]
+                ["read", "bash", "write", "edit", "grep", "find", "ls", "git", "chain"]
             );
         } else {
-            assert_eq!(names, ["read", "bash", "write", "edit", "ffgrep", "fffind"]);
+            assert_eq!(
+                names,
+                ["read", "bash", "write", "edit", "grep", "find", "ls"]
+            );
         }
     }
 

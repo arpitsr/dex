@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::core::types::Budget;
-
 /// Request to create a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -50,7 +48,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub skill_dirs: Vec<String>,
     /// Optional per-request overrides; when absent the daemon uses its own
-    /// environment/config file. These let a co-located client forward its
+    /// environment. These let a co-located client forward its
     /// CLI flags through to the turn.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -164,8 +162,6 @@ pub enum StreamEvent {
         constraints: Vec<String>,
         #[serde(default)]
         acceptance: Vec<(String, bool)>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        budget: Option<Budget>,
     },
 
     /// Steering message was accepted by the agent loop (mid-turn injection).
@@ -235,6 +231,8 @@ pub struct LoadSkillResponse {
 pub struct DaemonInfo {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub api: String,
     pub available_models: Vec<String>,
     pub context_window: u64,
     pub permission: String,
@@ -328,23 +326,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_event_carries_budget() {
+    fn plan_event_carries_no_budget() {
         let ev = StreamEvent::Plan {
             goal: Some("g".into()),
             steps: vec![("s".into(), false)],
             constraints: vec!["c".into()],
             acceptance: vec![],
-            budget: Some(crate::core::types::Budget {
-                max_seconds: Some(60),
-                max_tool_iterations: None,
-                max_cost_usd: None,
-            }),
         };
         let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("budget"));
         let back: StreamEvent = serde_json::from_str(&json).unwrap();
         match back {
-            StreamEvent::Plan { budget, .. } => assert_eq!(budget.unwrap().max_seconds, Some(60)),
+            StreamEvent::Plan { goal, .. } => assert_eq!(goal.as_deref(), Some("g")),
             _ => panic!("wrong variant"),
         }
     }

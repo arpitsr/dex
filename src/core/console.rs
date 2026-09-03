@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};

@@ -152,32 +152,9 @@ pub(super) fn compact_path(path: &str) -> String {
     path.to_string()
 }
 
-pub(super) fn plan_status(app: &App) -> Option<String> {
-    if app.plan.is_empty() {
-        return None;
-    }
-    let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
-    let total = app.plan.steps.len();
-    let mut parts = Vec::new();
-    if let Some(g) = &app.plan.goal {
-        let short = if g.len() > 40 {
-            format!("{}…", &g[..40])
-        } else {
-            g.clone()
-        };
-        parts.push(format!("Goal: {short}"));
-    }
-    if total > 0 {
-        parts.push(format!("Plan {done}/{total}"));
-    }
-    let a_done = app.plan.acceptance.iter().filter(|(_, d)| *d).count();
-    if !app.plan.acceptance.is_empty() {
-        parts.push(format!("✓ {a_done}/{}", app.plan.acceptance.len()));
-    }
-    if app.plan.is_complete() {
-        parts.push("complete".to_string());
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+pub(super) fn plan_status(_app: &App) -> Option<String> {
+    // pi has no plan mode — plans are files, not footer state
+    None
 }
 
 pub(super) fn ui_status(app: &App) -> String {
@@ -199,12 +176,8 @@ pub(super) fn ui_status(app: &App) -> String {
             .checked_div(app.config.context_window)
             .unwrap_or(0)
     };
-    let conn = app
-        .connection
-        .clone()
-        .unwrap_or_else(|| "connected to local".to_string());
     let mut base = format!(
-        "{conn} · {} · {} / {}{} · {} / {} tokens ({}%)",
+        "{} · {} / {}{} · {} / {} tokens ({}%)",
         cwd,
         app.config.provider.name(),
         app.config.model,
@@ -242,6 +215,11 @@ pub(super) fn ui_status(app: &App) -> String {
             format_tokens(app.tool_state.total_usage)
         ));
     }
+    // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
+    // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
+    if app.tool_state.total_cost > 0.0005 {
+        base.push_str(&format!(" · ${:.3}", app.tool_state.total_cost));
+    }
     if let Some(plan) = plan_status(app) {
         format!("{} · {}", base, plan)
     } else {
@@ -266,11 +244,29 @@ pub(super) fn footer_text(app: &App, width: u16) -> String {
     }
     candidates.push(compact);
     candidates.push(model.clone());
+    // Connection badge pinned to the right edge. On a remote box knowing
+    // that beats any left-side detail, so it survives narrowing at the
+    // left's expense: first left candidate that leaves room for it wins,
+    // otherwise the widest left that fits alone, else bare model.
+    let conn = app
+        .connection
+        .clone()
+        .unwrap_or_else(|| "[L] local".to_string());
+    let conn_w = UnicodeWidthStr::width(conn.as_str());
+    let mut left_only = None;
     for status in candidates {
-        let candidate = format!("{}{}", hint, status);
-        if UnicodeWidthStr::width(candidate.as_str()) <= width as usize {
-            return candidate;
+        let left = format!("{}{}", hint, status);
+        let lw = UnicodeWidthStr::width(left.as_str());
+        if lw + 1 + conn_w <= width as usize {
+            let pad = " ".repeat(width as usize - lw - conn_w);
+            return format!("{left}{pad}{conn}");
         }
+        if left_only.is_none() && lw <= width as usize {
+            left_only = Some(left);
+        }
+    }
+    if let Some(left) = left_only {
+        return left;
     }
     truncate_display(&format!("{}{}", hint, model), width)
 }
@@ -582,21 +578,55 @@ impl SlashSuggestionsView {
             return;
         }
         app.slash_selected = app.slash_selected.min(suggestions.len() - 1);
-        let height = (suggestions.len() as u16 + 2).min(area.y);
+        // A bare `/model ` matches the whole catalog (50+ entries): cap the
+        // visible rows so the popup stays a small list above the composer
+        // instead of a full-transcript wall, and scroll it with the selection.
+        const MAX_VISIBLE: usize = 10;
+        let mut visible = suggestions.len().min(MAX_VISIBLE);
+        let height = (visible as u16 + 2).min(area.y);
         if height < 3 {
             return;
         }
+        visible = visible.min(height.saturating_sub(2) as usize);
+        let max_start = suggestions.len().saturating_sub(visible);
+        let start = app
+            .slash_selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(max_start);
+        let window = &suggestions[start..start + visible];
+        // Size the popup to its content. The old fixed `{command:<20}` column
+        // glued the description onto any `/model <name>` longer than 20
+        // chars; the column now fits the longest visible command with a
+        // two-space gap before the description.
+        let avail = area.width.saturating_sub(2) as usize;
+        let cmd_col = window
+            .iter()
+            .map(|(command, _)| UnicodeWidthStr::width(command.as_str()))
+            .max()
+            .unwrap_or(0)
+            .min(48)
+            .min(avail.max(1));
+        let desc_col = window
+            .iter()
+            .map(|(_, description)| UnicodeWidthStr::width(description.as_str()))
+            .max()
+            .unwrap_or(0);
+        // Borders (2) + column gap (2) + breathing room (2).
+        let width = (cmd_col + 2 + desc_col + 2) as u16 + 2;
+        let width = width.clamp(30, 72).min(area.width);
         let popup = Rect {
             x: area.x,
             y: area.y - height,
-            width: area.width.min(52),
+            width,
             height,
         };
-        let items = suggestions
+        let inner_w = width.saturating_sub(2) as usize;
+        let desc_w = inner_w.saturating_sub(cmd_col + 2) as u16;
+        let items = window
             .iter()
             .enumerate()
-            .map(|(index, (command, description))| {
-                let selected = index == app.slash_selected;
+            .map(|(offset, (command, description))| {
+                let selected = start + offset == app.slash_selected;
                 let row_style = if selected {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else {
@@ -618,17 +648,36 @@ impl SlashSuggestionsView {
                 } else {
                     Style::default().fg(theme::secondary_fg())
                 };
+                let cell = truncate_display(command, cmd_col as u16);
+                let pad = cmd_col.saturating_sub(UnicodeWidthStr::width(cell.as_str()));
+                let mut cell = cell;
+                cell.push_str(&" ".repeat(pad + 2));
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{command:<20}"), command_style),
-                    Span::styled(description.clone(), description_style),
+                    Span::styled(cell, command_style),
+                    Span::styled(truncate_display(description, desc_w), description_style),
                 ]))
                 .style(row_style)
             });
+        let input = app.input.text();
+        let base = if input.starts_with("/model ") {
+            "Models"
+        } else if input.starts_with("/provider ") {
+            "Providers"
+        } else if input.starts_with("/resume") {
+            "Sessions"
+        } else {
+            "Slash commands"
+        };
+        let title = if suggestions.len() > visible {
+            format!(" {base} {}/{} ", app.slash_selected + 1, suggestions.len())
+        } else {
+            format!(" {base} ")
+        };
         f.render_widget(Clear, popup);
         f.render_widget(
             List::new(items).block(
                 Block::default()
-                    .title(" Slash commands ")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue))
                     .style(Style::default().bg(theme::popup_bg())),
@@ -1206,10 +1255,9 @@ mod tests {
                 account_id: None,
                 thinking_effort: None,
                 context_window: 128_000,
+                reserve_tokens: 16_384,
+                keep_recent_tokens: 20_000,
                 permission: PermissionMode::Trusted,
-                max_tool_iterations: 60,
-                max_prompt_tokens: 128_000,
-                max_turn_seconds: 900,
                 verify_command: None,
                 client: reqwest::blocking::Client::new(),
             },
@@ -1356,6 +1404,21 @@ mod tests {
         assert_eq!(truncate_display("abcdef", 0), "");
         let app = test_app();
         assert_eq!(footer_text(&app, 8), "test-mo…");
+    }
+
+    #[test]
+    fn footer_pins_connection_badge_right() {
+        let mut app = test_app();
+        app.connection = Some("[R] daemon.internal".into());
+        // Wide enough for left + badge: badge flush right, left at column 0.
+        let text = footer_text(&app, 60);
+        assert!(text.starts_with("/tmp/dex-ui-test"), "{text}");
+        assert!(text.ends_with("[R] daemon.internal"), "{text}");
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 60);
+        // Narrow: badge survives, left degrades to the bare model name.
+        let text = footer_text(&app, 30);
+        assert!(text.ends_with("[R] daemon.internal"), "{text}");
+        assert!(text.starts_with("test-model"), "{text}");
     }
 
     #[test]

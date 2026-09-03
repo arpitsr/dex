@@ -125,9 +125,9 @@ pub(crate) struct App {
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: String,
     pub(crate) slash_selected: usize,
-    /// How this TUI reached its agent engine, e.g. "connected to local" or
-    /// "connected to daemon at 127.0.0.1:4113". Shown in the status bar only;
-    /// the transcript stays free of startup banners.
+    /// How this TUI reached its agent engine, e.g. "[L] 127.0.0.1" (local
+    /// loopback) or "[R] daemon.internal" (remote). Pinned to the right edge
+    /// of the status bar; the transcript stays free of startup banners.
     pub(crate) connection: Option<String>,
     /// Whether the tail `Assistant` block is still open for streaming
     /// coalescence. Tracked so an initial transcript block (e.g. in tests)
@@ -498,6 +498,65 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
     app.autoscroll = true;
 }
 
+pub(crate) fn rebuild_transcript(app: &mut App) {
+    app.transcript.clear();
+    app.assistant_open = false;
+    app.active_tool = None;
+    app.transcript_version = app.transcript_version.wrapping_add(1);
+    let msgs = app.messages.clone();
+    for msg in msgs.iter().skip(1) {
+        match msg.role.as_str() {
+            "user" => {
+                if let Some(content) = &msg.content {
+                    if !content.trim().is_empty() {
+                        render_user_prompt(app, content);
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(content) = &msg.content {
+                    if !content.trim().is_empty() {
+                        append_sink_line(
+                            app,
+                            crate::core::types::SinkLine::Assistant(content.clone()),
+                        );
+                    }
+                }
+                if let Some(calls) = &msg.tool_calls {
+                    for tc in calls {
+                        let input = format!("{} {}", tc.function.name, tc.function.arguments);
+                        append_sink_line(app, crate::core::types::SinkLine::ToolInput(input));
+                    }
+                }
+            }
+            "tool" => {
+                let name = msg.name.clone().unwrap_or_else(|| "tool".to_string());
+                let content = msg.content.clone().unwrap_or_default();
+                let mut lines = content.lines();
+                let summary = lines.next().unwrap_or("").to_string();
+                let preview: Vec<String> = lines.take(6).map(|s| s.to_string()).collect();
+                append_sink_line(
+                    app,
+                    crate::core::types::SinkLine::ToolOutput {
+                        name,
+                        summary,
+                        success: true,
+                        preview,
+                        duration: 0.0,
+                    },
+                );
+            }
+            _ if msg.role == "system" => {}
+            _ => {
+                if let Some(content) = &msg.content {
+                    push_info(app, format!("{}: {}", msg.role, content));
+                }
+            }
+        }
+    }
+    app.autoscroll = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,10 +578,9 @@ mod tests {
                 account_id: None,
                 thinking_effort: None,
                 context_window: 128_000,
+                reserve_tokens: 16_384,
+                keep_recent_tokens: 20_000,
                 permission: crate::core::types::PermissionMode::Trusted,
-                max_tool_iterations: 60,
-                max_prompt_tokens: 128_000,
-                max_turn_seconds: 900,
                 verify_command: None,
                 client: reqwest::blocking::Client::new(),
             },

@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
