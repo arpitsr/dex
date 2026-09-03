@@ -40,52 +40,6 @@ pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
     }
 }
 
-/// Per-model context window, matching pi's catalog (models-store.json).
-/// Kept static to avoid network probe; DEX_CONTEXT_WINDOW / file override wins.
-/// Pi catalog: gpt-5* 400k (5.6* 1050k), claude 200k/1M, muse 1048576, deepseek/glm 1M.
-/// Update when pi catalog changes — grep models-store.json for contextWindow.
-pub(crate) fn model_context_window(model: &str, provider: Provider) -> u64 {
-    let m = model.to_ascii_lowercase();
-    // ponytail: static table, pi's models-store.json is the source of truth
-    if m.contains("muse-spark") {
-        return 1_048_576;
-    }
-    if m.contains("gpt-5.6") {
-        return 1_050_000;
-    }
-    if m.contains("gpt-5.5") {
-        return 1_050_000;
-    }
-    if m.contains("gpt-5.4-pro") {
-        return 1_050_000;
-    }
-    if m.contains("gpt-5.4") {
-        return 272_000;
-    }
-    if m.contains("gpt-5") {
-        return 400_000;
-    }
-    if m.contains("claude-fable") {
-        return 1_000_000;
-    }
-    if m.contains("claude") {
-        return 200_000;
-    }
-    if m.contains("deepseek") {
-        return 1_000_000;
-    }
-    if m.contains("glm-5.3") || m.contains("glm-5.2") {
-        return 1_000_000;
-    }
-    if m.contains("glm-5") {
-        return 202_752;
-    }
-    if m.contains("kimi") || m.contains("qwen") {
-        return 128_000;
-    }
-    provider_default_context_window(provider)
-}
-
 pub(crate) fn dex_models_cache_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
         return Some(std::path::PathBuf::from(dir).join("dex/models.json"));
@@ -503,13 +457,13 @@ impl LlmConfig {
             Provider::OpenAiCodex => load_codex_credentials()?,
         };
         // Resolve context window once, then derive max_prompt_tokens from it
-        // Dex: models.dev catalog > static table. DEX_CONTEXT_WINDOW / file override wins. No pi dependency.
+        // Dex: models.dev catalog (limit.context) > provider default. No hard-coded table.
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
             .or(file.context_window)
             .or_else(|| load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)))
-            .unwrap_or_else(|| model_context_window(&model, provider));
+            .unwrap_or_else(|| provider_default_context_window(provider));
         let derived_max_prompt = context_window
             .saturating_sub(16_000)
             .min(context_window * 3 / 4);
@@ -634,7 +588,7 @@ impl LlmConfig {
             self.model = selection.to_string();
             None
         };
-        // Dex standalone: contextWindow from models.dev catalog > static table; refresh unless env/file pinned it.
+        // Dex standalone: contextWindow from models.dev catalog > provider default; refresh unless env/file pinned it.
         if env::var("DEX_CONTEXT_WINDOW").is_err() {
             let file_ctx = load_file_config().ok().and_then(|f| f.context_window);
             if file_ctx.is_none() {
@@ -642,10 +596,10 @@ impl LlmConfig {
                     if let Some(ctx) = catalog_context_window(&self.model, &catalog) {
                         self.context_window = ctx;
                     } else {
-                        self.context_window = model_context_window(&self.model, self.provider);
+                        self.context_window = provider_default_context_window(self.provider);
                     }
                 } else {
-                    self.context_window = model_context_window(&self.model, self.provider);
+                    self.context_window = provider_default_context_window(self.provider);
                 }
                 self.max_prompt_tokens = self
                     .context_window
