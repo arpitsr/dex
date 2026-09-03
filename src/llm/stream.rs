@@ -446,8 +446,7 @@ mod tests {
             r#"data: {"choices":[],"usage":{"prompt_tokens":123,"prompt_tokens_details":{"cached_tokens":7}}}"#,
             "data: [DONE]",
         ]);
-        let (msg, usage) =
-            read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        let (msg, usage) = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(msg.content.as_deref(), Some("hello world\nsecond line"));
         let calls = msg.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
@@ -456,7 +455,10 @@ mod tests {
         assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
         assert_eq!(
             usage,
-            Some(Usage { prompt_tokens: 123, cached_tokens: Some(7) })
+            Some(Usage {
+                prompt_tokens: 123,
+                cached_tokens: Some(7)
+            })
         );
         let lines: Vec<SinkLine> = rx.try_iter().collect();
         assert!(matches!(&lines[0], SinkLine::Assistant(s) if s == "hello world"));
@@ -476,12 +478,18 @@ mod tests {
             "data: [DONE]",
         ]);
         let (msg, _) = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
-        assert_eq!(msg.content.as_deref(), Some("```rust\nfn main() {}\n```\ntrailing prose"));
+        assert_eq!(
+            msg.content.as_deref(),
+            Some("```rust\nfn main() {}\n```\ntrailing prose")
+        );
         let lines: Vec<SinkLine> = rx.try_iter().collect();
         // The fence body keeps its streamed trailing newline and the close
         // adds one more — current sink contract; consumers re-parse the block.
-        assert!(matches!(&lines[0], SinkLine::Assistant(s)
-            if s == "```rust:\nfn main() {}\n\n```"), "{lines:?}");
+        assert!(
+            matches!(&lines[0], SinkLine::Assistant(s)
+            if s == "```rust:\nfn main() {}\n\n```"),
+            "{lines:?}"
+        );
         assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "trailing prose"));
     }
 
@@ -516,12 +524,22 @@ mod tests {
             read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(msg.content.as_deref(), Some("hello\n"));
         let calls = msg.tool_calls.unwrap();
-        assert_eq!(calls.len(), 2, "ghost call (no id) and padding must be filtered: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            2,
+            "ghost call (no id) and padding must be filtered: {calls:?}"
+        );
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[1].id, "call_2");
         assert_eq!(calls[1].function.arguments, "EARLYLATER");
-        assert_eq!(usage, Some(Usage { prompt_tokens: 50, cached_tokens: Some(5) }));
+        assert_eq!(
+            usage,
+            Some(Usage {
+                prompt_tokens: 50,
+                cached_tokens: Some(5)
+            })
+        );
     }
 
     /// Garbage, empty, and keep-alive data lines are skipped; reasoning

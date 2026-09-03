@@ -7,13 +7,13 @@ use std::env;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ::fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
+use ::fff::grep::{has_regex_metacharacters, GrepMode, GrepSearchOptions};
 use ::fff::{
-    FilePicker, FilePickerOptions, FFFMode, FuzzySearchOptions, PaginationArgs, QueryParser,
+    FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser,
     SharedFilePicker, SharedFrecency,
 };
 
-use super::{ToolError, arg_str};
+use super::{arg_str, ToolError};
 use serde_json::{Map, Value};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -208,7 +208,9 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
             }
         }
         if result.next_file_offset != 0 {
-            out.push_str("\n[... more matching files exist; narrow the query or raise head_limit ...]");
+            out.push_str(
+                "\n[... more matching files exist; narrow the query or raise head_limit ...]",
+            );
         }
         Ok(out)
     })

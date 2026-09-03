@@ -1171,7 +1171,6 @@ fn extract_search_paths(
     Ok(paths)
 }
 
-
 /// Execute a tool using paths confined to the current workspace.
 pub(crate) fn execute(
     name: &str,
@@ -1618,7 +1617,11 @@ mod tests {
         let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation);
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("approximate"), "{}", outcome.text);
-        assert!(outcome.text.contains("UserAccountController"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("UserAccountController"),
+            "{}",
+            outcome.text
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1740,7 +1743,11 @@ mod tests {
         args.insert("pattern".into(), Value::String("tools mod".into()));
         let outcome = execute_outcome("fffind", &args, &GlobalCancellation);
         assert!(outcome.ok, "{}", outcome.text);
-        assert!(outcome.text.contains("src/tools/mod.rs"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("src/tools/mod.rs"),
+            "{}",
+            outcome.text
+        );
     }
 
     #[test]

@@ -132,11 +132,17 @@ mod tests {
         let prev_home = env::var_os("HOME");
 
         env::set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-test");
-        assert_eq!(cache_file_path().unwrap(), PathBuf::from("/tmp/xdg-cache-test/dex-tool-cache.json"));
+        assert_eq!(
+            cache_file_path().unwrap(),
+            PathBuf::from("/tmp/xdg-cache-test/dex-tool-cache.json")
+        );
 
         env::remove_var("XDG_CACHE_HOME");
         env::set_var("HOME", "/tmp/fakehome2");
-        assert_eq!(cache_file_path().unwrap(), PathBuf::from("/tmp/fakehome2/.cache/dex-tool-cache.json"));
+        assert_eq!(
+            cache_file_path().unwrap(),
+            PathBuf::from("/tmp/fakehome2/.cache/dex-tool-cache.json")
+        );
 
         match prev_xdg {
             Some(v) => env::set_var("XDG_CACHE_HOME", v),
