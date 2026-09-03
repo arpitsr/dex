@@ -185,7 +185,7 @@ pub(crate) struct ApprovalRequest {
 
 /// Width of a string as displayed, ignoring ANSI escape sequences.
 /// dividers, truncated to fit the terminal width.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub(crate) struct ChatMessage {
     pub(crate) role: String,
     pub(crate) content: Option<String>,
@@ -195,6 +195,16 @@ pub(crate) struct ChatMessage {
     pub(crate) tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
+    /// Raw Responses reasoning items emitted with this turn (carrying
+    /// `encrypted_content`); replayed verbatim so a stateless `store:false`
+    /// request hands the model its own reasoning thread back instead of
+    /// making it re-reason from scratch every tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_items: Option<Vec<Value>>,
+    /// DeepSeek-style reasoning text, replayed on assistant messages for
+    /// chat-completions providers that stream `reasoning_content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_content: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -257,7 +267,7 @@ pub(crate) enum Provider {
 impl Provider {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "opencode" => Ok(Self::OpenCode),
+            "opencode" | "openai" => Ok(Self::OpenCode),
             "openai-codex" | "codex" => Ok(Self::OpenAiCodex),
             other => Err(format!(
                 "unsupported provider '{}'; use opencode or openai-codex",
@@ -270,6 +280,13 @@ impl Provider {
         match self {
             Self::OpenCode => "opencode",
             Self::OpenAiCodex => "openai-codex",
+        }
+    }
+
+    pub(crate) fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenCode => "https://api.openai.com/v1",
+            Self::OpenAiCodex => "https://chatgpt.com/backend-api/codex",
         }
     }
 }

@@ -196,6 +196,7 @@ async fn load_skill(
             tool_calls: None,
             tool_call_id: None,
             name: Some("skill".to_string()),
+            ..Default::default()
         };
         session
             .append_message(msg)
@@ -717,6 +718,13 @@ fn run_turn_inner(
             .transpose()?,
     )
     .map_err(|e| format!("failed to build config: {e}"))?;
+    // Persist provider/model overrides so /resume restores the same provider/base_url without env
+    if let Some(raw) = &req.model {
+        if !raw.is_empty() {
+            let _ = session.set_state("model", raw);
+            let _ = session.set_state("provider", config.provider.name());
+        }
+    }
     // Verification is opt-in (DEX_VERIFY / config verify_command). No
     // auto-detect by default — pi has no verify hook and auto-running
     // `cargo test` after every edit is the biggest loop tax.
@@ -739,6 +747,7 @@ fn run_turn_inner(
         tool_calls: None,
         tool_call_id: None,
         name: None,
+        ..Default::default()
     });
     if let Some(path) = session.path() {
         messages.extend(session::load_messages_from_session(path).unwrap_or_default());
@@ -749,6 +758,7 @@ fn run_turn_inner(
         tool_calls: None,
         tool_call_id: None,
         name: None,
+        ..Default::default()
     };
     // Durable journal (P8): a turn only exists once turn_start is recorded,
     // and an io::Error here fails the turn instead of being swallowed.
@@ -955,6 +965,7 @@ fn run_turn_inner(
                         tool_calls: None,
                         tool_call_id: None,
                         name: Some("follow-up".into()),
+                        ..Default::default()
                     };
                     session
                         .append_message(msg.clone())
@@ -1310,6 +1321,7 @@ async fn session_waive(
             tool_calls: None,
             tool_call_id: None,
             name: Some("waive".into()),
+            ..Default::default()
         })?;
         session.set_state(
             "verify",

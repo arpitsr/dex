@@ -154,6 +154,7 @@ pub(crate) fn process_turn(
                     tool_calls: None,
                     tool_call_id: None,
                     name: Some("steering".to_string()),
+                    ..Default::default()
                 });
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
@@ -233,6 +234,8 @@ pub(crate) fn process_turn(
                 tool_calls: Some(calls.clone()),
                 tool_call_id: None,
                 name: None,
+                reasoning_items: message.reasoning_items.clone(),
+                reasoning_content: message.reasoning_content.clone(),
             });
 
             let serialize_batch = tool_calls_conflict(&calls);
@@ -373,6 +376,7 @@ pub(crate) fn process_turn(
                     tool_calls: None,
                     tool_call_id: Some(call.id.clone()),
                     name: None,
+                    ..Default::default()
                 });
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
@@ -385,6 +389,8 @@ pub(crate) fn process_turn(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                reasoning_items: message.reasoning_items.clone(),
+                reasoning_content: message.reasoning_content.clone(),
             });
             if let Some(rx) = steering_rx {
                 let steering: Vec<String> = rx.try_iter().collect();
@@ -399,6 +405,7 @@ pub(crate) fn process_turn(
                             tool_calls: None,
                             tool_call_id: None,
                             name: Some("steering".to_string()),
+                            ..Default::default()
                         });
                     }
                     state.last_usage = last_usage;
@@ -438,6 +445,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                    ..Default::default()
                 },
                 Some(Usage {
                     prompt_tokens: 1,
@@ -488,6 +496,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            ..Default::default()
         }];
         let mut state = ToolState::default();
         let result = process_turn(
@@ -544,6 +553,7 @@ mod tests {
                     }]),
                     tool_call_id: None,
                     name: None,
+                                    ..Default::default()
                 }
             } else {
                 ChatMessage {
@@ -552,6 +562,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                    ..Default::default()
                 }
             };
             Ok((
@@ -573,6 +584,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            ..Default::default()
         }];
         let mut state = ToolState::default();
         let (sink_tx, sink_rx) = mpsc::channel();
