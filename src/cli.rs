@@ -36,6 +36,8 @@ pub(crate) enum Mode {
     /// One-shot tool execution (`dex run <tool> <args...>`) so scripts can
     /// call tools locally and stitch pipelines without model round trips.
     RunTool { name: String, args: Vec<String> },
+    /// Refresh model catalog (`dex update --models`) — like `pi update --models`.
+    Update { models: bool },
 }
 
 pub(crate) fn parse_args() -> Args {
@@ -88,6 +90,10 @@ pub(crate) fn parse_args() -> Args {
 /// Determine the invocation mode from parsed args.
 pub(crate) fn resolve_mode(args: &Args) -> Mode {
     match args.rest.first().map(|s| s.as_str()) {
+        Some("update") => {
+            let models = args.rest.iter().any(|a| a == "--models" || a == "--all");
+            Mode::Update { models }
+        }
         Some("serve") => {
             let bind = args
                 .rest
