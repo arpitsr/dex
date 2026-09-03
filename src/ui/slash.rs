@@ -50,7 +50,7 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
                     if model == &app.config.model {
                         "Current model".to_string()
                     } else {
-                        "Configured model".to_string()
+                        String::new()
                     },
                 )
             })
@@ -67,7 +67,7 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
                     if *provider == *app.config.provider.name() {
                         "Current provider".to_string()
                     } else {
-                        "Available provider".to_string()
+                        String::new()
                     },
                 )
             })

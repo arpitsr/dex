@@ -578,21 +578,55 @@ impl SlashSuggestionsView {
             return;
         }
         app.slash_selected = app.slash_selected.min(suggestions.len() - 1);
-        let height = (suggestions.len() as u16 + 2).min(area.y);
+        // A bare `/model ` matches the whole catalog (50+ entries): cap the
+        // visible rows so the popup stays a small list above the composer
+        // instead of a full-transcript wall, and scroll it with the selection.
+        const MAX_VISIBLE: usize = 10;
+        let mut visible = suggestions.len().min(MAX_VISIBLE);
+        let height = (visible as u16 + 2).min(area.y);
         if height < 3 {
             return;
         }
+        visible = visible.min(height.saturating_sub(2) as usize);
+        let max_start = suggestions.len().saturating_sub(visible);
+        let start = app
+            .slash_selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(max_start);
+        let window = &suggestions[start..start + visible];
+        // Size the popup to its content. The old fixed `{command:<20}` column
+        // glued the description onto any `/model <name>` longer than 20
+        // chars; the column now fits the longest visible command with a
+        // two-space gap before the description.
+        let avail = area.width.saturating_sub(2) as usize;
+        let cmd_col = window
+            .iter()
+            .map(|(command, _)| UnicodeWidthStr::width(command.as_str()))
+            .max()
+            .unwrap_or(0)
+            .min(48)
+            .min(avail.max(1));
+        let desc_col = window
+            .iter()
+            .map(|(_, description)| UnicodeWidthStr::width(description.as_str()))
+            .max()
+            .unwrap_or(0);
+        // Borders (2) + column gap (2) + breathing room (2).
+        let width = (cmd_col + 2 + desc_col + 2) as u16 + 2;
+        let width = width.clamp(30, 72).min(area.width);
         let popup = Rect {
             x: area.x,
             y: area.y - height,
-            width: area.width.min(52),
+            width,
             height,
         };
-        let items = suggestions
+        let inner_w = width.saturating_sub(2) as usize;
+        let desc_w = inner_w.saturating_sub(cmd_col + 2) as u16;
+        let items = window
             .iter()
             .enumerate()
-            .map(|(index, (command, description))| {
-                let selected = index == app.slash_selected;
+            .map(|(offset, (command, description))| {
+                let selected = start + offset == app.slash_selected;
                 let row_style = if selected {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else {
@@ -614,17 +648,36 @@ impl SlashSuggestionsView {
                 } else {
                     Style::default().fg(theme::secondary_fg())
                 };
+                let cell = truncate_display(command, cmd_col as u16);
+                let pad = cmd_col.saturating_sub(UnicodeWidthStr::width(cell.as_str()));
+                let mut cell = cell;
+                cell.push_str(&" ".repeat(pad + 2));
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{command:<20}"), command_style),
-                    Span::styled(description.clone(), description_style),
+                    Span::styled(cell, command_style),
+                    Span::styled(truncate_display(description, desc_w), description_style),
                 ]))
                 .style(row_style)
             });
+        let input = app.input.text();
+        let base = if input.starts_with("/model ") {
+            "Models"
+        } else if input.starts_with("/provider ") {
+            "Providers"
+        } else if input.starts_with("/resume") {
+            "Sessions"
+        } else {
+            "Slash commands"
+        };
+        let title = if suggestions.len() > visible {
+            format!(" {base} {}/{} ", app.slash_selected + 1, suggestions.len())
+        } else {
+            format!(" {base} ")
+        };
         f.render_widget(Clear, popup);
         f.render_widget(
             List::new(items).block(
                 Block::default()
-                    .title(" Slash commands ")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue))
                     .style(Style::default().bg(theme::popup_bg())),
