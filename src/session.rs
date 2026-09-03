@@ -402,10 +402,16 @@ impl Session {
                 .append(true)
                 .open(path)?;
             writeln!(file, "{}", line)?;
-            // Durability: flush to disk before reporting success so a crash
-            // cannot lose the last record while in-memory state believes it
-            // was persisted (P8 journal).
-            file.sync_data()?;
+            // Industry harnesses (pi, claude) don't fsync every line — they
+            // rely on OS buffer + periodic flush. Sync only when
+            // durability matters (turn boundaries / effect journal) or when
+            // DEX_DURABLE=1 is set for strict recovery testing.
+            let durable = std::env::var("DEX_DURABLE").as_deref() == Ok("1")
+                || line.contains("\"type\":\"turn_")
+                || line.contains("\"type\":\"effect_");
+            if durable {
+                file.sync_data()?;
+            }
         }
         Ok(())
     }
@@ -464,7 +470,14 @@ impl Session {
             .append(true)
             .open(path)?;
         writeln!(file, "{}", line)?;
-        file.sync_data()?;
+        // Event journal is replayable but not critical for crash recovery —
+        // sync only for terminal events or when DEX_DURABLE=1.
+        let is_terminal = payload.to_string().contains("TurnComplete")
+            || payload.to_string().contains("TurnFailed")
+            || std::env::var("DEX_DURABLE").as_deref() == Ok("1");
+        if is_terminal {
+            file.sync_data()?;
+        }
         Ok(())
     }
 

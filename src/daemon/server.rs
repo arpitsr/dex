@@ -721,9 +721,12 @@ fn run_turn_inner(
             .transpose()?,
     )
     .map_err(|e| format!("failed to build config: {e}"))?;
-    // P9: auto-detect the verification command at the daemon boundary (its
-    // filesystem is the workspace); the agent loop consumes config only.
-    if config.verify_command.is_none() {
+    // Verification is opt-in (DEX_VERIFY / config verify_command). No
+    // auto-detect by default — pi has no verify hook and auto-running
+    // `cargo test` after every edit is the biggest loop tax.
+    // Set DEX_VERIFY or config verify_command, or DEX_VERIFY=1 with a manifest,
+    // to re-enable: `DEX_VERIFY=1` or explicit `verify_command` in config.
+    if config.verify_command.is_none() && std::env::var("DEX_VERIFY").as_deref() == Ok("1") {
         config.verify_command = crate::llm::config::detect_verify_command();
     }
 

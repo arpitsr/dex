@@ -28,7 +28,12 @@ pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamTo
 }
 
 pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
-    vec![
+    // Industry harnesses (pi, claude) ship 4-6 tools. `chain` and `git`
+    // cost ~800 prompt tokens per request and are rarely used — `read`
+    // fan-out + parallel calls cover the same, and `git` is reachable via
+    // `bash "git ..."`. Gate them behind DEX_EXTRA_TOOLS=1 for compat.
+    let extra = std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1");
+    let mut tools = vec![
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
@@ -123,15 +128,17 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                 }),
             },
         },
-        ToolDefinition {
+    ];
+    if extra {
+        tools.push(ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "git".to_string(),
                 description: "Inspect repository status or diff (read-only).".to_string(),
                 parameters: json!({"type":"object","properties":{"mode":{"type":"string","enum":["status","diff"]}}}),
             },
-        },
-        ToolDefinition {
+        });
+        tools.push(ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "chain".to_string(),
@@ -158,8 +165,9 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                     "required": ["steps"]
                 }),
             },
-        },
-    ]
+        });
+    }
+    tools
 }
 
 pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
@@ -318,10 +326,15 @@ mod tests {
     fn tools_schema_contains_all_tools() {
         let schema = tools_schema();
         let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["read", "bash", "write", "edit", "ffgrep", "fffind", "git", "chain"]
-        );
+        // Default is 6 tools (pi parity); DEX_EXTRA_TOOLS=1 adds git+chain
+        if std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1") {
+            assert_eq!(
+                names,
+                ["read", "bash", "write", "edit", "ffgrep", "fffind", "git", "chain"]
+            );
+        } else {
+            assert_eq!(names, ["read", "bash", "write", "edit", "ffgrep", "fffind"]);
+        }
     }
 
     #[test]
