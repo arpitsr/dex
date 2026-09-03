@@ -38,9 +38,32 @@ cargo build --release
 
 ## Configuration
 
-There is no config file — everything is environment variables (plus `--model` /
-`--base-url` CLI flags and `/model` + `/provider` session switches, which persist
-across resumes via session state). To get started:
+Defaults come from a config file, layered under env vars and CLI flags:
+
+| Layer (wins first)        | Example                              |
+| ------------------------- | ------------------------------------ |
+| CLI flags                 | `--model`, `--base-url`              |
+| Environment variables     | `OPENAI_MODEL`, `OPENAI_BASE_URL`    |
+| Config file               | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
+| Built-in defaults         | provider `opencode`, model `gpt-5.6-luna` |
+
+Supported file keys: `provider`, `api_key`, `base_url`, `model`, `api` (other
+keys are preserved untouched). `/model` and `/provider` selections are written
+back to the file's `model:`/`provider:`/`base_url:` keys, so a switch becomes
+the new default for later runs. Session state still re-applies the exact
+provider/model on `/resume`.
+
+A minimal `~/.config/dex/config.yaml`:
+
+```yaml
+provider: opencode
+api_key: sk-...
+base_url: https://opencode.ai/zen/go/v1
+model: glm-5.3-flash
+api: openai-completions
+```
+
+Or without a file:
 
 ```sh
 export OPENAI_API_KEY=sk-...                    # the only required setting
@@ -291,7 +314,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | -------------------- | -------------------------------------------------------- |
 | `OPENAI_API_KEY`     | API key (required for `opencode`; export it in your shell profile). |
 | `OPENAI_BASE_URL`    | API base URL (default `https://api.openai.com/v1`; e.g. `https://opencode.ai/zen/v1`). |
-| `OPENAI_MODEL`       | Model selection (default `gpt-5.6-luna`).                |
+| `OPENAI_MODEL`       | Model selection (default: config file `model:` or `gpt-5.6-luna`).          |
 | `OPENAI_API`         | Wire protocol default (`openai-completions` or `openai-responses`); pins one protocol for everything. |
 | `DEX_PROVIDER`        | Provider selection (`opencode` or `openai-codex`, default `opencode`). |
 | `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |

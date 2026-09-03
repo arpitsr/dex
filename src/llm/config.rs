@@ -6,6 +6,108 @@ use std::time::Duration;
 use crate::core::types::*;
 use crate::llm::auth::*;
 
+/// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
+/// > `~/.config/dex/config.yaml`.
+fn config_file_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = env::var_os("DEX_CONFIG") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let dir = env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(dir.join("dex/config.yaml"))
+}
+
+/// Raw config file as YAML. Parsed as an untyped `Value` so unknown keys
+/// survive the `/model` write-back. Missing/invalid file → None (env rules).
+fn load_config_file() -> Option<serde_yaml::Value> {
+    let text = std::fs::read_to_string(config_file_path()?).ok()?;
+    serde_yaml::from_str(&text).ok()
+}
+
+fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String> {
+    file.as_ref()
+        .and_then(|f| f.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// Persisted wire protocols learned empirically at runtime
+/// (`XDG_CACHE_HOME/dex/learned-apis.json`): models that rejected
+/// `/responses` and succeeded over `/chat/completions`. Keyed
+/// `"<base_url>|<model>"`. Only consulted when nothing explicit pins the
+/// protocol. ponytail: no expiry — a model that speaks completions keeps
+/// working even after the provider adds responses support.
+fn learned_apis_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
+        return Some(std::path::PathBuf::from(dir).join("dex/learned-apis.json"));
+    }
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache/dex/learned-apis.json"))
+}
+
+fn learned_api(base_url: &str, model: &str) -> Option<ApiProtocol> {
+    let text = std::fs::read_to_string(learned_apis_path()?).ok()?;
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
+    map.get(format!("{base_url}|{model}").as_str())?
+        .as_str()
+        .and_then(ApiProtocol::parse)
+}
+
+/// Best-effort write; a lost race between concurrent learners just re-learns.
+pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol) {
+    let Some(path) = learned_apis_path() else {
+        return;
+    };
+    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    map.insert(
+        format!("{base_url}|{model}"),
+        serde_json::Value::from(api.name()),
+    );
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Write a model/provider selection back to the config file: `model:` keeps
+/// the raw selection (endpoint prefixes like `go/…` re-route on restart),
+/// `provider:`/`base_url:` the resolved values. Everything else (api_key,
+/// api, comments excepted) is preserved verbatim. Best-effort: a read-only
+/// or missing file silently skips the write.
+/// ponytail: serde_yaml drops comments on write-back; restructure the file
+/// if round-tripping comments ever matters.
+fn persist_selection(selection: &str, provider: Provider, base_url: &str) {
+    let Some(path) = config_file_path() else {
+        return;
+    };
+    let mut root: serde_yaml::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str(&text).ok())
+        .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if let Some(map) = root.as_mapping_mut() {
+        for (k, v) in [
+            ("model", serde_yaml::Value::from(selection)),
+            ("provider", serde_yaml::Value::from(provider.name())),
+            ("base_url", serde_yaml::Value::from(base_url)),
+        ] {
+            map.insert(serde_yaml::Value::from(k), v);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_yaml::to_string(&root) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
     match provider {
         Provider::OpenCode => 128_000,
@@ -13,7 +115,7 @@ pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
     }
 }
 
-fn provider_endpoints(provider: Provider) -> BTreeMap<String, String> {
+pub(crate) fn provider_endpoints(provider: Provider) -> BTreeMap<String, String> {
     if provider == Provider::OpenCode {
         // ponytail: static table, add dynamic registry if more than 3 providers/endpoints
         [
@@ -327,36 +429,6 @@ pub(crate) fn detect_verify_command() -> Option<String> {
     None
 }
 
-/// Warn once when a legacy config file exists: files are no longer read —
-/// everything is environment now. Called at process startup (not per turn).
-pub(crate) fn warn_if_legacy_config() {
-    let mut candidates: Vec<std::path::PathBuf> = env::var_os("DEX_CONFIG")
-        .map(std::path::PathBuf::from)
-        .into_iter()
-        .collect();
-    if candidates.is_empty() {
-        let dir = env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
-        if let Some(dir) = dir {
-            for name in [
-                "dex/config.yaml",
-                "dex/config.yml",
-                "dex/config.json",
-                "ak/config.json",
-            ] {
-                candidates.push(dir.join(name));
-            }
-        }
-    }
-    if let Some(path) = candidates.iter().find(|p| p.exists()) {
-        eprintln!(
-            "[dex] {} exists but config files are no longer read; use environment variables (see README) and remove it",
-            path.display()
-        );
-    }
-}
-
 #[derive(Deserialize)]
 struct ModelsResponse {
     #[serde(default)]
@@ -399,7 +471,7 @@ fn fetch_provider_models(
 /// Dex-owned per-model table (`DEX_MODEL_APIS="id=api,..."`, e.g.
 /// `"kimi-k2.6=openai-completions"`); full `endpoint/id` selection first,
 /// then the bare id. None keeps the current/global api.
-fn model_api_from_env(selection: &str, bare_id: &str) -> Option<ApiProtocol> {
+pub(crate) fn model_api_from_env(selection: &str, bare_id: &str) -> Option<ApiProtocol> {
     let raw = env::var("DEX_MODEL_APIS").ok()?;
     let mut bare = None;
     for entry in raw.split(',') {
@@ -462,12 +534,15 @@ impl LlmConfig {
             Some(mode) => mode,
             None => permission_from_env()?,
         };
+        let file = load_config_file();
         let provider_name = env::var("DEX_PROVIDER")
             .ok()
+            .or_else(|| load_config_str(&file, "provider"))
             .unwrap_or_else(|| "opencode".to_string());
         let provider = Provider::parse(&provider_name)?;
         let model = model_override
             .or_else(|| env::var("OPENAI_MODEL").ok())
+            .or_else(|| load_config_str(&file, "model"))
             .unwrap_or_else(|| match provider {
                 Provider::OpenCode => "gpt-5.6-luna".to_string(),
                 Provider::OpenAiCodex => "gpt-5.6-luna".to_string(),
@@ -487,10 +562,12 @@ impl LlmConfig {
         let explicit_base_url = base_url_override.is_some();
         let base_url = base_url_override
             .or(env_base_url)
+            .or_else(|| load_config_str(&file, "base_url"))
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| provider.default_base_url().to_string());
         let api_name = env::var("OPENAI_API")
             .ok()
+            .or_else(|| load_config_str(&file, "api"))
             .unwrap_or_else(|| "openai-responses".to_string());
         let api = match ApiProtocol::parse(&api_name) {
             Some(api) => api,
@@ -513,6 +590,7 @@ impl LlmConfig {
             Provider::OpenCode => (
                 env::var("OPENAI_API_KEY")
                     .ok()
+                    .or_else(|| load_config_str(&file, "api_key"))
                     .ok_or("OPENAI_API_KEY not set (export it or add it to your shell profile)")?,
                 None,
             ),
@@ -586,7 +664,7 @@ impl LlmConfig {
         // per-request model) routes to its endpoint; bare ids keep the
         // resolved base_url. An explicit --base-url wins over routing.
         if !explicit_base_url {
-            this.apply_model(&model);
+            this.apply_model(&model, false);
         }
         Ok(this)
     }
@@ -595,8 +673,11 @@ impl LlmConfig {
     /// base_url) when `provider` parses as a known provider; `endpoint/model`
     /// routes to the named endpoint's base_url. Provider prefix is stripped
     /// first, then endpoint routing runs on the remainder. Returns the endpoint
-    /// name when an endpoint route was taken.
-    pub(crate) fn apply_model(&mut self, selection: &str) -> Option<String> {
+    /// name when an endpoint route was taken. With `persist`, the selection is
+    /// written back to the config file (it becomes the new default).
+    pub(crate) fn apply_model(&mut self, selection: &str, persist: bool) -> Option<String> {
+        let prev_model = self.model.clone();
+        let prev_provider = self.provider;
         // Provider-qualified: "opencode/gpt-..." or "openai-codex/gpt-..." sets base_url without env
         let mut sel = selection;
         if let Some((prefix, rest)) = selection.split_once('/') {
@@ -638,7 +719,12 @@ impl LlmConfig {
         if env::var("OPENAI_API").is_err() {
             if let Some(api) = model_api_from_env(selection, &self.model) {
                 self.api = api;
+            } else if let Some(learned) = learned_api(&self.base_url, &self.model) {
+                self.api = learned;
             }
+        }
+        if persist && (self.model != prev_model || self.provider != prev_provider) {
+            persist_selection(selection, self.provider, &self.base_url);
         }
         // Dex standalone: contextWindow from models.dev catalog > provider default; refresh unless env pinned it.
         if env::var("DEX_CONTEXT_WINDOW").is_err() {
@@ -674,6 +760,7 @@ impl LlmConfig {
     pub(crate) fn switch_provider(
         &mut self,
         provider: Provider,
+        persist: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
         let (api_key, account_id) = match provider {
@@ -704,12 +791,15 @@ impl LlmConfig {
                 self.api = api;
             }
         }
+        if persist {
+            persist_selection(&self.model, provider, &self.base_url);
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -740,24 +830,24 @@ mod tests {
             client: reqwest::blocking::Client::new(),
         };
         // Bare id keeps the current base_url.
-        assert_eq!(cfg.apply_model("gpt-5.6-luna"), None);
+        assert_eq!(cfg.apply_model("gpt-5.6-luna", false), None);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         // Prefixed id routes to the endpoint and strips the prefix.
-        assert_eq!(cfg.apply_model("go/kimi-k2").as_deref(), Some("go"));
+        assert_eq!(cfg.apply_model("go/kimi-k2", false).as_deref(), Some("go"));
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "kimi-k2");
         // Provider-native slashes in model ids survive under an endpoint.
         assert_eq!(
-            cfg.apply_model("go/moonshotai/kimi-k2").as_deref(),
+            cfg.apply_model("go/moonshotai/kimi-k2", false).as_deref(),
             Some("go")
         );
         assert_eq!(cfg.model, "moonshotai/kimi-k2");
         // Unknown prefix is a plain model id.
-        assert_eq!(cfg.apply_model("unknown/m"), None);
+        assert_eq!(cfg.apply_model("unknown/m", false), None);
         assert_eq!(cfg.model, "unknown/m");
     }
 
-    fn test_cfg() -> LlmConfig {
+    pub(crate) fn test_cfg() -> LlmConfig {
         LlmConfig {
             provider: Provider::OpenCode,
             api_key: "k".into(),
@@ -826,10 +916,10 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _guard = model_apis_env("m-c=openai-completions");
         let mut cfg = test_cfg();
-        cfg.apply_model("m-c");
+        cfg.apply_model("m-c", false);
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         // Unknown ids keep the current protocol.
-        cfg.apply_model("m-r");
+        cfg.apply_model("m-r", false);
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
     }
 
@@ -840,11 +930,11 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _guard = model_apis_env("m-x=openai-completions,go/m-x=openai-responses");
         let mut cfg = test_cfg();
-        cfg.apply_model("go/m-x");
+        cfg.apply_model("go/m-x", false);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "m-x");
         assert_eq!(cfg.api, ApiProtocol::Responses);
-        cfg.apply_model("m-x");
+        cfg.apply_model("m-x", false);
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
     }
 
@@ -906,23 +996,23 @@ mod tests {
         // starts as OpenCode @ zen
         assert_eq!(cfg.provider, Provider::OpenCode);
         // Switch to codex via provider-qualified model — no env base_url required
-        cfg.apply_model("openai-codex/gpt-5.6-luna");
+        cfg.apply_model("openai-codex/gpt-5.6-luna", false);
         assert_eq!(cfg.provider, Provider::OpenAiCodex);
         assert_eq!(cfg.base_url, Provider::OpenAiCodex.default_base_url());
         assert_eq!(cfg.model, "gpt-5.6-luna");
         // Switch back via alias "openai"
-        cfg.apply_model("openai/gpt-4o");
+        cfg.apply_model("openai/gpt-4o", false);
         assert_eq!(cfg.provider, Provider::OpenCode);
         assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url());
         assert_eq!(cfg.model, "gpt-4o");
         // Provider + endpoint: opencode/go/kimi -> go endpoint
-        cfg.apply_model("opencode/go/kimi-k2");
+        cfg.apply_model("opencode/go/kimi-k2", false);
         assert_eq!(cfg.provider, Provider::OpenCode);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "kimi-k2");
         // Bare endpoint still works without provider prefix
         cfg = test_cfg();
-        cfg.apply_model("go/kimi-k2");
+        cfg.apply_model("go/kimi-k2", false);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "kimi-k2");
     }
@@ -936,13 +1026,20 @@ mod tests {
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_MODEL",
+            "OPENAI_API",
             "DEX_PROVIDER",
             "DEX_MODELS",
+            "DEX_CONFIG",
         ]);
         std::env::set_var("OPENAI_API_KEY", "test-key2");
         std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("DEX_MODELS");
         std::env::set_var("DEX_PROVIDER", "opencode");
+        // No config file: point DEX_CONFIG at a missing path.
+        std::env::set_var(
+            "DEX_CONFIG",
+            std::env::temp_dir().join(format!("dex-missing-{}", std::process::id())),
+        );
         let cfg = LlmConfig::from_env(None, None, None).unwrap();
         assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url());
         assert!(cfg.endpoints.contains_key("go"));
@@ -1003,21 +1100,59 @@ mod tests {
     }
 
     #[test]
-    fn warn_if_legacy_config_fires_on_dex_config_target() {
+    fn config_file_defaults_apply_and_env_wins() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_CONFIG"]);
-        // No target, no warning (nothing to assert on stderr; just no panic).
-        std::env::remove_var("DEX_CONFIG");
-        warn_if_legacy_config();
-        // Point at a real file: still just warns, never reads.
-        let dir = std::env::temp_dir().join(format!("dex-legacy-{}", std::process::id()));
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENAI_MODEL",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-filecfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        std::fs::write(&path, "model: grabbed-if-read\n").unwrap();
+        std::fs::write(
+            &path,
+            "provider: opencode\napi_key: file-key\nbase_url: https://file.example/v1\nmodel: file-model\napi: openai-completions\ncustom_key: keep-me\n",
+        )
+        .unwrap();
         std::env::set_var("DEX_CONFIG", &path);
-        warn_if_legacy_config();
+        std::env::set_var("OPENAI_API_KEY", "env-key");
+        // No OPENAI_MODEL: file model + file base_url + file api apply.
+        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        assert_eq!(cfg.model, "file-model");
+        assert_eq!(cfg.base_url, "https://file.example/v1");
+        assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
+        // Env model beats the file.
+        std::env::set_var("OPENAI_MODEL", "env-model");
+        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        assert_eq!(cfg.model, "env-model");
+        // Write-back: selection lands in the file, unknown keys survive.
+        let mut cfg = LlmConfig::from_env(None, None, None).unwrap();
+        cfg.apply_model("go/new-model", true);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("model: go/new-model"));
+        assert!(text.contains("custom_key: keep-me"));
+        assert!(text.contains("api_key: file-key"));
+        // Learned protocol: remembered to the cache, picked up on the next
+        // config build (nothing explicit pins this model's protocol).
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+        let cache = dir.join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        remember_learned_api(
+            "https://file.example/v1",
+            "file-model",
+            ApiProtocol::ChatCompletions,
+        );
+        assert!(cache.join("dex/learned-apis.json").exists());
+        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
