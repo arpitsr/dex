@@ -72,7 +72,11 @@ mod tests {
     #[test]
     fn base_prompt_does_not_duplicate_tool_schema_detail() {
         // Pagination/chain/stitching guidance lives in tool descriptions, not here.
-        let base = system_prompt(&[]);
+        let base = system_prompt(&[])
+            .split("\n\n--- Project instructions ---\n")
+            .next()
+            .unwrap()
+            .to_string();
         for needle in [
             "offset/limit",
             "from/take",

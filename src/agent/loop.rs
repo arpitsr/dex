@@ -590,6 +590,8 @@ mod tests {
         );
         let events: Vec<_> = sink_rx.try_iter().collect();
         assert!(events.iter().any(|e| matches!(e, SinkLine::ToolInput(_))));
-        assert!(events.iter().any(|e| matches!(e, SinkLine::ToolOutput { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SinkLine::ToolOutput { .. })));
     }
 }

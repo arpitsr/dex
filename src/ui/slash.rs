@@ -4,9 +4,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-use crate::core::types::{ChatMessage, Provider};
 #[allow(unused_imports)]
 use crate::core::types::Plan;
+use crate::core::types::{ChatMessage, Provider};
 use crate::session::Session;
 
 use super::{push_info, rebuild_transcript, App, InputField};
