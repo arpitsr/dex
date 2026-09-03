@@ -12,8 +12,7 @@ sessions and can be resumed.
   endpoints (OpenAI, OpenCode Zen, Moonshot/Kimi, etc.). Streaming responses,
   automatic retries with exponential backoff, and configurable reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write
-  and edit files, search the filesystem, and inspect git status/diffs. Tool
-  output caching is disabled by default; set `DEX_TOOL_CACHE=1` to opt in.
+  and edit files, search the filesystem. Extra tools (`git`, `chain`) behind `DEX_EXTRA_TOOLS=1`. Tool output caching disabled by default; set `DEX_TOOL_CACHE=1` to opt in. Pi-fast defaults: minimal prompt, parallel `write`/`edit` on distinct files, deterministic compaction, no per-turn `git`/`verify` tax.
 - **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript
   (via `ratatui-markdown`), a custom multi-line input editor with an inline
   block cursor and soft-wrapping (no `tui-textarea` underline / horizontal
@@ -24,8 +23,7 @@ sessions and can be resumed.
 - **Skills** — lightweight, discoverable agent skills (directories with a
   `SKILL.md` frontmatter) can be injected into the system prompt or loaded on
   demand via `/skill:<name>`.
-- **History compaction** — when the context window is exceeded, older turns are
-  summarized (or truncated as a fallback) to keep requests bounded.
+- **History compaction** — when the context window is exceeded, older turns are summarized deterministically (no LLM call) to keep requests bounded. Set `DEX_COMPACTION_LLM=1` for model summarization.
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
 
@@ -65,7 +63,7 @@ cp config.sample.yaml ~/.config/dex/config.yaml
 | `api`            | string   | Wire protocol: `openai-completions` or `openai-responses` (overridable by `OPENAI_API`). |
 | `thinking_effort`| string   | Optional reasoning effort passed to the API (e.g. `"medium"`).     |
 | `context_window` | integer  | Token context window used for compaction/status (overridable by `DEX_CONTEXT_WINDOW`). |
-| `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits. |
+| `max_tool_iterations` / `max_prompt_tokens` / `max_tool_output_bytes` / `max_turn_seconds` | integer | Per-turn safety limits (`max_tool_iterations` default 25, pi p95 ~8). |
 | `http_connect_timeout_secs` / `http_request_timeout_secs` | integer | HTTP connection and request limits. |
 
 The `api` field follows the provider/model API distinction used by Pi and Codex. It defaults to `openai-responses`.
@@ -190,9 +188,7 @@ Tool safety defaults to `ask-writes`. Paths are confined to the current
 workspace; `bash` can execute arbitrary commands in that workspace and should
 only be enabled in trusted environments. Shell commands default to 120
 seconds and 1 MiB per output stream. HTTP requests default to 10 seconds to
-connect and 300 seconds overall. Tool calls are recorded in
-`$XDG_DATA_HOME/dex/audit.jsonl` (or the equivalent path under
-`~/.local/share`). Configure limits with `DEX_TOOL_*`, `DEX_HTTP_*`, and
+connect and 300 seconds overall. Sessions journal to `$XDG_DATA_HOME/dex/sessions/*.jsonl` with `fsync` only on `turn_*`/`effect_*` (set `DEX_DURABLE=1` for per-line). Audit to `audit.jsonl` is off by default (`DEX_AUDIT=1` to enable). Configure limits with `DEX_TOOL_*`, `DEX_HTTP_*`, and
 `DEX_MAX_*` environment variables or the corresponding JSON config fields.
 
 In the interactive TUI, actions requiring approval open a dedicated overlay.
@@ -281,15 +277,17 @@ schema):
 
 | Tool    | Purpose                                                          |
 | ------- | -----------------------------------------------------------------|
-| `read`  | Read a file (`path`).                                            |
+| `read`  | Read a file (`path`, `paths`, `glob`). Line-numbered, tab-expanded. |
 | `bash`  | Run a shell command via `sh -c` (`command`).                     |
 | `write` | Write/overwrite a file (`path`, `content`).                      |
 | `edit`  | Replace exactly one occurrence of text (`path`, `oldText`, `newText`). |
 | `ffgrep` | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`). |
 | `fffind` | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`). |
+| `git`*   | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.   |
+| `chain`* | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`. |
 
-Tool results are truncated before being sent back to the model, and a result
-cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work.
+`*` behind `DEX_EXTRA_TOOLS=1` — pi parity is 6 tools. Tool results are truncated before being sent back to the model, and a result
+cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
 
 ## Environment variables
 
@@ -306,8 +304,21 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work.
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
 | `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`). |
 | `DEX_CONFIG`    | Explicit path to the config file.                        |
+| `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
+| `DEX_GIT_CONTEXT` | `1` to inject `git status/diff --stat` per turn (off by default). |
+| `DEX_WRAPUP_NUDGE` | `1` to inject wrap-up nudge at 5 iterations remaining. |
+| `DEX_STUCK_DETECT` | `1` to enable stuck detection (identical failures / repeated edits). |
+| `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
+| `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
+| `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
+| `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
+| `DEX_TAB_WIDTH` | Override tab width (1-16) for `read` line numbers.       |
+| `DEX_COST_PER_1K` | Prompt cost per 1k tok for `trace.jsonl` (default `0.002`). |
+| `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap (default 25, was 60). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
+
+Restore strict harness: `DEX_DURABLE=1 DEX_AUDIT=1 DEX_EXTRA_TOOLS=1 DEX_GIT_CONTEXT=1 DEX_VERIFY=1 DEX_STUCK_DETECT=1 DEX_WRAPUP_NUDGE=1 DEX_COMPACTION_LLM=1 dex`
 
 ## Project structure
 
@@ -338,10 +349,9 @@ dex/
 ## How it works
 
 A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
-model with tools enabled, executes any requested tool calls in parallel, feeds
-results back, and compacts history once the message count or estimated token
-budget is exceeded. A wrap-up nudge is injected when few tool-call iterations
-remain. Progress is reported through a `Console` (streamed lines + approval
+model with tools enabled, executes any requested tool calls in parallel ( `write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
+results back, and compacts history deterministically once the message count or estimated token
+budget is exceeded. Optional `DEX_WRAPUP_NUDGE`/`DEX_STUCK_DETECT`/`DEX_VERIFY` hooks and `git` context are off by default for pi-fast latency. Progress is reported through a `Console` (streamed lines + approval
 requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and

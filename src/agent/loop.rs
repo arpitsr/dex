@@ -25,6 +25,7 @@ pub(crate) fn within_budget(deadline: Instant) -> bool {
 
 /// Maximum number of model round-trips within a single turn.
 /// When this many iterations remain, nudge the model to wrap up.
+/// Disabled by default (0) — set DEX_WRAPUP_NUDGE=1 to re-enable.
 pub(crate) const WRAP_UP_THRESHOLD: usize = 5;
 
 fn load_plan(session: &Option<&mut Session>) -> crate::core::types::Plan {
@@ -39,10 +40,12 @@ fn plan_injection(plan: &crate::core::types::Plan) -> Option<String> {
 }
 
 fn capture_git_context(cancel: &dyn CancellationSource) -> Option<String> {
+    // Opt-in: pi has no per-turn git snapshot. Enable with DEX_GIT_CONTEXT=1
+    // when you need branch/dirty awareness without paying shell cost.
+    if std::env::var("DEX_GIT_CONTEXT").as_deref() != Ok("1") {
+        return None;
+    }
     let mut parts = Vec::new();
-    // Git snapshot — reuse tool_git via direct execute so timeout/cancellation applies.
-    // This is ephemeral (not persisted): only the git stat, not the plan.
-    // The plan is injected separately as `name:plan` each turn.
     for mode in ["status", "diff"] {
         let mut args = serde_json::Map::new();
         args.insert("mode".into(), serde_json::Value::String(mode.into()));
@@ -68,7 +71,6 @@ fn capture_git_context(cancel: &dyn CancellationSource) -> Option<String> {
         return None;
     }
     let mut msg = parts.join("\n\n");
-    // Cap ~10 lines
     let lines: Vec<&str> = msg.lines().collect();
     if lines.len() > 10 {
         msg = format!("{}\n[... truncated]", lines[..10].join("\n"));
@@ -97,6 +99,9 @@ pub(crate) fn permission_denied(mode: PermissionMode, name: &str) -> Option<Stri
 }
 
 fn audit_approval(name: &str, input: &str, decision: &str) {
+    if std::env::var("DEX_AUDIT").as_deref() != Ok("1") {
+        return;
+    }
     let Some(base) = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -525,11 +530,11 @@ pub(crate) fn process_turn(
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
         }
-        // Ephemeral preamble this iteration: plan + wrap-up nudge (git context
-        // was captured once above). NOT appended to `messages` — injected at
-        // call-time only, so it never accumulates in history.
-        let remaining = iteration_cap.saturating_sub(iteration);
-        let nudge_text: Option<String> = if remaining == WRAP_UP_THRESHOLD {
+        // Ephemeral preamble this iteration: plan + optional wrap-up nudge.
+        // pi has no nudge; dex enables it only with DEX_WRAPUP_NUDGE=1.
+        let nudge_text: Option<String> = if std::env::var("DEX_WRAPUP_NUDGE").as_deref() == Ok("1")
+            && iteration_cap.saturating_sub(iteration) == WRAP_UP_THRESHOLD
+        {
             Some(
                 concat!(
                 "[System] You are approaching the tool-call limit for this turn. ",
@@ -738,10 +743,15 @@ pub(crate) fn process_turn(
             }
 
             // Execute all tool calls in this assistant message in parallel.
+            // pi parallelizes everything except conflicting paths / sequential tools.
+            // dex previously serialized the whole batch on any mutation; now only
+            // bash (unscoped mutation) or conflicting paths force serialization -
+            // write/edit on distinct files run in parallel.
+            let has_bash = calls.iter().any(|c| c.function.name == "bash");
+            let serialize_batch = has_bash || tool_calls_conflict(&calls);
             let batch_has_mutation = calls
                 .iter()
                 .any(|call| crate::tools::is_mutating(&call.function.name));
-            let serialize_batch = batch_has_mutation || tool_calls_conflict(&calls);
             let results: Vec<_> = if serialize_batch {
                 let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 calls
@@ -967,49 +977,53 @@ pub(crate) fn process_turn(
             if batch_has_mutation {
                 state.verify_dirty = true;
             }
-            // — stuck detection — check patterns and escalate
-            let mut stuck_reason: Option<String> = None;
-            if last_failed
-                .iter()
-                .filter(|k| **k == last_failed.last().cloned().unwrap_or_default())
-                .count()
-                >= 3
-            {
-                stuck_reason = Some("identical failed tool calls".into());
-            } else if edit_paths.len() >= 3
-                && edit_paths[edit_paths.len() - 1] == edit_paths[edit_paths.len() - 2]
-                && edit_paths[edit_paths.len() - 2] == edit_paths[edit_paths.len() - 3]
-            {
-                stuck_reason = Some(format!(
-                    "repeated edits to {}",
-                    edit_paths.last().unwrap_or(&String::new())
-                ));
-            } else if search_streak >= 4 {
-                stuck_reason = Some("consecutive searches without a read".into());
-            }
-            if let Some(reason) = stuck_reason {
-                escalation_count += 1;
-                if escalation_count > 3 {
-                    return Err(format!(
-                        "stuck: {reason} — escalation limit reached; aborting turn. {}",
-                        "Partial progress preserved; please re-plan."
-                    )
-                    .into());
+            // — stuck detection — opt-in with DEX_STUCK_DETECT=1 (pi has none).
+            if std::env::var("DEX_STUCK_DETECT").as_deref() == Ok("1") {
+                let mut stuck_reason: Option<String> = None;
+                if last_failed
+                    .iter()
+                    .filter(|k| **k == last_failed.last().cloned().unwrap_or_default())
+                    .count()
+                    >= 3
+                {
+                    stuck_reason = Some("identical failed tool calls".into());
+                } else if edit_paths.len() >= 3
+                    && edit_paths[edit_paths.len() - 1] == edit_paths[edit_paths.len() - 2]
+                    && edit_paths[edit_paths.len() - 2] == edit_paths[edit_paths.len() - 3]
+                {
+                    stuck_reason = Some(format!(
+                        "repeated edits to {}",
+                        edit_paths.last().unwrap_or(&String::new())
+                    ));
+                } else if search_streak >= 4 {
+                    stuck_reason = Some("consecutive searches without a read".into());
                 }
-                let nudge = stuck_nudge(escalation_count, &reason);
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: Some(nudge),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: Some("system-nudge".into()),
-                });
-                persist_pending(&mut session, messages, &mut persisted_cursor)?;
-                if escalation_count == 3 {
-                    search_streak = 0;
+                if let Some(reason) = stuck_reason {
+                    escalation_count += 1;
+                    if escalation_count > 3 {
+                        return Err(format!(
+                            "stuck: {reason} — escalation limit reached; aborting turn. {}",
+                            "Partial progress preserved; please re-plan."
+                        )
+                        .into());
+                    }
+                    let nudge = stuck_nudge(escalation_count, &reason);
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: Some(nudge),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: Some("system-nudge".into()),
+                    });
+                    persist_pending(&mut session, messages, &mut persisted_cursor)?;
+                    if escalation_count == 3 {
+                        search_streak = 0;
+                    }
                 }
             }
-            // — verification hook —
+            // — verification hook — opt-in only when verify_command is explicitly
+            // configured (DEX_VERIFY / config file). No auto-detect by default.
+            // pi has no verify hook; dex keeps it for correctness gates when asked.
             if let Some(cmd) = verify_command.clone() {
                 if state.verify_dirty
                     && within_budget(turn_deadline)
@@ -1470,8 +1484,10 @@ mod tests {
             "{injected}"
         );
         assert!(injected.contains("[x] 1. tests pass"), "{injected}");
-        // And the turn-start context (plan summary) as well.
-        assert!(first.iter().any(|m| m.name.as_deref() == Some("context")));
+        // Turn-start git context is now opt-in (DEX_GIT_CONTEXT=1), so not
+        // required for correctness. Verify that at least the plan was injected.
+        // When DEX_GIT_CONTEXT=1 the context message will also be present.
+        assert!(first.iter().any(|m| m.name.as_deref() == Some("plan")));
     }
 
     /// Mock that plays a scripted sequence of responses and captures every

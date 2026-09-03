@@ -235,6 +235,12 @@ fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolE
 }
 
 fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
+    // Industry harnesses buffer audit async; dex does sync open+write per
+    // tool call which blocks the loop thread on fs. Gate behind DEX_AUDIT=1
+    // for strict auditing, otherwise skip (session.jsonl already journals).
+    if std::env::var("DEX_AUDIT").as_deref() != Ok("1") {
+        return;
+    }
     let Some(base) = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
@@ -866,10 +872,31 @@ fn detect_tab_width(path: &Path) -> usize {
             }
         }
     }
-    if let Some(v) = editorconfig_tab_width(path) {
-        return v;
+    // Cache per-extension + per-directory editorconfig result — pi never
+    // re-reads .editorconfig per file. Cache key is parent dir + extension.
+    {
+        use std::collections::HashMap;
+        use std::sync::{LazyLock, Mutex};
+        static CACHE: LazyLock<Mutex<HashMap<String, usize>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        let key = format!(
+            "{}:{}",
+            path.parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            path.extension().and_then(|e| e.to_str()).unwrap_or("")
+        );
+        if let Ok(cache) = CACHE.lock() {
+            if let Some(&v) = cache.get(&key) {
+                return v;
+            }
+        }
+        let v = editorconfig_tab_width(path).unwrap_or_else(|| language_tab_width(path));
+        if let Ok(mut cache) = CACHE.lock() {
+            cache.insert(key, v);
+        }
+        v
     }
-    language_tab_width(path)
 }
 
 fn editorconfig_tab_width(path: &Path) -> Option<usize> {
