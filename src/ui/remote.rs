@@ -20,7 +20,7 @@ use crate::core::types::{
 use crate::protocol::{ApprovalDecision as ProtocolApprovalDecision, DaemonInfo, StreamEvent};
 use crate::session::Session;
 
-use super::slash::{complete_slash, handle_slash, slash_suggestions};
+use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
 use super::{
     append_sink_line, push_info, render_user_prompt, resolve_approval, scroll_transcript, view,
     App, DisableAlternateScroll, EnableAlternateScroll, PendingApproval, TerminalCleanup,
@@ -1067,13 +1067,35 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
     match line {
         "/quit" => return true,
         "/clear" | "/new" => {
-            let cwd = remote.app.cwd.clone();
-            match remote.client.create_session(&cwd, None) {
-                Ok(session) => {
-                    remote.session_id = session.session_id;
-                    push_info(&mut remote.app, "new session started.".to_string());
+            if remote.app.busy {
+                let what = if line == "/clear" {
+                    "clear history"
+                } else {
+                    "start a new session"
+                };
+                push_info(
+                    &mut remote.app,
+                    format!("cannot {what} while a turn is running."),
+                );
+            } else {
+                let label = if line == "/clear" {
+                    "history cleared."
+                } else {
+                    "new session started."
+                };
+                let cwd = remote.app.cwd.clone();
+                match remote.client.create_session(&cwd, None) {
+                    Ok(session) => {
+                        remote.session_id = session.session_id;
+                        reset_session_state(&mut remote.app);
+                        remote.options.plan = None;
+                        remote.app.session = Session::in_memory(cwd);
+                        push_info(&mut remote.app, label.to_string());
+                    }
+                    Err(e) => {
+                        push_info(&mut remote.app, format!("could not start new session: {e}"))
+                    }
                 }
-                Err(e) => push_info(&mut remote.app, format!("could not start new session: {e}")),
             }
         }
         "/session" => {
@@ -1387,6 +1409,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                                             tool_calls: None,
                                             tool_call_id: None,
                                             name: None,
+                                            ..Default::default()
                                         },
                                     );
                                     remote.app.messages.clear();

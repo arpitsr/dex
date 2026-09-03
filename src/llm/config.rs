@@ -13,6 +13,23 @@ pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
     }
 }
 
+fn provider_endpoints(provider: Provider) -> BTreeMap<String, String> {
+    if provider == Provider::OpenCode {
+        // ponytail: static table, add dynamic registry if more than 3 providers/endpoints
+        [
+            ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
+            (
+                "go".to_string(),
+                "https://opencode.ai/zen/go/v1".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    } else {
+        BTreeMap::new()
+    }
+}
+
 pub(crate) fn dex_models_cache_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
         return Some(std::path::PathBuf::from(dir).join("dex/models.json"));
@@ -128,24 +145,35 @@ pub(crate) fn cost_for_prompt(
 }
 
 fn load_dex_models_cache() -> Option<Vec<String>> {
-    // dex cache is now models.dev catalog — extract opencode ids from it
+    // dex cache is models.dev api.json — expose both bare and provider-qualified ids
+    // so /model shows provider and can set base_url without env
     if let Some(catalog) = load_dex_catalog() {
         if let Some(providers) = catalog.as_object() {
-            if let Some(op) = providers.get("opencode") {
-                if let Some(models) = op.get("models").and_then(|m| m.as_object()) {
-                    let mut ids: Vec<String> = models.keys().cloned().collect();
-                    if let Some(go) = providers.get("opencode-go") {
-                        if let Some(gmodels) = go.get("models").and_then(|m| m.as_object()) {
-                            for id in gmodels.keys() {
-                                ids.push(format!("go/{id}"));
-                                ids.push(id.clone());
+            let mut ids: Vec<String> = Vec::new();
+            for (prov_key, entry) in providers {
+                if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+                    // Only dex-known providers get a qualified variant; others just bare
+                    let dex_prefix: Option<&str> = match prov_key.as_str() {
+                        "opencode" => Some("opencode"),
+                        "opencode-go" => Some("go"),
+                        "openai" => Some("opencode"),
+                        "openai-codex" | "codex" => Some("openai-codex"),
+                        _ => None,
+                    };
+                    for id in models.keys() {
+                        ids.push(id.clone());
+                        if let Some(prefix) = dex_prefix {
+                            if prefix != id.as_str() {
+                                ids.push(format!("{prefix}/{id}"));
                             }
                         }
                     }
-                    if !ids.is_empty() {
-                        return Some(ids);
-                    }
                 }
+            }
+            if !ids.is_empty() {
+                ids.sort();
+                ids.dedup();
+                return Some(ids);
             }
         }
         if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
@@ -457,15 +485,10 @@ impl LlmConfig {
             .unwrap_or_default();
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
         let explicit_base_url = base_url_override.is_some();
-        let base_url = match provider {
-            Provider::OpenCode => base_url_override
-                .or(env_base_url)
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            Provider::OpenAiCodex => base_url_override
-                .or(env_base_url)
-                .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex".to_string()),
-        };
+        let base_url = base_url_override
+            .or(env_base_url)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| provider.default_base_url().to_string());
         let api_name = env::var("OPENAI_API")
             .ok()
             .unwrap_or_else(|| "openai-responses".to_string());
@@ -529,22 +552,8 @@ impl LlmConfig {
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
-        // Already pointed at opencode.ai: expose its zen/go gateways by
-        // default so autocomplete shows which endpoint each model is on.
-        let endpoints: BTreeMap<String, String> =
-            if provider == Provider::OpenCode && base_url.starts_with("https://opencode.ai/") {
-                [
-                    ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-                    (
-                        "go".to_string(),
-                        "https://opencode.ai/zen/go/v1".to_string(),
-                    ),
-                ]
-                .into_iter()
-                .collect()
-            } else {
-                BTreeMap::new()
-            };
+        // Always expose zen/go for OpenCode so /model can set base_url without env
+        let endpoints: BTreeMap<String, String> = provider_endpoints(provider);
         // Dex own cache (no pi dependency) — bootstraps with just current model if missing.
         if available_models.is_empty() {
             if let Some(cached) = load_dex_models_cache() {
@@ -582,23 +591,49 @@ impl LlmConfig {
         Ok(this)
     }
 
-    /// Apply a `/model` selection. `name/model-id` routes to the named
-    /// endpoint's base_url when `name` matches a configured endpoint (the
-    /// prefix is stripped — the provider only knows the bare id); anything
-    /// else is a plain model id on the current base_url. Returns the endpoint
-    /// name when a route was taken.
+    /// Apply a `/model` selection. `provider/model` switches provider (and its
+    /// base_url) when `provider` parses as a known provider; `endpoint/model`
+    /// routes to the named endpoint's base_url. Provider prefix is stripped
+    /// first, then endpoint routing runs on the remainder. Returns the endpoint
+    /// name when an endpoint route was taken.
     pub(crate) fn apply_model(&mut self, selection: &str) -> Option<String> {
-        let result = if let Some((name, rest)) = selection.split_once('/') {
-            if let Some(url) = self.endpoints.get(name) {
+        // Provider-qualified: "opencode/gpt-..." or "openai-codex/gpt-..." sets base_url without env
+        let mut sel = selection;
+        if let Some((prefix, rest)) = selection.split_once('/') {
+            if let Ok(new_provider) = Provider::parse(prefix) {
+                if new_provider != self.provider {
+                    // Best-effort credential switch; failure surfaces at next LLM call
+                    let creds = match new_provider {
+                        Provider::OpenCode => env::var("OPENAI_API_KEY").ok().map(|k| (k, None)),
+                        Provider::OpenAiCodex => load_codex_credentials().ok(),
+                    };
+                    if let Some((k, acct)) = creds {
+                        self.provider = new_provider;
+                        self.api_key = k;
+                        self.account_id = acct;
+                        self.base_url = new_provider.default_base_url().to_string();
+                        self.endpoints = provider_endpoints(new_provider);
+                    } else {
+                        // No creds for target provider — still switch base_url so /model shows intent; LLM call will error clearly
+                        self.provider = new_provider;
+                        self.base_url = new_provider.default_base_url().to_string();
+                        self.endpoints = provider_endpoints(new_provider);
+                    }
+                }
+                sel = rest;
+            }
+        }
+        let result = if let Some((name, rest)) = sel.split_once('/') {
+            if let Some(url) = self.endpoints.get(name).cloned() {
                 self.base_url = url.clone();
                 self.model = rest.to_string();
                 Some(name.to_string())
             } else {
-                self.model = selection.to_string();
+                self.model = sel.to_string();
                 None
             }
         } else {
-            self.model = selection.to_string();
+            self.model = sel.to_string();
             None
         };
         // The model carries its wire protocol; the global `api` is the
@@ -656,12 +691,10 @@ impl LlmConfig {
         self.provider = provider;
         self.api_key = api_key;
         self.account_id = account_id;
-        self.base_url = match provider {
-            Provider::OpenCode => env_base_url
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            Provider::OpenAiCodex => "https://chatgpt.com/backend-api/codex".to_string(),
-        };
+        self.base_url = env_base_url
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| provider.default_base_url().to_string());
+        self.endpoints = provider_endpoints(provider);
         let api_name = env::var("OPENAI_API").ok();
         self.api = api_name
             .as_deref()
@@ -841,12 +874,82 @@ mod tests {
     #[test]
     fn provider_parse_accepts_aliases() {
         assert_eq!(Provider::parse("opencode").unwrap(), Provider::OpenCode);
+        assert_eq!(Provider::parse("openai").unwrap(), Provider::OpenCode);
         assert_eq!(Provider::parse("codex").unwrap(), Provider::OpenAiCodex);
         assert_eq!(
             Provider::parse("openai-codex").unwrap(),
             Provider::OpenAiCodex
         );
         assert!(Provider::parse("unknown").is_err());
+        assert_eq!(
+            Provider::OpenCode.default_base_url(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            Provider::OpenAiCodex.default_base_url(),
+            "https://chatgpt.com/backend-api/codex"
+        );
+    }
+
+    #[test]
+    fn apply_model_switches_provider_and_sets_base_url_without_env() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = EnvRestore::take(&[
+            "OPENAI_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_ACCOUNT_ID",
+            "OPENAI_BASE_URL",
+        ]);
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("CODEX_ACCESS_TOKEN", "codex-tok");
+        std::env::remove_var("OPENAI_BASE_URL");
+        let mut cfg = test_cfg();
+        // starts as OpenCode @ zen
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        // Switch to codex via provider-qualified model — no env base_url required
+        cfg.apply_model("openai-codex/gpt-5.6-luna");
+        assert_eq!(cfg.provider, Provider::OpenAiCodex);
+        assert_eq!(cfg.base_url, Provider::OpenAiCodex.default_base_url());
+        assert_eq!(cfg.model, "gpt-5.6-luna");
+        // Switch back via alias "openai"
+        cfg.apply_model("openai/gpt-4o");
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url());
+        assert_eq!(cfg.model, "gpt-4o");
+        // Provider + endpoint: opencode/go/kimi -> go endpoint
+        cfg.apply_model("opencode/go/kimi-k2");
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(cfg.model, "kimi-k2");
+        // Bare endpoint still works without provider prefix
+        cfg = test_cfg();
+        cfg.apply_model("go/kimi-k2");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(cfg.model, "kimi-k2");
+    }
+
+    #[test]
+    fn endpoints_always_available_for_opencode_without_env() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = EnvRestore::take(&[
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_MODEL",
+            "DEX_PROVIDER",
+            "DEX_MODELS",
+        ]);
+        std::env::set_var("OPENAI_API_KEY", "test-key2");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("DEX_MODELS");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url());
+        assert!(cfg.endpoints.contains_key("go"));
+        assert!(cfg.endpoints.contains_key("zen"));
     }
 
     #[test]
