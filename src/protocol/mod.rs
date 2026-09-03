@@ -48,7 +48,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub skill_dirs: Vec<String>,
     /// Optional per-request overrides; when absent the daemon uses its own
-    /// environment/config file. These let a co-located client forward its
+    /// environment. These let a co-located client forward its
     /// CLI flags through to the turn.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -231,6 +231,8 @@ pub struct LoadSkillResponse {
 pub struct DaemonInfo {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub api: String,
     pub available_models: Vec<String>,
     pub context_window: u64,
     pub permission: String,
