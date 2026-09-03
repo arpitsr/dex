@@ -786,6 +786,42 @@ mod tests {
         assert!(load_session_state(&path).is_err());
     }
 
+    /// Reasoning replay fields must survive the JSONL journal: the
+    /// flattened `ChatMessage` (session.rs `SessionMessageEntry`) round-trips
+    /// `reasoning_items` + `reasoning_content` so a resumed session keeps
+    /// its reasoning thread instead of re-reasoning from scratch.
+    #[test]
+    fn message_round_trip_preserves_reasoning_replay_fields() {
+        let path = unique_path("dex-session-reasoning");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        let mut msg = serde_json::to_value(ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("done".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_items: Some(vec![serde_json::json!({
+                "type": "reasoning",
+                "id": "r1",
+                "encrypted_content": "blob1",
+            })]),
+            reasoning_content: Some("step 1".to_string()),
+        })
+        .unwrap();
+        msg["type"] = serde_json::json!("message");
+        msg["id"] = serde_json::json!("1");
+        msg["timestamp"] = serde_json::json!("2020-01-01T00:00:00Z");
+        fs::write(&path, format!("{}\n{}\n", header, msg)).unwrap();
+        let loaded = load_messages_from_session(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].reasoning_items.as_ref().unwrap()[0]["encrypted_content"],
+            "blob1"
+        );
+        assert_eq!(loaded[0].reasoning_content.as_deref(), Some("step 1"));
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn events_journal_replays_after_seq_cursor() {
         let mut s = Session::new("/tmp/dex-events-test".into(), None).unwrap();

@@ -203,6 +203,10 @@ pub(crate) fn call_responses(
         "input": input,
         "stream": true,
         "store": false,
+        // State is never stored server-side, so ask for the encrypted
+        // reasoning blobs — without them reasoning can't be replayed and
+        // the model re-reasons from scratch on every tool call.
+        "include": ["reasoning.encrypted_content"],
     });
     if let Some(instructions) = instructions {
         body["instructions"] = json!(instructions);
@@ -257,6 +261,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                    ..Default::default()
                 },
                 Some(Usage {
                     prompt_tokens: 3,

@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -43,12 +42,23 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
             .config
             .available_models
             .iter()
-            .filter(|model| model.to_ascii_lowercase().starts_with(&query))
+            .filter(|model| {
+                let lower = model.to_ascii_lowercase();
+                lower.starts_with(&query)
+                    || lower
+                        .split('/')
+                        .last()
+                        .is_some_and(|tail| tail.starts_with(&query))
+            })
             .map(|model| {
+                let is_current = model == &app.config.model
+                    || model.ends_with(&format!("/{}", app.config.model));
                 (
                     format!("/model {model}"),
-                    if model == &app.config.model {
+                    if is_current {
                         "Current model".to_string()
+                    } else if let Some((prov, _)) = model.split_once('/') {
+                        prov.to_string()
                     } else {
                         String::new()
                     },
@@ -166,22 +176,71 @@ pub(super) fn complete_slash(app: &mut App) -> bool {
     true
 }
 
+/// Clear per-session TUI state for `/clear` (same session) and `/new`
+/// (fresh session). Keeps connection/config/skills/history — everything else
+/// (transcript, token spend, plan, queued steering/follow-ups, turn markers)
+/// is scoped to the conversation being discarded.
+pub(super) fn reset_session_state(app: &mut App) {
+    app.messages.truncate(1);
+    app.turn_start = 0;
+    app.turn_started = None;
+    app.active_tool = None;
+    app.last_activity = None;
+    app.pending_steering.clear();
+    app.pending_followups.clear();
+    app.cancel_requested = false;
+    if let Some(approval) = app.pending_approval.take() {
+        let _ = approval
+            .response
+            .send(crate::core::types::ApprovalDecision::Deny);
+    }
+    app.approval_rx = None;
+    app.steering_rx = None;
+    app.followup_rx = None;
+    app.tool_state.last_usage = None;
+    app.tool_state.last_cached = None;
+    app.tool_state.total_usage = 0;
+    app.tool_state.total_cost = 0.0;
+    app.tool_state.verify_dirty = false;
+    app.plan = crate::core::types::Plan::default();
+    app.transcript.clear();
+    app.assistant_open = false;
+    app.autoscroll = true;
+    app.scroll = 0;
+    app.transcript_version = app.transcript_version.wrapping_add(1);
+}
+
 pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
     match line {
         "/quit" => return true,
         "/clear" => {
-            app.messages.truncate(1);
+            if app.busy {
+                push_info(app, "cannot clear while a turn is running.".to_string());
+                return false;
+            }
+            reset_session_state(app);
             let _ = app.session.clear_messages();
+            let _ = app
+                .session
+                .set_state("plan", &crate::core::types::Plan::default().to_json());
             push_info(app, "history cleared.".to_string());
         }
         "/new" => {
-            app.messages.truncate(1);
-            let cwd = env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
+            if app.busy {
+                push_info(
+                    app,
+                    "cannot start a new session while a turn is running.".to_string(),
+                );
+                return false;
+            }
+            let system = app.messages.first().cloned();
+            reset_session_state(app);
+            let cwd = app.cwd.clone();
             match Session::new(cwd, None) {
                 Ok(mut s) => {
-                    s.append_message(app.messages[0].clone()).ok();
+                    if let Some(system) = system {
+                        s.append_message(system).ok();
+                    }
                     app.session = s;
                     push_info(app, "new session started.".to_string());
                 }
@@ -310,6 +369,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     tool_calls: None,
                     tool_call_id: None,
                     name: Some("skill".to_string()),
+                    ..Default::default()
                 });
                 let _ = app
                     .session
@@ -355,6 +415,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     tool_calls: None,
                     tool_call_id: None,
                     name: Some("waive".to_string()),
+                    ..Default::default()
                 });
                 let _ = app
                     .session
@@ -395,6 +456,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         _ if line.starts_with("/model ") => {
             let m = line["/model ".len()..].trim().to_string();
             if !m.is_empty() {
+                let old_provider = app.config.provider;
                 let endpoint = app.config.apply_model(&m);
                 if !app
                     .config
@@ -405,23 +467,36 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     app.config.available_models.push(m.clone());
                 }
                 let _ = app.session.set_state("model", &m);
+                if app.config.provider != old_provider {
+                    let _ = app
+                        .session
+                        .set_state("provider", app.config.provider.name());
+                }
+                let provider_suffix = if app.config.provider != old_provider {
+                    format!(" via {}", app.config.provider.name())
+                } else {
+                    String::new()
+                };
                 match endpoint {
                     Some(name) => push_info(
                         app,
                         format!(
-                            "switched to model: {} @ {} ({}, {})",
+                            "switched to model: {} @ {} ({}, {}){}",
                             app.config.model,
                             name,
                             app.config.base_url,
-                            app.config.api.name()
+                            app.config.api.name(),
+                            provider_suffix
                         ),
                     ),
                     None => push_info(
                         app,
                         format!(
-                            "switched to model: {} ({})",
+                            "switched to model: {} ({}, {}){}",
                             app.config.model,
-                            app.config.api.name()
+                            app.config.api.name(),
+                            app.config.base_url,
+                            provider_suffix
                         ),
                     ),
                 }

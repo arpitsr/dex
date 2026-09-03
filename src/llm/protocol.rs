@@ -203,6 +203,10 @@ pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<
             continue;
         }
         if message.role == "assistant" {
+            // Replay the model's own reasoning items first: with store:false
+            // the request is stateless, and the model only keeps its
+            // reasoning thread if we hand it back.
+            input.extend(message.reasoning_items.iter().flatten().cloned());
             if let Some(content) = &message.content {
                 if !content.is_empty() {
                     input.push(json!({ "role": "assistant", "content": content }));
@@ -363,6 +367,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                ..Default::default()
             },
             ChatMessage {
                 role: "system".into(),
@@ -370,6 +375,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                ..Default::default()
             },
             ChatMessage {
                 role: "user".into(),
@@ -377,6 +383,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                ..Default::default()
             },
             ChatMessage {
                 role: "tool".into(),
@@ -384,6 +391,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
                 name: None,
+                ..Default::default()
             },
         ];
         let (instructions, input) = responses_input(&msgs);
@@ -408,12 +416,47 @@ mod tests {
             }]),
             tool_call_id: None,
             name: None,
+            ..Default::default()
         }];
         let (instructions, input) = responses_input(&msgs);
         assert!(instructions.is_none());
         assert_eq!(input[0]["role"], "assistant");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["call_id"], "c1");
+    }
+
+    /// Reasoning items stored on an assistant message are replayed verbatim
+    /// and first, so a stateless request resumes the model's reasoning
+    /// thread instead of making it re-reason.
+    #[test]
+    fn responses_input_replays_reasoning_items_before_content() {
+        let msgs = vec![ChatMessage {
+            role: "assistant".into(),
+            content: Some("narration".into()),
+            tool_calls: Some(vec![LlmToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+            reasoning_items: Some(vec![json!({
+                "type": "reasoning",
+                "id": "r1",
+                "summary": [],
+                "encrypted_content": "blob1"
+            })]),
+            reasoning_content: None,
+        }];
+        let (_, input) = responses_input(&msgs);
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["encrypted_content"], "blob1");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[2]["type"], "function_call");
     }
 
     #[test]

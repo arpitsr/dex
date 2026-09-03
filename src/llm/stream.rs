@@ -110,6 +110,7 @@ pub(crate) fn read_stream(
     let mut tool_calls: Vec<LlmToolCall> = Vec::new();
     let mut usage_tokens: Option<u64> = None;
     let mut usage_cached: Option<u64> = None;
+    let mut reasoning = String::new();
 
     loop {
         if cancel.take_cancelled() {
@@ -146,6 +147,18 @@ pub(crate) fn read_stream(
                     sink.send(SinkLine::Thinking(text.to_string())).ok();
                 }
             }
+            // DeepSeek-style reasoning text: captured for replay on the
+            // assistant message so the provider gets its own reasoning
+            // thread back next request (self-gating: only set when the
+            // provider streamed this exact field).
+            if let Some(text) = choice
+                .delta
+                .reasoning_content
+                .as_ref()
+                .and_then(Value::as_str)
+            {
+                reasoning.push_str(text);
+            }
             if let Some(text) = choice.delta.content {
                 content.push_str(&text);
                 // Print complete lines live; keep any partial tail buffered.
@@ -181,6 +194,8 @@ pub(crate) fn read_stream(
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             tool_call_id: None,
             name: None,
+            reasoning_items: None,
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
         },
         usage_tokens.map(|tokens| Usage {
             prompt_tokens: tokens,
@@ -202,6 +217,7 @@ pub(crate) fn read_responses_stream(
     let mut tool_calls = Vec::new();
     let mut response_items: HashMap<String, usize> = HashMap::new();
     let mut pending_arguments: HashMap<String, String> = HashMap::new();
+    let mut reasoning_items: Vec<Value> = Vec::new();
     let mut usage_tokens = None;
     let mut usage_cached: Option<u64> = None;
 
@@ -319,6 +335,16 @@ pub(crate) fn read_responses_stream(
                             }
                         }
                     }
+                } else if event.pointer("/item/type").and_then(Value::as_str) == Some("reasoning") {
+                    // Keep raw reasoning items for stateless replay next
+                    // request; summary-only items (no encrypted_content)
+                    // can't be replayed and would corrupt the thread.
+                    let item = event.get("item").unwrap_or(&Value::Null);
+                    if item.get("encrypted_content").map_or(false, |v| {
+                        !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(true)
+                    }) {
+                        reasoning_items.push(item.clone());
+                    }
                 }
             }
             "response.completed" | "response.done" => {
@@ -351,6 +377,8 @@ pub(crate) fn read_responses_stream(
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             tool_call_id: None,
             name: None,
+            reasoning_items: (!reasoning_items.is_empty()).then_some(reasoning_items),
+            reasoning_content: None,
         },
         usage_tokens.map(|tokens| Usage {
             prompt_tokens: tokens,
@@ -428,6 +456,60 @@ mod tests {
             .body(body)
             .unwrap()
             .into()
+    }
+
+    /// A reasoning output item with encrypted_content is captured onto the
+    /// message for stateless replay; summary-only items are not.
+    #[test]
+    fn responses_stream_captures_replayable_reasoning_items() {
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r1","summary":[],"encrypted_content":"blob1"}}"#,
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"r2","summary":[{"type":"summary_text","text":"visible"}]}}"#,
+            r#"data: {"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"read","arguments":"{}"}}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, _) = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        let items = msg.reasoning_items.expect("replayable items captured");
+        assert_eq!(items.len(), 1, "summary-only item must be skipped");
+        assert_eq!(items[0]["encrypted_content"], "blob1");
+        assert!(msg.reasoning_content.is_none());
+    }
+
+    /// Null AND empty-string `encrypted_content` are both unreplayable:
+    /// an empty blob would corrupt the thread if sent back.
+    #[test]
+    fn responses_stream_skips_null_and_empty_encrypted_content() {
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r1","summary":[],"encrypted_content":""}}"#,
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"r2","summary":[],"encrypted_content":null}}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, _) = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert!(
+            msg.reasoning_items.is_none(),
+            "empty/null blobs must not be captured: {:?}",
+            msg.reasoning_items
+        );
+    }
+
+    /// DeepSeek-style chat-completions reasoning: `reasoning_content` deltas
+    /// accumulate onto the message for replay; other reasoning keys are
+    /// UI-only and must not leak into the replay field.
+    #[test]
+    fn chat_stream_captures_reasoning_content_for_replay() {
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"step 1"}}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning":"openrouter-style"}}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":" step 2"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"done"}}]}"#,
+            "data: [DONE]",
+        ]);
+        let (msg, _) = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("step 1 step 2"));
+        assert!(msg.reasoning_items.is_none());
     }
 
     /// Chat-completions stream: content accumulates across chunks and splits

@@ -764,4 +764,59 @@ mod tests {
 
         assert_eq!(app.config.model, "test");
     }
+
+    #[test]
+    fn reset_session_state_clears_per_session_state() {
+        let mut app = test_app();
+        app.messages.push(crate::core::types::ChatMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            ..Default::default()
+        });
+        app.transcript
+            .push(TranscriptBlock::Info(Line::from("old")));
+        app.tool_state.total_usage = 42;
+        app.tool_state.total_cost = 1.5;
+        app.tool_state.last_usage = Some(7);
+        app.pending_steering.push("steer".into());
+        app.pending_followups.push("follow".into());
+        app.plan.steps.push(("step".into(), false));
+        app.turn_start = 3;
+        app.active_tool = Some("read".into());
+        app.last_activity = Some("worked".into());
+        app.scroll = 9;
+        app.autoscroll = false;
+
+        crate::ui::slash::reset_session_state(&mut app);
+
+        assert!(app.messages.len() <= 1);
+        assert!(app.transcript.is_empty());
+        assert!(!app.assistant_open);
+        assert!(app.autoscroll);
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.tool_state.total_usage, 0);
+        assert_eq!(app.tool_state.total_cost, 0.0);
+        assert!(app.tool_state.last_usage.is_none());
+        assert!(app.pending_steering.is_empty());
+        assert!(app.pending_followups.is_empty());
+        assert!(app.plan.is_empty());
+        assert_eq!(app.turn_start, 0);
+        assert!(app.active_tool.is_none());
+        assert!(app.last_activity.is_none());
+    }
+
+    #[test]
+    fn slash_new_refuses_while_busy() {
+        let mut app = test_app();
+        app.busy = true;
+        crate::ui::slash::handle_slash(&mut app, "/new");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|b| matches!(b, TranscriptBlock::Info(l) if l.spans.iter().any(|s| s.content.contains("turn is running"))))
+        );
+    }
 }
