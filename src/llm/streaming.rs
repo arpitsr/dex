@@ -17,12 +17,34 @@ fn probed_apis() -> &'static Mutex<HashMap<(String, String), ApiProtocol>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Wire protocol for this call: an `OPENAI_API` pin or an explicit
-/// `DEX_MODEL_APIS` entry always wins (both are already baked into
+/// A failure raised *after* the provider began streaming the `/responses`
+/// reply (dropped SSE connection, malformed chunk, cancellation). Purely a
+/// type-level marker: `Display` passes the inner message through untouched
+/// so callers matching on `"cancelled"` etc. keep working.
+#[derive(Debug)]
+pub(crate) struct MidStreamError(pub String);
+
+impl std::fmt::Display for MidStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MidStreamError {}
+
+/// Only a pre-stream rejection (HTTP status, connect failure) qualifies for
+/// protocol fallback; a mid-stream failure may have already put partial text
+/// on the transcript, and a retried call would duplicate it.
+fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<MidStreamError>().is_some()
+}
+
+/// Wire protocol for this call: an explicit pin (`OPENAI_API` or config-file
+/// `api:`) or a `DEX_MODEL_APIS` entry always wins (all baked into
 /// `config.api`); otherwise a learned fallback overrides the configured
-/// default (config file `api:` / `openai-responses`).
+/// default (`openai-responses`).
 fn effective_api(config: &LlmConfig) -> ApiProtocol {
-    if std::env::var("OPENAI_API").is_ok()
+    if crate::llm::config::api_pinned()
         || crate::llm::config::model_api_from_env(&config.model, &config.model).is_some()
     {
         return config.api;
@@ -39,7 +61,7 @@ fn effective_api(config: &LlmConfig) -> ApiProtocol {
 /// chat-completions? Only when nothing explicitly pinned the protocol, the
 /// provider exposes both wire shapes, and the failure isn't a cancellation.
 fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
-    if std::env::var("OPENAI_API").is_ok() {
+    if crate::llm::config::api_pinned() {
         return false; // user pinned one protocol for everything
     }
     if crate::llm::config::model_api_from_env(&config.model, &config.model).is_some() {
@@ -71,7 +93,7 @@ pub(crate) fn complete(
                 cancel,
             ) {
                 Ok(ok) => Ok(ok),
-                Err(e) if try_responses_fallback(config, &e.to_string()) => {
+                Err(e) if !is_mid_stream(&*e) && try_responses_fallback(config, &e.to_string()) => {
                     // Empirical protocol inference: responses API rejected the
                     // model — try chat-completions once and remember.
                     match crate::llm::chat_completions::complete(
@@ -132,6 +154,13 @@ mod tests {
             }
             Self { prev }
         }
+
+        /// Point `key` at `value`, restoring the previous value on drop.
+        fn set(mut self, key: &'static str, value: &std::path::Path) -> Self {
+            self.prev.push((key, std::env::var_os(key)));
+            std::env::set_var(key, value);
+            self
+        }
     }
 
     impl Drop for EnvGuard {
@@ -152,7 +181,10 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let mut cfg = test_cfg();
         {
-            let _env = EnvGuard::clear(&["OPENAI_API", "DEX_MODEL_APIS"]);
+            // Hermetic: no real env pins and no developer config.yaml.
+            let absent = std::env::temp_dir().join("dex-gate-test-absent.yaml");
+            let _env =
+                EnvGuard::clear(&["OPENAI_API", "DEX_MODEL_APIS"]).set("DEX_CONFIG", &absent);
             // Unpinned opencode model: fallback allowed.
             assert!(try_responses_fallback(&cfg, "500 Internal server error"));
             // Never on cancellation.
@@ -165,6 +197,16 @@ mod tests {
             std::env::set_var("DEX_MODEL_APIS", "m-r=openai-responses");
             assert!(!try_responses_fallback(&cfg, "500 boom"));
             std::env::remove_var("DEX_MODEL_APIS");
+            // A config-file `api:` pin counts too.
+            let pin_dir =
+                std::env::temp_dir().join(format!("dex-gate-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&pin_dir);
+            std::fs::create_dir_all(&pin_dir).unwrap();
+            std::fs::write(pin_dir.join("config.yaml"), "api: openai-responses\n").unwrap();
+            std::env::set_var("DEX_CONFIG", &pin_dir.join("config.yaml"));
+            assert!(!try_responses_fallback(&cfg, "500 boom"));
+            std::env::set_var("DEX_CONFIG", &absent);
+            let _ = std::fs::remove_dir_all(&pin_dir);
             // Codex backend has no /chat/completions.
             cfg.provider = Provider::OpenAiCodex;
             assert!(!try_responses_fallback(&cfg, "500 boom"));
@@ -187,5 +229,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    #[test]
+    fn mid_stream_marker_blocks_fallback_and_keeps_message() {
+        let err: Box<dyn std::error::Error> = Box::new(MidStreamError("cancelled".into()));
+        assert!(is_mid_stream(&*err));
+        // Display passes the message through untouched so callers matching on
+        // `"cancelled"` (exact or substring) keep working.
+        assert_eq!(err.to_string(), "cancelled");
+        let plain: Box<dyn std::error::Error> = "API error: boom".into();
+        assert!(!is_mid_stream(&*plain));
     }
 }

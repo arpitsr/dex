@@ -1440,9 +1440,21 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             let had_model = remote.app.config.model.clone();
             let had_permission = remote.app.config.permission;
             let had_plan = remote.app.plan.clone();
+            // Raw `/model <selection>` argument: the daemon routes endpoint
+            // prefixes (`go/…`) against its own endpoint table, so it must
+            // see the un-stripped selection — the client's `config.model` is
+            // already resolved to the bare id.
+            let raw_model = if line.starts_with("/model ") {
+                Some(line["/model ".len()..].trim().to_string())
+            } else {
+                None
+            };
             let quit = handle_slash(&mut remote.app, line);
             if remote.app.config.model != had_model {
-                remote.options.model = Some(remote.app.config.model.clone());
+                remote.options.model = Some(match raw_model {
+                    Some(raw) if !raw.is_empty() => raw,
+                    _ => remote.app.config.model.clone(),
+                });
             }
             if remote.app.config.permission != had_permission {
                 remote.options.permission = Some(match remote.app.config.permission {
