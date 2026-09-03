@@ -151,10 +151,16 @@ fn post_with_retry(
                 continue;
             }
             provider_log("api_error", &format!("{}: {}", status, body_text));
-            // Opaque 5xx from `/responses` usually means the model only speaks
-            // chat-completions (proven for e.g. glm-5.3-flash on zen/go) —
-            // point at the per-model override instead of a bare body.
-            if url.ends_with("/responses") && env::var("OPENAI_API").is_err() {
+            // Opaque 5xx / missing route from `/responses` usually means the
+            // model only speaks chat-completions (proven for e.g.
+            // glm-5.3-flash on zen/go) — point at the per-model override
+            // instead of a bare body. Auth and rate-limit failures say
+            // nothing about the protocol, and a pinned `api:` means the user
+            // already decided.
+            if url.ends_with("/responses")
+                && !crate::llm::config::api_pinned()
+                && (status == reqwest::StatusCode::NOT_FOUND || status.is_server_error())
+            {
                 return Err(format!(
                     "API error: {} (hint: {} may speak openai-completions; set DEX_MODEL_APIS={}=openai-completions)",
                     body_text, config.model, config.model
@@ -233,7 +239,11 @@ pub(crate) fn call_responses(
         &body,
         sink.as_ref(),
     )?;
+    // Mark failures after streaming began (dropped connection, bad chunk) so
+    // the protocol-fallback gate won't re-run the turn on chat-completions
+    // and duplicate partially streamed output.
     read_responses_stream(resp, sink, cancel)
+        .map_err(|e| Box::new(crate::llm::streaming::MidStreamError(e.to_string())) as _)
 }
 
 pub(crate) fn call_llm(

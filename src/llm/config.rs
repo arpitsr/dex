@@ -21,8 +21,17 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 /// Raw config file as YAML. Parsed as an untyped `Value` so unknown keys
 /// survive the `/model` write-back. Missing/invalid file → None (env rules).
 fn load_config_file() -> Option<serde_yaml::Value> {
-    let text = std::fs::read_to_string(config_file_path()?).ok()?;
-    serde_yaml::from_str(&text).ok()
+    let path = config_file_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_yaml::from_str::<serde_yaml::Value>(&text) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            // A typo'd file must not silently disable every user setting.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| eprintln!("dex: ignoring invalid config {}: {e}", path.display()));
+            None
+        }
+    }
 }
 
 fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String> {
@@ -31,6 +40,17 @@ fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty())
+}
+
+/// True when the user explicitly pinned the wire protocol: the `OPENAI_API`
+/// env var or an `api:` key in config.yaml. Per-model `DEX_MODEL_APIS`
+/// entries don't count — they decide per model, but empirical fallback stays
+/// available for unlisted models.
+pub(crate) fn api_pinned() -> bool {
+    if env::var("OPENAI_API").is_ok() {
+        return true;
+    }
+    load_config_str(&load_config_file(), "api").is_some()
 }
 
 /// Persisted wire protocols learned empirically at runtime
@@ -1087,8 +1107,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(tmp.join("go.mod"));
         std::fs::write(tmp.join("package.json"), "{}").unwrap();
         assert_eq!(detect_verify_command().as_deref(), Some("npm test"));
-        let _ = std::fs::remove_dir_all(&tmp);
+        // Restore the cwd *before* deleting the temp dir: this runs
+        // concurrently with other tests, and a deleted process cwd makes
+        // `current_dir()` return None for them.
         std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
