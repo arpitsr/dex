@@ -81,7 +81,11 @@ mod tests {
         assert_eq!(acct.as_deref(), Some("file-acct"));
 
         // blank token in file is rejected
-        fs::write(dir.join("auth.json"), r#"{"tokens":{"access_token":"   "}}"#).unwrap();
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"   "}}"#,
+        )
+        .unwrap();
         assert!(load_codex_credentials().is_err());
         let _ = fs::remove_dir_all(&dir);
 

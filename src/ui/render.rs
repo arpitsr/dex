@@ -223,7 +223,11 @@ pub(super) fn ui_status(app: &App) -> String {
                     .checked_div(tokens)
                     .unwrap_or(0)
                     .min(100);
-                base.push_str(&format!(" · {} cached ({}%)", format_tokens(cached), hit_pct));
+                base.push_str(&format!(
+                    " · {} cached ({}%)",
+                    format_tokens(cached),
+                    hit_pct
+                ));
             } else {
                 base.push_str(&format!(" · {} cached", format_tokens(cached)));
             }
@@ -657,74 +661,162 @@ impl ApprovalOverlay {
         let Some(approval) = app.pending_approval.as_ref() else {
             return;
         };
-        f.render_widget(Clear, area);
+        // — centered modal, clean readable command —
+        let details = crate::core::format::approval_details(&approval.name, &approval.input);
+        let title = crate::core::format::approval_title(&approval.name);
+        let (risk_label, risk_color) = crate::core::format::approval_risk(&approval.name);
+        let summary = crate::core::format::approval_summary(&approval.name, &approval.input);
+        // width clamped so modal feels floating, not full-bleed; height grows with details
+        let width = area
+            .width
+            .saturating_sub(6)
+            .clamp(52, 76)
+            .min(area.width.saturating_sub(2));
+        let detail_rows = details.len() as u16;
+        // header 2 + gap 1 + details + gap 1 + options 3 + hint 1 + borders(2) + padding(2) = 12+details
+        let needed = detail_rows.saturating_add(12).clamp(13, 22);
+        let height = needed.min(area.height.saturating_sub(4)).max(13);
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        let popup = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        f.render_widget(Clear, popup);
         let block = Block::default()
-            .title(" Approval required ")
-            .borders(Borders::TOP | Borders::BOTTOM)
-            // Keep the overlay's text in the same left gutter as the
-            // transcript and composer instead of flush with the screen edge.
-            .padding(Padding::horizontal(super::HORIZONTAL_GUTTER))
+            .title(format!(" {} — {} ", title, approval.name))
+            .title_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
-            .style(Style::default().bg(theme::surface_bg()));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+            .padding(Padding::new(1, 1, 1, 1))
+            .style(Style::default().bg(theme::popup_bg()));
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
 
-        let command = truncate_display(
-            &cell_safe(&format!("{} {}", approval.name, approval.input)),
-            inner.width.saturating_sub(2),
-        );
-        let header = Paragraph::new(vec![
-            Line::from(Span::styled("The agent wants to run:", theme::surface_fg())),
-            Line::from(Span::styled(command, Style::default().fg(Color::Cyan))),
-            Line::from(""),
+        // inside: header (title+summary), label, details, spacer, options, hint
+        let chunks = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(detail_rows.min(inner.height.saturating_sub(7)).max(1)),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
         ])
-        .wrap(Wrap { trim: false });
+        .split(inner);
+
+        let header_line = Line::from(vec![
+            Span::styled(
+                title.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ·  ", Style::default().fg(theme::muted_fg())),
+            Span::styled(
+                format!("{} risk", risk_label),
+                Style::default().fg(risk_color),
+            ),
+            Span::styled(
+                format!("  ·  {}", approval.name),
+                Style::default().fg(theme::muted_fg()),
+            ),
+        ]);
+        let sub = Line::from(Span::styled(
+            summary.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
         f.render_widget(
-            header,
-            Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: 4,
-            },
+            Paragraph::new(vec![header_line, sub]).wrap(Wrap { trim: false }),
+            chunks[0],
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "The agent wants to run:",
+                Style::default().fg(theme::muted_fg()),
+            ))),
+            chunks[1],
+        );
+        let detail_lines: Vec<Line> = details
+            .into_iter()
+            .map(|d| {
+                let style = if d.starts_with('$') || d.starts_with("path:") {
+                    Style::default().fg(Color::Cyan)
+                } else if d.starts_with("  −") {
+                    Style::default().fg(Color::LightRed)
+                } else if d.starts_with("  +") {
+                    Style::default().fg(Color::LightGreen)
+                } else {
+                    Style::default().fg(theme::tool_input_fg())
+                };
+                Line::from(Span::styled(d, style))
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(detail_lines).wrap(Wrap { trim: false }),
+            chunks[2],
         );
 
         let labels = [
-            ("Allow once", "y"),
-            ("Allow for this session", "s"),
-            ("Deny", "n"),
+            ("Allow once", "y", "just this time"),
+            ("Allow for session", "s", "remember"),
+            ("Deny", "n", "block"),
         ];
-        let items = labels.iter().enumerate().map(|(index, (label, key))| {
-            let marker = if approval.selected == index {
-                "›"
-            } else {
-                " "
-            };
-            let style = if approval.selected == index {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
-            } else {
-                Style::default().fg(theme::surface_fg())
-            };
-            ListItem::new(format!("{marker} {label}  [{key}]")).style(style)
-        });
+        let items: Vec<ListItem> = labels
+            .iter()
+            .enumerate()
+            .map(|(idx, (label, key, hint))| {
+                let sel = approval.selected == idx;
+                let style = if sel {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(theme::surface_fg())
+                        .bg(theme::popup_bg())
+                };
+                let marker = if sel { "› " } else { "  " };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{}{}", marker, label), style),
+                    Span::styled(
+                        format!("  [{}]  ", key),
+                        if sel {
+                            Style::default().fg(Color::Black).bg(Color::Yellow)
+                        } else {
+                            Style::default().fg(theme::muted_fg()).bg(theme::popup_bg())
+                        },
+                    ),
+                    Span::styled(
+                        *hint,
+                        if sel {
+                            Style::default().fg(Color::Black).bg(Color::Yellow)
+                        } else {
+                            Style::default().fg(theme::muted_fg()).bg(theme::popup_bg())
+                        },
+                    ),
+                ]))
+                .style(style)
+            })
+            .collect();
+        f.render_widget(List::new(items), chunks[4]);
         f.render_widget(
-            List::new(items),
-            Rect {
-                x: inner.x,
-                y: inner.y + 4,
-                width: inner.width,
-                height: 3,
-            },
-        );
-        f.render_widget(
-            Paragraph::new("↑/↓ select · Enter confirm · Esc deny")
-                .style(Style::default().fg(theme::muted_fg())),
-            Rect {
-                x: inner.x,
-                y: inner.y + 8,
-                width: inner.width,
-                height: 1,
-            },
+            Paragraph::new("↑↓ navigate · Enter confirm · Esc deny · y / s / n quick")
+                .style(
+                    Style::default()
+                        .fg(theme::muted_fg())
+                        .add_modifier(Modifier::ITALIC),
+                )
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[5],
         );
     }
 }
@@ -742,18 +834,16 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let visible_pending = pending_total.min(3) as u16;
     let extra_queue_line = u16::from(pending_total > 3);
     let activity_items = 1 + visible_pending + extra_queue_line;
-    let layout = compute_layout(
-        area,
-        input_rows,
-        activity_items,
-        app.pending_approval.is_some(),
-    )
-    .expect("layout always exists");
+    // Approval is a centered modal, not a bottom-pane split — don't reserve
+    // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
+    // no reason and push the composer up.
+    let layout =
+        compute_layout(area, input_rows, activity_items, false).expect("layout always exists");
 
     TranscriptView::render(f, layout.transcript, app);
     BottomPane::render(f, &layout, app);
     if app.pending_approval.is_some() {
-        ApprovalOverlay::render(f, layout.approval, app);
+        ApprovalOverlay::render(f, area, app);
     }
     SlashSuggestionsView::render(f, layout.input, app);
 }
@@ -1352,13 +1442,15 @@ mod tests {
 
     #[test]
     fn approval_overlay_renders_action_and_choices() {
+        // Input is raw JSON — overlay must render it as a readable `"$ cargo test"`
+        // plus the human title, not the raw `bash cargo test` dump.
         let (response_tx, _response_rx) = std::sync::mpsc::channel();
         let mut app = test_app();
         app.pending_approval = Some(super::super::PendingApproval {
             name: "bash".to_string(),
-            input: "cargo test".to_string(),
+            input: r#"{"command":"cargo test"}"#.to_string(),
             response: response_tx,
-            selected: 0,
+            selected: 1,
         });
         let backend = TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -1372,28 +1464,50 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(symbols.contains("Approval required"));
-        assert!(symbols.contains("bash cargo test"));
-        assert!(symbols.contains("Allow for this session"));
-        assert!(symbols.contains("Esc deny"));
-        // Tool/why text sits in the app's one-column left gutter, aligned
-        // with the rest of the UI instead of flush with the screen edge.
-        let width = 100;
-        let rows: Vec<String> = symbols
-            .chars()
-            .collect::<Vec<char>>()
-            .chunks(width)
-            .map(|c| c.iter().collect())
+        // Title comes from approval_title, not raw JSON
+        assert!(
+            symbols.contains("Approval required") || symbols.contains("Run shell command"),
+            "{symbols}"
+        );
+        // Readable command — `$ cargo test`, not `bash {"command":…}`
+        assert!(symbols.contains("cargo test"), "{symbols}");
+        assert!(symbols.contains("$"), "{symbols}");
+        // No raw JSON should leak into the overlay
+        assert!(!symbols.contains("\"command\""), "{symbols}");
+        assert!(
+            symbols.contains("Allow for session") || symbols.contains("Allow for this session"),
+            "{symbols}"
+        );
+        assert!(
+            symbols.contains("Esc deny") || symbols.contains("Esc"),
+            "{symbols}"
+        );
+        // Modal is centered, not gutter-aligned — just ensure the key hints are present
+        assert!(
+            symbols.contains("navigate") || symbols.contains("select"),
+            "{symbols}"
+        );
+        // Second check: write tool formats path/lines, not raw JSON
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let mut app2 = test_app();
+        app2.pending_approval = Some(super::super::PendingApproval {
+            name: "write".to_string(),
+            input: r#"{"path":"src/main.rs","content":"hello\nworld\n"}"#.to_string(),
+            response: tx2,
+            selected: 0,
+        });
+        let backend2 = TestBackend::new(80, 24);
+        let mut term2 = ratatui::Terminal::new(backend2).expect("test terminal");
+        term2.draw(|f| view(f, &mut app2)).expect("render");
+        let s2: String = term2
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
             .collect();
-        let at_gutter = |needle: &str| {
-            rows.iter().any(|r| {
-                r.find(needle)
-                    .is_some_and(|byte| r[..byte].chars().count() == 1)
-            })
-        };
-        assert!(at_gutter("The agent"), "header not in gutter");
-        assert!(at_gutter("bash cargo"), "command not in gutter");
-        assert!(at_gutter("\u{2191}/\u{2193} select"), "hint not in gutter");
+        assert!(s2.contains("src/main.rs"), "{s2}");
+        assert!(s2.contains("Create") || s2.contains("write"), "{s2}");
     }
 
     #[test]

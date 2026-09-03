@@ -5,8 +5,23 @@ use crate::protocol::{ApprovalDecision, StreamEvent};
 use super::http::{ChatOptions, DaemonClient};
 
 fn prompt_for_approval(name: &str, input: &str) -> ApprovalDecision {
-    eprintln!("\n  Approve {name}? ({input})");
-    eprint!("  [y/N/s(session)] ");
+    use crate::core::format::{approval_details, approval_summary, approval_title};
+    let title = approval_title(name);
+    let summary = approval_summary(name, input);
+    let details = approval_details(name, input);
+    eprintln!();
+    eprintln!("  ┌─ Approval required ─────────────────────────────────");
+    eprintln!("  │ {} — {}", title, name);
+    eprintln!("  │ {}", summary);
+    for line in details.iter().take(6) {
+        // keep raw JSON out of sight; show the human lines
+        if line == &summary {
+            continue;
+        }
+        eprintln!("  │ {}", line);
+    }
+    eprintln!("  └──────────────────────────────────────────────────────");
+    eprint!("  [y] allow once  [s] allow for session  [n] deny > ");
     io::stderr().flush().ok();
     let mut answer = String::new();
     io::stdin().read_line(&mut answer).ok();

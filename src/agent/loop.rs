@@ -224,13 +224,41 @@ pub(crate) fn approve_tool(
         }
     } else {
         with_console(console.sink().is_some(), || {
-            eprint!("Approve {} {}? [y/N] ", name, terminal_preview(input))
+            let title = crate::core::format::approval_title(name);
+            let summary = crate::core::format::approval_summary(name, input);
+            let details = crate::core::format::approval_details(name, input);
+            eprintln!();
+            eprintln!("  ┌─ Approval required ─────────────────────────────────");
+            eprintln!("  │ {} — {}", title, name);
+            eprintln!("  │ {}", summary);
+            for line in details.iter().take(6) {
+                if line == &summary {
+                    continue;
+                }
+                eprintln!("  │ {}", line);
+            }
+            eprintln!("  └──────────────────────────────────────────────────────");
+            eprint!("  [y] allow once  [s] allow for session  [n] deny > ");
         });
     }
     let _ = io::stdout().flush();
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).is_ok()
-        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    let _ = io::stdin().read_line(&mut answer);
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => {
+            audit_approval(name, input, "once");
+            true
+        }
+        "s" | "session" => {
+            audit_approval(name, input, "session");
+            console.record_session_approval(name, input);
+            true
+        }
+        _ => {
+            audit_approval(name, input, "deny");
+            false
+        }
+    }
 }
 
 pub(crate) fn execute_tool_call(

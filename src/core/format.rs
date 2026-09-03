@@ -306,6 +306,279 @@ pub(crate) fn model_tool_result(text: &str) -> String {
     truncate_text(text, 50 * 1024, 2_000)
 }
 
+/// Human-readable approval helpers — keep tool JSON out of the user's face.
+/// `approval_title` / `approval_summary` / `approval_details` turn raw
+/// `{"path":…}` / `{"command":…}` payloads into the short, scannable
+/// lines the overlay and CLI prompt show. No filesystem IO, pure formatting.
+/// ponytail: one place for all tool-to-human mapping; add a tool → add a branch.
+pub(crate) fn approval_title(name: &str) -> &'static str {
+    match name {
+        "bash" => "Run shell command",
+        "write" => "Create / overwrite file",
+        "edit" => "Edit file",
+        "read" => "Read file",
+        "ffgrep" => "Search contents",
+        "fffind" => "Find files",
+        "git" => "Git",
+        "chain" => "Chained read",
+        _ => "Run tool",
+    }
+}
+
+pub(crate) fn approval_risk(name: &str) -> (&'static str, ratatui::style::Color) {
+    use ratatui::style::Color;
+    match name {
+        "bash" => ("high", Color::LightRed),
+        "write" | "edit" => ("medium", Color::Yellow),
+        _ => ("low", Color::LightGreen),
+    }
+}
+
+pub(crate) fn approval_summary(name: &str, input: &str) -> String {
+    let v = serde_json::from_str::<Value>(input).ok();
+    let obj = v.as_ref().and_then(|v| v.as_object());
+    let get = |k: &str| obj.and_then(|o| o.get(k)).and_then(|x| x.as_str());
+    match name {
+        "bash" => get("command")
+            .map(|c| c.lines().next().unwrap_or(c).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(no command)".to_string()),
+        "write" => {
+            let path = get("path").unwrap_or("(unknown path)");
+            let content = get("content").unwrap_or("");
+            let lines = content.lines().count();
+            format!(
+                "{} · {} line{}",
+                path,
+                lines,
+                if lines == 1 { "" } else { "s" }
+            )
+        }
+        "edit" => {
+            let path = get("path").unwrap_or("(unknown path)");
+            let old = get("oldText").unwrap_or("").lines().count();
+            let new = get("newText").unwrap_or("").lines().count();
+            format!("{} · -{} +{}", path, old, new)
+        }
+        "read" => {
+            if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(|v| v.as_array()) {
+                format!("{} files", paths.len())
+            } else if let Some(glob) = get("glob") {
+                format!("glob: {}", glob)
+            } else {
+                get("path")
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "(no path)".to_string())
+            }
+        }
+        "ffgrep" => get("pattern")
+            .map(|p| format!("search: {}", p))
+            .unwrap_or_else(|| "(no pattern)".to_string()),
+        "fffind" => get("pattern")
+            .map(|p| format!("find: {}", p))
+            .unwrap_or_else(|| "(no pattern)".to_string()),
+        "git" => get("mode")
+            .map(|m| format!("git {}", m))
+            .unwrap_or_else(|| "git".to_string()),
+        "chain" => obj
+            .and_then(|o| o.get("steps"))
+            .and_then(|v| v.as_array())
+            .map(|steps| {
+                let tools: Vec<&str> = steps
+                    .iter()
+                    .filter_map(|s| s.get("tool").and_then(|v| v.as_str()))
+                    .collect();
+                format!("{} steps: {}", steps.len(), tools.join(" → "))
+            })
+            .unwrap_or_else(|| "chain".to_string()),
+        _ => short_arg(name, input),
+    }
+}
+
+pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
+    let v = serde_json::from_str::<Value>(input).ok();
+    let obj = v.as_ref().and_then(|v| v.as_object());
+    let get = |k: &str| obj.and_then(|o| o.get(k)).and_then(|x| x.as_str());
+    match name {
+        "bash" => {
+            if let Some(cmd) = get("command") {
+                let cmd = cmd.trim();
+                if cmd.len() <= 120 && !cmd.contains('\n') {
+                    vec![format!("$ {}", cmd)]
+                } else {
+                    let mut out = vec!["$ ".to_string()];
+                    for (i, line) in cmd.lines().enumerate() {
+                        if i >= 6 {
+                            out.push(format!("  … +{} more lines", cmd.lines().count() - i));
+                            break;
+                        }
+                        let line = line.trim_end();
+                        let limit = line
+                            .char_indices()
+                            .nth(88)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(line.len());
+                        let clipped = if limit < line.len() {
+                            format!("{}…", &line[..limit])
+                        } else {
+                            line.to_string()
+                        };
+                        out.push(format!("  {}", clipped));
+                    }
+                    out
+                }
+            } else {
+                vec![input.to_string()]
+            }
+        }
+        "write" => {
+            let mut out = Vec::new();
+            if let Some(path) = get("path") {
+                out.push(format!("path: {}", path));
+            }
+            if let Some(content) = get("content") {
+                let lines = content.lines().count();
+                let bytes = content.len();
+                out.push(format!("{} lines · {} bytes", lines, bytes));
+                if lines > 0 {
+                    out.push("content:".to_string());
+                    for (i, line) in content.lines().take(4).enumerate() {
+                        let limit = line
+                            .char_indices()
+                            .nth(72)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(line.len());
+                        let clipped = if limit < line.len() {
+                            format!("{}…", &line[..limit])
+                        } else {
+                            line.to_string()
+                        };
+                        out.push(format!("  {:>3} │ {}", i + 1, clipped));
+                    }
+                    if lines > 4 {
+                        out.push(format!("  … +{} more lines", lines - 4));
+                    }
+                }
+            }
+            if out.is_empty() {
+                vec![input.to_string()]
+            } else {
+                out
+            }
+        }
+        "edit" => {
+            let mut out = Vec::new();
+            if let Some(path) = get("path") {
+                out.push(format!("path: {}", path));
+            }
+            if let (Some(old), Some(new)) = (get("oldText"), get("newText")) {
+                out.push(format!(
+                    "replace {} lines → {} lines",
+                    old.lines().count(),
+                    new.lines().count()
+                ));
+                let old_preview: Vec<&str> = old.lines().take(3).collect();
+                let new_preview: Vec<&str> = new.lines().take(3).collect();
+                if !old_preview.is_empty() {
+                    out.push("  − old:".to_string());
+                    for l in old_preview {
+                        let limit = l
+                            .char_indices()
+                            .nth(68)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(l.len());
+                        out.push(format!(
+                            "    {}",
+                            if limit < l.len() {
+                                format!("{}…", &l[..limit])
+                            } else {
+                                l.to_string()
+                            }
+                        ));
+                    }
+                }
+                if !new_preview.is_empty() {
+                    out.push("  + new:".to_string());
+                    for l in new_preview {
+                        let limit = l
+                            .char_indices()
+                            .nth(68)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(l.len());
+                        out.push(format!(
+                            "    {}",
+                            if limit < l.len() {
+                                format!("{}…", &l[..limit])
+                            } else {
+                                l.to_string()
+                            }
+                        ));
+                    }
+                }
+            }
+            if out.is_empty() {
+                vec![input.to_string()]
+            } else {
+                out
+            }
+        }
+        "read" => {
+            if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(|v| v.as_array()) {
+                let mut out = vec![format!("{} files:", paths.len())];
+                for p in paths.iter().take(6).filter_map(|v| v.as_str()) {
+                    out.push(format!("  • {}", p));
+                }
+                if paths.len() > 6 {
+                    out.push(format!("  … +{} more", paths.len() - 6));
+                }
+                out
+            } else if let Some(glob) = get("glob") {
+                vec![format!("glob: {}", glob)]
+            } else if let Some(path) = get("path") {
+                let mut out = vec![format!("path: {}", path)];
+                if let Some(off) = obj.and_then(|o| o.get("offset")).and_then(|v| v.as_u64()) {
+                    out.push(format!("offset: {}", off));
+                }
+                if let Some(lim) = obj.and_then(|o| o.get("limit")).and_then(|v| v.as_u64()) {
+                    out.push(format!("limit: {}", lim));
+                }
+                out
+            } else {
+                vec![input.to_string()]
+            }
+        }
+        "ffgrep" => {
+            let mut out = Vec::new();
+            if let Some(pat) = get("pattern") {
+                out.push(format!("pattern: {}", pat));
+            }
+            if let Some(mode) = get("output_mode") {
+                out.push(format!("mode: {}", mode));
+            }
+            if out.is_empty() {
+                vec![input.to_string()]
+            } else {
+                out
+            }
+        }
+        "fffind" => {
+            if let Some(pat) = get("pattern") {
+                vec![format!("pattern: {}", pat)]
+            } else {
+                vec![input.to_string()]
+            }
+        }
+        "git" => {
+            if let Some(mode) = get("mode") {
+                vec![format!("git {}", mode)]
+            } else {
+                vec![input.to_string()]
+            }
+        }
+        _ => vec![short_arg(name, input)],
+    }
+}
+
 /// Git branch + dirty flag for a working directory, for status displays.
 pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
     let branch = Command::new("git")

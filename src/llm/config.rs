@@ -259,12 +259,19 @@ impl LlmConfig {
             Some(map) => map.clone(),
             // Already pointed at opencode.ai: expose its zen/go gateways by
             // default so autocomplete shows which endpoint each model is on.
-            None if provider == Provider::OpenCode && base_url.starts_with("https://opencode.ai/") => [
-                ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-                ("go".to_string(), "https://opencode.ai/zen/go/v1".to_string()),
-            ]
-            .into_iter()
-            .collect(),
+            None if provider == Provider::OpenCode
+                && base_url.starts_with("https://opencode.ai/") =>
+            {
+                [
+                    ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
+                    (
+                        "go".to_string(),
+                        "https://opencode.ai/zen/go/v1".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect()
+            }
             None => BTreeMap::new(),
         };
         if available_models.is_empty() && !endpoints.values().any(|url| url == &base_url) {
@@ -397,7 +404,10 @@ mod tests {
             available_models: Vec::new(),
             endpoints: [
                 ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-                ("go".to_string(), "https://opencode.ai/zen/go/v1".to_string()),
+                (
+                    "go".to_string(),
+                    "https://opencode.ai/zen/go/v1".to_string(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -420,7 +430,10 @@ mod tests {
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "kimi-k2");
         // Provider-native slashes in model ids survive under an endpoint.
-        assert_eq!(cfg.apply_model("go/moonshotai/kimi-k2").as_deref(), Some("go"));
+        assert_eq!(
+            cfg.apply_model("go/moonshotai/kimi-k2").as_deref(),
+            Some("go")
+        );
         assert_eq!(cfg.model, "moonshotai/kimi-k2");
         // Unknown prefix is a plain model id.
         assert_eq!(cfg.apply_model("unknown/m"), None);
@@ -431,18 +444,35 @@ mod tests {
     fn provider_parse_accepts_aliases() {
         assert_eq!(Provider::parse("opencode").unwrap(), Provider::OpenCode);
         assert_eq!(Provider::parse("codex").unwrap(), Provider::OpenAiCodex);
-        assert_eq!(Provider::parse("openai-codex").unwrap(), Provider::OpenAiCodex);
+        assert_eq!(
+            Provider::parse("openai-codex").unwrap(),
+            Provider::OpenAiCodex
+        );
         assert!(Provider::parse("unknown").is_err());
     }
 
     #[test]
     fn permission_parse_and_ordering() {
-        assert_eq!(PermissionMode::parse("read-only").unwrap(), PermissionMode::ReadOnly);
-        assert_eq!(PermissionMode::parse("readonly").unwrap(), PermissionMode::ReadOnly);
-        assert_eq!(PermissionMode::parse("ask_writes").unwrap(), PermissionMode::AskWrites);
-        assert_eq!(PermissionMode::parse("trusted").unwrap(), PermissionMode::Trusted);
+        assert_eq!(
+            PermissionMode::parse("read-only").unwrap(),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            PermissionMode::parse("readonly").unwrap(),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            PermissionMode::parse("ask_writes").unwrap(),
+            PermissionMode::AskWrites
+        );
+        assert_eq!(
+            PermissionMode::parse("trusted").unwrap(),
+            PermissionMode::Trusted
+        );
         assert!(PermissionMode::parse("nope").is_err());
-        assert!(PermissionMode::ReadOnly.permissiveness() < PermissionMode::Trusted.permissiveness());
+        assert!(
+            PermissionMode::ReadOnly.permissiveness() < PermissionMode::Trusted.permissiveness()
+        );
     }
 
     #[test]
@@ -488,7 +518,10 @@ mod tests {
         assert_eq!(cfg.provider.as_deref(), Some("opencode"));
         assert_eq!(cfg.model.as_deref(), Some("muse-spark-1.2"));
         assert_eq!(cfg.api.as_deref(), Some("openai-completions"));
-        assert_eq!(cfg.models.as_deref(), Some(&["a".to_string(), "b".to_string()][..]));
+        assert_eq!(
+            cfg.models.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
         match prev {
             Some(v) => std::env::set_var("DEX_CONFIG", v),
             None => std::env::remove_var("DEX_CONFIG"),
