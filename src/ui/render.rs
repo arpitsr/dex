@@ -208,11 +208,18 @@ pub(super) fn ui_status(app: &App) -> String {
     }
     // Cumulative prompt tokens across all LLM calls this TUI process has
     // made (per-call counts are conversation-sized, so this is the spend
-    // figure that grows across turns; the % above is live context usage).
+    // figure that grows across turns; the % above is live context usage),
+    // with the completion-token figure alongside it.
     if app.tool_state.total_usage > 0 {
         base.push_str(&format!(
             " · {} total",
             format_tokens(app.tool_state.total_usage)
+        ));
+    }
+    if app.tool_state.total_output > 0 {
+        base.push_str(&format!(
+            " · {} out",
+            format_tokens(app.tool_state.total_output)
         ));
     }
     // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
@@ -1380,6 +1387,12 @@ mod tests {
         app.tool_state.total_usage = 215_000;
         let text = ui_status(&app);
         assert!(text.contains("215.0k total"), "{text}");
+        // Cumulative completion tokens render alongside the prompt total and
+        // stay hidden until the first output tokens are billed.
+        assert!(!ui_status(&app).contains("out"), "{}", ui_status(&app));
+        app.tool_state.total_output = 1_250;
+        let text = ui_status(&app);
+        assert!(text.contains("1.2k out"), "{text}");
         // Live context usage (% of window) still renders from last_usage.
         app.tool_state.last_usage = Some(12_000);
         let text = ui_status(&app);

@@ -162,10 +162,14 @@ pub enum SinkLine {
     Error(String),
     /// Prompt tokens reported by the provider after each LLM call, so the
     /// status bar can track context usage live instead of once per turn.
-    /// `cached` is the provider-reported cached-token subset, when reported.
+    /// `cached` is the provider-reported cached-token subset, when reported;
+    /// `cost` is the USD cost of the call as priced by the daemon; `output`
+    /// is the completion-token count for the same call.
     Usage {
         tokens: u64,
         cached: Option<u64>,
+        cost: f64,
+        output: u64,
     },
     Plan(Plan),
 }
@@ -297,12 +301,14 @@ pub(crate) struct StreamOptions {
 }
 
 /// Provider-reported usage for one LLM call, threaded from the stream readers
-/// through the agent loop to the status bar. `cached_tokens` is the
+/// through the agent loop to the status bar. `completion_tokens` is the
+/// output-token count (billed at the output rate); `cached_tokens` is the
 /// provider-reported cache-hit subset (billed at a fraction of full input
 /// price); None when the provider does not report cache detail.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Usage {
     pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
     pub(crate) cached_tokens: Option<u64>,
 }
 
@@ -311,6 +317,8 @@ pub(crate) struct Usage {
 #[derive(Deserialize, Default)]
 pub(crate) struct StreamUsage {
     pub(crate) prompt_tokens: u64,
+    #[serde(default)]
+    pub(crate) completion_tokens: u64,
     #[serde(rename = "prompt_tokens_details")]
     pub(crate) prompt_details: Option<PromptTokensDetails>,
 }
