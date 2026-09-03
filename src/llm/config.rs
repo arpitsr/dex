@@ -120,7 +120,11 @@ fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u6
                         .find(|(k, _)| k.to_ascii_lowercase() == needle)
                         .map(|(_, v)| v)
                 }) {
-                    if let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(|c| c.as_u64()) {
+                    if let Some(ctx) = m
+                        .get("limit")
+                        .and_then(|l| l.get("context"))
+                        .and_then(|c| c.as_u64())
+                    {
                         return Some(ctx);
                     }
                 }
@@ -129,13 +133,21 @@ fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u6
         // catalog.json shape: { models: { "id": { limit } }, providers: { } }
         if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
             if let Some(m) = models.get(needle.as_str()) {
-                if let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(|c| c.as_u64()) {
+                if let Some(ctx) = m
+                    .get("limit")
+                    .and_then(|l| l.get("context"))
+                    .and_then(|c| c.as_u64())
+                {
                     return Some(ctx);
                 }
             }
             for (k, m) in models {
                 if k.to_ascii_lowercase() == needle {
-                    if let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(|c| c.as_u64()) {
+                    if let Some(ctx) = m
+                        .get("limit")
+                        .and_then(|l| l.get("context"))
+                        .and_then(|c| c.as_u64())
+                    {
                         return Some(ctx);
                     }
                 }
@@ -202,7 +214,10 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
     let mut fetched = false;
-    for url in ["https://models.dev/api.json", "https://models.dev/catalog.json"] {
+    for url in [
+        "https://models.dev/api.json",
+        "https://models.dev/catalog.json",
+    ] {
         if let Ok(resp) = client.get(url).send().and_then(|r| r.error_for_status()) {
             if let Ok(text) = resp.text() {
                 if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
@@ -239,7 +254,9 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
     if provider != Provider::OpenCode {
         return Err("models.dev fetch failed and provider is not opencode".into());
     }
-    let env_base_url = std::env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
+    let env_base_url = std::env::var("OPENAI_BASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty());
     let base_url = env_base_url
         .or(file.base_url.clone())
         .filter(|v| !v.is_empty())
@@ -252,7 +269,10 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         Some(map) => map.clone(),
         None if base_url.starts_with("https://opencode.ai/") => [
             ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-            ("go".to_string(), "https://opencode.ai/zen/go/v1".to_string()),
+            (
+                "go".to_string(),
+                "https://opencode.ai/zen/go/v1".to_string(),
+            ),
         ]
         .into_iter()
         .collect(),
@@ -261,23 +281,36 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
     let mut all: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for id in fetch_provider_models(&client, provider, &base_url, &api_key) {
-        if seen.insert(id.clone()) { all.push(id); }
+        if seen.insert(id.clone()) {
+            all.push(id);
+        }
     }
     for (name, url) in &endpoints {
         for id in fetch_provider_models(&client, provider, url, &api_key) {
             let prefixed = format!("{name}/{id}");
-            if seen.insert(prefixed.clone()) { all.push(prefixed); }
-            if seen.insert(id.clone()) { all.push(id); }
+            if seen.insert(prefixed.clone()) {
+                all.push(prefixed);
+            }
+            if seen.insert(id.clone()) {
+                all.push(id);
+            }
         }
     }
     if all.is_empty() {
         return Err("no models fetched — check network".into());
     }
-    all.sort(); all.dedup();
+    all.sort();
+    all.dedup();
     let path = dex_models_cache_path().ok_or("could not determine cache path")?;
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(&path, serde_json::to_string_pretty(&all)?)?;
-    println!("cached {} models to {} (fallback)", all.len(), path.display());
+    println!(
+        "cached {} models to {} (fallback)",
+        all.len(),
+        path.display()
+    );
     Ok(())
 }
 
