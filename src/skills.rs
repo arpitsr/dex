@@ -136,7 +136,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dex-skill-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("SKILL.md");
-        fs::write(&path, "---\nname: my-skill\ndescription: \"Does things\"\n---\nBody").unwrap();
+        fs::write(
+            &path,
+            "---\nname: my-skill\ndescription: \"Does things\"\n---\nBody",
+        )
+        .unwrap();
         let skill = parse_skill(&path).unwrap();
         assert_eq!(skill.name, "my-skill");
         assert_eq!(skill.description, "Does things");
@@ -164,9 +168,21 @@ mod tests {
         fs::create_dir_all(a.join("skill-a")).unwrap();
         fs::create_dir_all(b.join("skill-a")).unwrap(); // duplicate name
         fs::create_dir_all(b.join("skill-b")).unwrap();
-        fs::write(a.join("skill-a/SKILL.md"), "---\nname: alpha\ndescription: first\n---\n").unwrap();
-        fs::write(b.join("skill-a/SKILL.md"), "---\nname: alpha\ndescription: dup\n---\n").unwrap();
-        fs::write(b.join("skill-b/SKILL.md"), "---\nname: beta\ndescription: second\n---\n").unwrap();
+        fs::write(
+            a.join("skill-a/SKILL.md"),
+            "---\nname: alpha\ndescription: first\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            b.join("skill-a/SKILL.md"),
+            "---\nname: alpha\ndescription: dup\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            b.join("skill-b/SKILL.md"),
+            "---\nname: beta\ndescription: second\n---\n",
+        )
+        .unwrap();
         let skills = discover_skills(&[a, b.clone()]);
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].name, "alpha");
@@ -178,7 +194,11 @@ mod tests {
 
     #[test]
     fn format_skills_for_prompt_contains_names() {
-        let skills = vec![Skill { name: "x".into(), description: "does x".into(), path: PathBuf::from("/tmp") }];
+        let skills = vec![Skill {
+            name: "x".into(),
+            description: "does x".into(),
+            path: PathBuf::from("/tmp"),
+        }];
         let out = format_skills_for_prompt(&skills);
         assert!(out.contains("x: does x"));
         assert!(out.contains("/skill:"));
