@@ -1,12 +1,16 @@
 #![allow(clippy::doc_lazy_continuation)]
+mod fff;
+
+use self::fff::{tool_fffind, tool_ffgrep};
 use serde_json::{Map, Value};
+use similar::TextDiff;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +20,7 @@ use crate::core::format::clamp_lines;
 unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
+    fn setsid() -> i32;
 }
 
 const SIGKILL: i32 = 9;
@@ -101,16 +106,22 @@ pub(crate) enum ToolError {
         output: String,
         code: Option<i32>,
     },
+    /// An internal tool-engine failure (not a bad invocation, not a shell
+    /// exit): e.g. the fff index failed to initialize.
+    Internal(String),
     Unknown(String),
 }
 
 /// A tool result together with whether the call actually succeeded. Success
 /// is decided where the exit status is known — never inferred from the
 /// output text, which may legitimately contain markers like `[exit 1]`.
+/// `diff` carries the display-only git diff for write/edit, captured before
+/// the file was mutated; it never reaches the model.
 #[derive(Clone, Debug)]
 pub(crate) struct ToolOutcome {
     pub(crate) text: String,
     pub(crate) ok: bool,
+    pub(crate) diff: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,7 +155,15 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             requires_shell: false,
             permission: PermissionRequirement::Read,
         },
-        "grep" | "find" | "git" => ToolMetadata {
+        // fff tools run in-process; only git shells out.
+        "ffgrep" | "fffind" => ToolMetadata {
+            read_only: true,
+            mutating: false,
+            idempotent: true,
+            requires_shell: false,
+            permission: PermissionRequirement::Read,
+        },
+        "git" => ToolMetadata {
             read_only: true,
             mutating: false,
             idempotent: true,
@@ -201,6 +220,7 @@ impl std::fmt::Display for ToolError {
                 Some(code) => write!(f, "{output}\n[exit {code}]"),
                 None => write!(f, "{output}"),
             },
+            Self::Internal(e) => write!(f, "{e}"),
             Self::Unknown(t) => write!(f, "unknown tool '{}'", t),
         }
     }
@@ -261,10 +281,16 @@ fn shell_timeout() -> Duration {
 /// ponytail: shell stitching only — if JSON routing in pipelines gets
 /// painful, embed rquickjs and expose tools as functions (same $DEX_BIN mechanism).
 fn tool_runner_env() -> Vec<(String, String)> {
-    std::env::current_exe()
-        .ok()
-        .map(|exe| vec![("DEX_BIN".to_string(), exe.display().to_string())])
-        .unwrap_or_default()
+    let mut env = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        env.push(("DEX_BIN".to_string(), exe.display().to_string()));
+    }
+    // git via bash without --no-pager can invoke delta/bat/less which
+    // probe the terminal (OSC 10/11) and race crossterm for the reply;
+    // force a non-interactive pager so the child never queries the pts.
+    env.push(("GIT_PAGER".to_string(), "cat".to_string()));
+    env.push(("PAGER".to_string(), "cat".to_string()));
+    env
 }
 
 /// Read up to `limit` bytes; reports whether more output remained after the
@@ -307,14 +333,29 @@ fn run_bash_with_limits(
     max_bytes: usize,
     cancel: &dyn CancellationSource,
 ) -> Result<(String, Option<i32>), ToolError> {
-    let mut child = Command::new("sh")
+    let mut builder = Command::new("sh");
+    builder
         .arg("-c")
         .arg(command)
         .envs(tool_runner_env())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ToolError::Io)?;
+        .stderr(Stdio::piped());
+    // New session for the shell: drops the controlling tty, so tool children
+    // can never write to or race the user's terminal for input. Without this,
+    // a child that probes the terminal (e.g. `cargo test` running the theme
+    // tests → OSC 10/11 on /dev/tty) sends queries to the TUI's pts and races
+    // crossterm for the reply — the TUI can end up with half a color report
+    // typed into the composer.
+    // SAFETY: runs in the forked child before exec; it is not yet a process
+    // group leader, so setsid() succeeds.
+    unsafe {
+        builder.pre_exec(|| {
+            let _ = setsid();
+            Ok(())
+        });
+    }
+    let mut child = builder.spawn().map_err(ToolError::Io)?;
     // Put the shell in its own process group so cancellation/timeout does not
     // leave descendants running.
     unsafe {
@@ -657,11 +698,13 @@ fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
     Ok(format!("edited {}{note}", path.display()))
 }
 
-/// Human-readable before/after diff for a pending write/edit, used as a
-/// patch preview before approval (`permission != trusted`). Returns None when
-/// the file is missing or too large, or the diff is empty.
-pub(crate) fn change_preview(name: &str, args: &Map<String, Value>) -> Option<String> {
-    let path = workspace_path(&arg_str(args, "path").ok()?).ok()?;
+/// Git-style unified diff (4 context lines, `--- a/…` / `+++ b/…` headers,
+/// `/dev/null` for new files) of a pending write/edit, shown in the
+/// transcript before approval and under the tool result. Returns None when
+/// the file is missing or the change is empty.
+pub(crate) fn change_diff(name: &str, args: &Map<String, Value>) -> Option<String> {
+    let raw_path = arg_str(args, "path").ok()?;
+    let path = workspace_path(&raw_path).ok()?;
     let before = fs::read_to_string(&path).ok();
     let after = match name {
         "write" => arg_str(args, "content").ok(),
@@ -678,50 +721,21 @@ pub(crate) fn change_preview(name: &str, args: &Map<String, Value>) -> Option<St
         }
         _ => return None,
     }?;
-    let diff = simple_diff(before.as_deref().unwrap_or(""), &after);
-    if diff.is_empty() {
-        return None;
-    }
-    let header = match before {
-        Some(_) => format!("{name} {}", path.display()),
-        None => format!("{name} {} (new file)", path.display()),
+    let diff = TextDiff::from_lines(before.as_deref().unwrap_or(""), &after);
+    let (old_header, new_header) = match &before {
+        Some(_) => (format!("a/{raw_path}"), format!("b/{raw_path}")),
+        None => ("/dev/null".to_string(), format!("b/{raw_path}")),
     };
-    Some(format!("{header}\n{diff}"))
-}
-
-/// Minimal line diff (`-` removed / `+` added), capped so a preview never
-/// floods the transcript.
-fn simple_diff(before: &str, after: &str) -> String {
-    let before_lines: Vec<&str> = before.lines().collect();
-    let after_lines: Vec<&str> = after.lines().collect();
-    let mut out = Vec::new();
-    let max = before_lines.len().max(after_lines.len());
-    for i in 0..max {
-        let b = before_lines.get(i);
-        let a = after_lines.get(i);
-        match (b, a) {
-            (Some(b), Some(a)) if b == a => {}
-            (Some(b), Some(a)) => {
-                out.push(format!("-{b}"));
-                out.push(format!("+{a}"));
-            }
-            (Some(b), None) => out.push(format!("-{b}")),
-            (None, Some(a)) => out.push(format!("+{a}")),
-            _ => {}
-        }
-    }
+    let out = diff
+        .unified_diff()
+        .context_radius(4)
+        .header(&old_header, &new_header)
+        .to_string();
     if out.is_empty() {
-        return String::new();
+        None
+    } else {
+        Some(out)
     }
-    let mut text = out.join("\n");
-    if out.len() > 40 {
-        text = format!(
-            "{}\n[... {} more lines]",
-            out[..40].join("\n"),
-            out.len() - 40
-        );
-    }
-    text
 }
 
 fn apply_edit(
@@ -819,11 +833,6 @@ fn apply_edit(
     };
     Ok((updated, note))
 }
-
-/// Directories that are noise for a coding agent and slow (`target/` alone
-/// can be gigabytes) enough to cause spurious tool timeouts when searched.
-const SKIP_DIRS: &str = "--exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules";
-const SKIP_GLOBS: &str = "--glob '!target' --glob '!node_modules' --glob '!.git'";
 
 fn expand_tabs(line: &str, width: usize) -> String {
     let width = width.clamp(1, 16);
@@ -976,189 +985,6 @@ fn language_tab_width(path: &Path) -> usize {
     }
 }
 
-fn has_ripgrep() -> bool {
-    static RG: OnceLock<bool> = OnceLock::new();
-    *RG.get_or_init(|| {
-        Command::new("rg")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrepMode {
-    Files,
-    Content,
-    Count,
-}
-
-impl GrepMode {
-    fn parse(value: Option<&str>) -> Result<Self, ToolError> {
-        match value {
-            None | Some("files") => Ok(Self::Files),
-            Some("content") => Ok(Self::Content),
-            Some("count") => Ok(Self::Count),
-            Some(other) => Err(ToolError::InvalidArgument(format!(
-                "unknown output_mode '{other}' (files, content, count)"
-            ))),
-        }
-    }
-
-    /// Ripgrep flags for each output mode.
-    fn rg_flags(self) -> &'static str {
-        match self {
-            Self::Files => "-l",
-            Self::Content => "--no-heading -n",
-            Self::Count => "--count-matches",
-        }
-    }
-
-    /// GNU grep fallback flags for each output mode.
-    fn grep_flags(self) -> &'static str {
-        match self {
-            Self::Files => "-R -I -l",
-            Self::Content => "-R -I -n",
-            Self::Count => "-R -I -c",
-        }
-    }
-
-    fn default_limit(self) -> usize {
-        match self {
-            Self::Files => 100,
-            Self::Content => 200,
-            Self::Count => 50,
-        }
-    }
-
-    fn unit(self) -> &'static str {
-        match self {
-            Self::Files => "files",
-            Self::Content => "lines",
-            Self::Count => "entries",
-        }
-    }
-}
-
-/// Cap search output at `head_limit` lines with a marker that states the
-/// real totals, so the model knows to narrow the pattern instead of paging.
-fn shape_search_output(output: &str, mode: GrepMode, head_limit: usize) -> String {
-    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() <= head_limit {
-        return lines.join("\n");
-    }
-    let shown: Vec<&str> = lines.iter().take(head_limit).copied().collect();
-    format!(
-        "{}\n[... {} of {} {} matched; raise head_limit or narrow the search ...]",
-        shown.join("\n"),
-        lines.len() - head_limit,
-        lines.len(),
-        mode.unit()
-    )
-}
-
-fn tool_grep(
-    args: &Map<String, Value>,
-    cancel: &dyn CancellationSource,
-) -> Result<String, ToolError> {
-    let pattern = arg_str(args, "pattern")?;
-    if pattern.trim().is_empty() {
-        return Err(ToolError::InvalidArgument(
-            "grep pattern must not be empty (it would match every line)".to_string(),
-        ));
-    }
-    let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
-    let path = workspace_path(&path)?;
-    let mode = GrepMode::parse(args.get("output_mode").and_then(Value::as_str))?;
-    let head_limit = args
-        .get("head_limit")
-        .and_then(Value::as_u64)
-        .map(|n| n.max(1) as usize)
-        .unwrap_or_else(|| mode.default_limit());
-
-    let escaped = shell_escape(&pattern);
-    let target = shell_escape(&path.to_string_lossy());
-    // Context lines (content mode) fold the follow-up "read around the
-    // match" call into this one.
-    let context = args
-        .get("context")
-        .and_then(Value::as_u64)
-        .map(|n| n.min(10))
-        .unwrap_or(0);
-    let context_flag = if context > 0 {
-        format!(" -C {context}")
-    } else {
-        String::new()
-    };
-    let command = if has_ripgrep() {
-        format!(
-            "rg {}{context_flag} -S {SKIP_GLOBS} -- {escaped} {target}",
-            mode.rg_flags()
-        )
-    } else {
-        format!(
-            "grep {}{context_flag} {SKIP_DIRS} -- {escaped} {target}",
-            mode.grep_flags()
-        )
-    };
-    let (output, code) = run_bash(&command, cancel)?;
-    // Exit 1 means "no matches" for both grep and ripgrep — a normal result.
-    match code {
-        Some(0) | Some(1) => Ok(shape_search_output(&output, mode, head_limit)),
-        code => Err(ToolError::Shell { output, code }),
-    }
-}
-
-fn tool_find(
-    args: &Map<String, Value>,
-    cancel: &dyn CancellationSource,
-) -> Result<String, ToolError> {
-    let pattern = arg_str(args, "pattern")?;
-    // Optional, matching the advertised schema (only `pattern` is required).
-    let path = arg_str(args, "path").unwrap_or_else(|_| ".".to_string());
-    if pattern.trim().is_empty() || pattern == "*" {
-        return Err(ToolError::InvalidArgument(
-            "find pattern must be targeted (not empty or '*')".to_string(),
-        ));
-    }
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|n| n.max(1) as usize)
-        .unwrap_or(100);
-    let path = workspace_path(&path)?;
-    let (output, code) = run_bash(
-        &format!(
-            "find {} \\( -name .git -o -name target -o -name node_modules \\) -prune -o -path '*{}*' -print",
-            shell_escape(&path.to_string_lossy()),
-            shell_escape(&pattern)
-        ),
-        cancel,
-    )?;
-    match code {
-        Some(0) => {
-            let mut paths: Vec<&str> = output
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .collect();
-            paths.sort_unstable();
-            paths.dedup();
-            if paths.len() <= limit {
-                return Ok(paths.join("\n"));
-            }
-            Ok(format!(
-                "{}\n[... {} of {} paths matched; raise limit or narrow the pattern ...]",
-                paths[..limit].join("\n"),
-                paths.len() - limit,
-                paths.len()
-            ))
-        }
-        code => Err(ToolError::Shell { output, code }),
-    }
-}
-
 fn tool_git(
     args: &Map<String, Value>,
     cancel: &dyn CancellationSource,
@@ -1287,9 +1113,9 @@ fn run_chain_step(
             return Err(invalid("'from' routing requires the read tool".to_string()));
         }
         let (source_tool, source_output) = &completed[from];
-        if !matches!(source_tool.as_str(), "grep" | "find" | "chain") {
+        if !matches!(source_tool.as_str(), "ffgrep" | "fffind" | "chain") {
             return Err(invalid(format!(
-                "'from' step {from} is '{source_tool}', which produces no file paths; use grep (files mode) or find"
+                "'from' step {from} is '{source_tool}', which produces no file paths; use ffgrep (files mode) or fffind"
             )));
         }
         let max_files = obj
@@ -1345,9 +1171,6 @@ fn extract_search_paths(
     Ok(paths)
 }
 
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
 
 /// Execute a tool using paths confined to the current workspace.
 pub(crate) fn execute(
@@ -1365,8 +1188,8 @@ pub(crate) fn execute(
         "bash" => tool_bash(args, cancel),
         "write" => tool_write(args),
         "edit" => tool_edit(args),
-        "grep" => tool_grep(args, cancel),
-        "find" => tool_find(args, cancel),
+        "ffgrep" => tool_ffgrep(args),
+        "fffind" => tool_fffind(args),
         "git" => tool_git(args, cancel),
         "chain" => tool_chain(args, cancel),
         _ => unreachable!("metadata and dispatch must stay in sync"),
@@ -1391,10 +1214,12 @@ pub(crate) fn execute_outcome(
         Ok(out) => ToolOutcome {
             text: out,
             ok: true,
+            diff: None,
         },
         Err(e) => ToolOutcome {
             text: format!("Error: {}", e),
             ok: false,
+            diff: None,
         },
     }
 }
@@ -1404,11 +1229,6 @@ mod tests {
     use super::*;
     use crate::agent::state::GlobalCancellation;
     use serde_json::json;
-    #[test]
-    fn shell_escape_handles_quotes_and_commands() {
-        assert_eq!(shell_escape("a'b; echo hacked"), "'a'\"'\"'b; echo hacked'");
-    }
-
     #[test]
     fn bash_exposes_the_binary_for_local_stitching() {
         let (output, code) = run_bash_with_limits(
@@ -1424,6 +1244,26 @@ mod tests {
             std::env::current_exe().unwrap().display().to_string()
         );
     }
+    #[test]
+    fn bash_children_have_no_controlling_tty() {
+        // A tool child must never share the user's terminal: a child that
+        // probes it (e.g. cargo test → theme query → OSC 10/11 on /dev/tty)
+        // would write to and race the TUI's crossterm for the same pts, and
+        // half a color report could end up typed into the composer.
+        let (output, code) = run_bash_with_limits(
+            "if cat </dev/tty >/dev/null 2>&1; then echo HAS_TTY; else echo NO_TTY; fi",
+            Duration::from_secs(5),
+            4096,
+            &GlobalCancellation,
+        )
+        .unwrap();
+        assert_eq!(code, Some(0));
+        assert!(
+            output.contains("NO_TTY"),
+            "tool child still has a controlling tty: {output}"
+        );
+    }
+
     #[test]
     fn metadata_classifies_tools() {
         assert!(metadata("read").unwrap().read_only);
@@ -1447,12 +1287,17 @@ mod tests {
     }
 
     #[test]
-    fn find_rejects_unbounded_patterns() {
+    fn fffind_rejects_unbounded_patterns() {
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("*".into()));
-        args.insert("path".into(), Value::String(".".into()));
         assert!(matches!(
-            execute("find", &args, &GlobalCancellation),
+            execute("fffind", &args, &GlobalCancellation),
+            Err(ToolError::InvalidArgument(_))
+        ));
+        let mut args = Map::new();
+        args.insert("pattern".into(), Value::String("".into()));
+        assert!(matches!(
+            execute("ffgrep", &args, &GlobalCancellation),
             Err(ToolError::InvalidArgument(_))
         ));
     }
@@ -1520,19 +1365,42 @@ mod tests {
     }
 
     #[test]
-    fn change_preview_shows_diff_for_write_and_edit() {
+    fn change_diff_shows_unified_diff_for_write_and_edit() {
         let cwd = std::env::current_dir().unwrap();
         fs::create_dir_all(cwd.join("target")).unwrap();
         let path = cwd.join("target/dex-preview-test.txt");
-        fs::write(&path, "line1\nline2\n").unwrap();
+        fs::write(&path, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n").unwrap();
         let rel = "target/dex-preview-test.txt";
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
-        args.insert("content".into(), Value::String("line1\nCHANGED\n".into()));
-        let preview = change_preview("write", &args).unwrap();
-        assert!(preview.contains("line2"), "{preview}");
-        assert!(preview.contains("-line2"), "{preview}");
+        args.insert("oldText".into(), Value::String("l5\n".into()));
+        args.insert("newText".into(), Value::String("L5\nL5b\n".into()));
+        let diff = change_diff("edit", &args).unwrap();
+        assert!(diff.contains("--- a/target/dex-preview-test.txt"), "{diff}");
+        assert!(diff.contains("+++ b/target/dex-preview-test.txt"), "{diff}");
+        assert!(diff.contains("@@"), "{diff}");
+        assert!(diff.contains("-l5"), "{diff}");
+        assert!(diff.contains("+L5b"), "{diff}");
+        // Context lines surround the change (4 radius) and are untouched.
+        assert!(diff.lines().any(|l| l == " l4"), "{diff}");
+        assert!(diff.lines().any(|l| l == " l9"), "{diff}");
+        // Lines beyond the 4-line context radius stay outside the hunks.
+        assert!(!diff.contains(" l10\n"), "{diff}");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn change_diff_new_file_uses_dev_null_header() {
+        let cwd = std::env::current_dir().unwrap();
+        let rel = "target/dex-preview-new.txt";
+        let _ = fs::remove_file(cwd.join(rel));
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("hello\n".into()));
+        let diff = change_diff("write", &args).unwrap();
+        assert!(diff.contains("--- /dev/null"), "{diff}");
+        assert!(diff.contains("+++ b/target/dex-preview-new.txt"), "{diff}");
+        assert!(diff.contains("+hello"), "{diff}");
     }
 
     #[test]
@@ -1697,27 +1565,26 @@ mod tests {
     }
 
     #[test]
-    fn grep_context_returns_surrounding_lines() {
+    fn ffgrep_context_returns_surrounding_lines() {
+        // Fixture at the workspace root (not target/): fff respects
+        // .gitignore, so ignored fixture dirs are invisible to it.
         let root = std::env::current_dir()
             .unwrap()
-            .join("target")
-            .join(format!("dex-grep-ctx-test-{}", std::process::id()));
+            .join(format!("dex-fff-ctx-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
+        let needle = format!("CTXNEEDLE_{}", std::process::id());
         fs::write(
             root.join("code.rs"),
-            "top\nbefore\nNEEDLE here\nafter\nbottom\n",
+            format!("top\nbefore\n{needle} here\nafter\nbottom\n"),
         )
         .unwrap();
+        super::fff::rescan();
 
         let mut args = Map::new();
-        args.insert("pattern".into(), Value::String("NEEDLE".into()));
-        args.insert(
-            "path".into(),
-            Value::String(root.join("code.rs").display().to_string()),
-        );
+        args.insert("pattern".into(), Value::String(needle.clone()));
         args.insert("output_mode".into(), Value::String("content".into()));
         args.insert("context".into(), Value::Number(1.into()));
-        let outcome = execute_outcome("grep", &args, &GlobalCancellation);
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation);
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("before"), "{}", outcome.text);
         assert!(outcome.text.contains("after"), "{}", outcome.text);
@@ -1727,22 +1594,51 @@ mod tests {
     }
 
     #[test]
+    fn ffgrep_fuzzy_fallback_recovers_typos() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("dex-fff-typo-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("thing.rs"),
+            "struct UserAccountController { field: u32 }\n",
+        )
+        .unwrap();
+        super::fff::rescan();
+
+        // Exact query misses (the token has a transposed 'lr'), fuzzy retry hits.
+        // Assembled at runtime so the query text does not appear verbatim in
+        // this source file — the exact search would hit this file otherwise.
+        let mut args = Map::new();
+        args.insert(
+            "pattern".into(),
+            Value::String(format!("UserAccountControlel{}", "r")),
+        );
+        args.insert("output_mode".into(), Value::String("content".into()));
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation);
+        assert!(outcome.ok, "{}", outcome.text);
+        assert!(outcome.text.contains("approximate"), "{}", outcome.text);
+        assert!(outcome.text.contains("UserAccountController"), "{}", outcome.text);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn chain_runs_search_then_reads_matched_files_in_one_call() {
-        // Fixtures live at the workspace root (not target/) because search
-        // rules deliberately exclude target/.
+        // Fixtures live at the workspace root (not target/): fff respects
+        // .gitignore, so ignored fixture dirs are invisible to it.
         let needle = format!("TARGET_{}", "TOKEN");
         let root = std::env::current_dir()
             .unwrap()
-            // Prefix must NOT match .gitignore entries: the chain's grep respects
-            // ignore files, so an ignored fixture dir is invisible to it.
             .join(format!("dex-chain-fx-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("one.rs"), format!("{needle} in one\n")).unwrap();
         fs::write(root.join("two.rs"), "nothing here\n").unwrap();
+        super::fff::rescan();
 
         let args = json!({
             "steps": [
-                {"tool": "grep", "args": {"pattern": &needle, "path": ".", "output_mode": "files"}},
+                {"tool": "ffgrep", "args": {"pattern": &needle, "output_mode": "files"}},
                 {"tool": "read", "from": 0, "take": "paths", "args": {"limit": 10}}
             ]
         })
@@ -1752,7 +1648,7 @@ mod tests {
         let outcome = execute_outcome("chain", &args, &GlobalCancellation);
         assert!(outcome.ok, "{}", outcome.text);
         assert!(
-            outcome.text.contains("--- step 0: grep ---"),
+            outcome.text.contains("--- step 0: ffgrep ---"),
             "{}",
             outcome.text
         );
@@ -1770,7 +1666,7 @@ mod tests {
         // Mutation and shell tools are refused inside chains.
         let args = json!({
             "steps": [
-                {"tool": "grep", "args": {"pattern": "x-unlikely", "output_mode": "files"}},
+                {"tool": "ffgrep", "args": {"pattern": "x-unlikely", "output_mode": "files"}},
                 {"tool": "bash", "args": {"command": "echo hi"}}
             ]
         })
@@ -1784,7 +1680,7 @@ mod tests {
         // `from` must reference an earlier step.
         let args = json!({
             "steps": [
-                {"tool": "grep", "args": {"pattern": "x-unlikely", "output_mode": "files"}},
+                {"tool": "ffgrep", "args": {"pattern": "x-unlikely", "output_mode": "files"}},
                 {"tool": "read", "from": 1, "take": "paths"}
             ]
         })
@@ -1798,7 +1694,7 @@ mod tests {
         // A failing second step still ships the first step's output.
         let args = json!({
             "steps": [
-                {"tool": "grep", "args": {"pattern": &needle, "path": ".", "output_mode": "files"}},
+                {"tool": "ffgrep", "args": {"pattern": &needle, "output_mode": "files"}},
                 {"tool": "read", "from": 0, "take": "paths", "args": {"offset": 99}}
             ]
         })
@@ -1808,7 +1704,7 @@ mod tests {
         let outcome = execute_outcome("chain", &args, &GlobalCancellation);
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(
-            outcome.text.contains("step 0: grep") && outcome.text.contains("step 1 failed"),
+            outcome.text.contains("step 0: ffgrep") && outcome.text.contains("step 1 failed"),
             "{}",
             outcome.text
         );
@@ -1817,41 +1713,34 @@ mod tests {
     }
 
     #[test]
-    fn grep_without_matches_is_success() {
+    fn ffgrep_without_matches_is_success() {
         // Assembled at runtime so the needle does not appear in this source
-        // file (the test greps the crate it lives in).
-        let needle = format!("dex-no-such-token-{}", "xyz");
+        // file (the test greps the crate it lives in). Gibberish so the
+        // fuzzy fallback has nothing approximate to land on either.
+        let needle = format!("zxq{}wvut", std::process::id());
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String(needle));
-        let outcome = execute_outcome("grep", &args, &GlobalCancellation);
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation);
         assert!(
             outcome.ok,
-            "grep exit 1 (no matches) must be ok: {}",
+            "no matches (exact or fuzzy) must be ok: {}",
             outcome.text
         );
         assert!(
-            outcome.text.trim().is_empty(),
-            "no matches must produce empty output: {:?}",
+            outcome.text.contains("0 matches."),
+            "no matches must report zero: {:?}",
             outcome.text
         );
     }
 
     #[test]
-    fn find_defaults_path_to_workspace() {
+    fn fffind_finds_paths_fuzzily() {
+        super::fff::rescan();
         let mut args = Map::new();
-        args.insert("pattern".into(), Value::String("mod.rs".into()));
-        args.insert("path".into(), Value::String("src".into()));
-        let with_path = execute_outcome("find", &args, &GlobalCancellation);
-        assert!(with_path.ok, "{}", with_path.text);
-        let mut args = Map::new();
-        args.insert("pattern".into(), Value::String("mod.rs".into()));
-        let without_path = execute_outcome("find", &args, &GlobalCancellation);
-        assert!(
-            without_path.ok,
-            "find without path must default to '.': {}",
-            without_path.text
-        );
-        assert!(without_path.text.contains("src/tools/mod.rs"));
+        args.insert("pattern".into(), Value::String("tools mod".into()));
+        let outcome = execute_outcome("fffind", &args, &GlobalCancellation);
+        assert!(outcome.ok, "{}", outcome.text);
+        assert!(outcome.text.contains("src/tools/mod.rs"), "{}", outcome.text);
     }
 
     #[test]

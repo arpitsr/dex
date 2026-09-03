@@ -537,7 +537,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll"
+                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
                     .to_string(),
             );
             push_info(
@@ -549,7 +549,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         _ if line.starts_with("/model ") => {
             let m = line["/model ".len()..].trim().to_string();
             if !m.is_empty() {
-                app.config.model = m.clone();
+                let endpoint = app.config.apply_model(&m);
                 if !app
                     .config
                     .available_models
@@ -559,7 +559,16 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     app.config.available_models.push(m.clone());
                 }
                 let _ = app.session.set_state("model", &m);
-                push_info(app, format!("switched to model: {}", app.config.model));
+                match endpoint {
+                    Some(name) => push_info(
+                        app,
+                        format!(
+                            "switched to model: {} @ {} ({})",
+                            app.config.model, name, app.config.base_url
+                        ),
+                    ),
+                    None => push_info(app, format!("switched to model: {}", app.config.model)),
+                }
             }
         }
         _ if line.starts_with("/provider ") => {
@@ -617,7 +626,7 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
     }
     if let Some(model) = state.get("model") {
         if app.config.model != *model {
-            app.config.model = model.clone();
+            let endpoint = app.config.apply_model(model);
             if !app
                 .config
                 .available_models
@@ -626,7 +635,16 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
             {
                 app.config.available_models.push(model.clone());
             }
-            push_info(app, format!("restored model: {}", model));
+            match endpoint {
+                Some(name) => push_info(
+                    app,
+                    format!(
+                        "restored model: {} @ {} ({})",
+                        app.config.model, name, app.config.base_url
+                    ),
+                ),
+                None => push_info(app, format!("restored model: {}", model)),
+            }
         }
     }
     if let Some(plan_json) = state.get("plan") {

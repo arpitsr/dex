@@ -388,4 +388,41 @@ impl DaemonClient {
             .error_for_status()?;
         Ok(())
     }
+
+    /// Enqueue a steering message into an active turn (mid-turn injection).
+    pub fn steer(&self, session_id: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.http
+            .post(format!(
+                "{}/api/sessions/{}/steer",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .json(&SteerRequest {
+                content: content.to_string(),
+            })
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Enqueue a follow-up message (runs as a chained turn after the current
+    /// one completes, Alt+Enter in the TUI).
+    pub fn followup(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.http
+            .post(format!(
+                "{}/api/sessions/{}/followup",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .json(&FollowupRequest {
+                content: content.to_string(),
+            })
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
 }

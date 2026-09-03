@@ -51,7 +51,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "bash".to_string(),
-                description: "Run a shell command. Output is capped (head and tail kept, middle elided). Prefer the read/grep/find tools over cat/grep/find here, and prefer targeted commands (grep -n, tail -N, wc) over dumping whole files.".to_string(),
+                description: "Run a shell command. Output is capped (head and tail kept, middle elided). Prefer the read/ffgrep/fffind tools over cat/grep/find here, and prefer targeted commands (grep -n, tail -N, wc) over dumping whole files. For a distilled result (matched files, counts, short excerpts, an aggregate), run the whole pipeline in ONE call: the dex binary is available as \"$DEX_BIN\" and `\"$DEX_BIN\" run <tool> <key>=<value>...` executes read/ffgrep/fffind/git locally with raw output on stdout (exit 1 on error); only what it prints enters the conversation. Example: `\"$DEX_BIN\" run ffgrep pattern=TODO output_mode=files | while IFS= read -r f; do \"$DEX_BIN\" run read \"path=$f\" limit=3; done` (read-only; use dedicated tools when you need to see full output yourself).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": { "command": { "type": "string", "description": "shell command to run" } },
@@ -94,16 +94,15 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
-                name: "grep".to_string(),
-                description: "Search file contents (ripgrep when available; regex, smart-case). Default returns matching file paths only — read the files it names, or switch to content/count mode for matches.".to_string(),
+                name: "ffgrep".to_string(),
+                description: "Fast frecency-ranked content search (respects .gitignore, git-aware). Regex when the pattern has metacharacters, plain text otherwise; a zero-match query is automatically retried as fuzzy, so typos still hit. Default output is matching file paths; content mode returns path:line:text (with optional context lines) so a follow-up read is often unnecessary. Keep queries SHORT — one term or one regex; multiple words narrow the search (AND), not OR. Narrow with a path prefix ('src/ TODO') or an exclude ('TODO !test/').".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "regular expression to search for" },
-                        "path": { "type": "string", "description": "directory or file to search (default: current directory)" },
-                        "output_mode": { "type": "string", "enum": ["files", "content", "count"], "description": "files (default): paths only; content: path:line:text; count: matches per file" },
-                        "head_limit": { "type": "integer", "description": "maximum lines returned (default 100 files / 200 content lines / 50 counts)" },
-                        "context": { "type": "integer", "description": "lines of context around each match in content mode (0-10, default 0); avoids a follow-up read" }
+                        "pattern": { "type": "string", "description": "text or regex to search; may include path prefixes ('src/') and excludes ('!tests/')" },
+                        "output_mode": { "type": "string", "enum": ["files", "content"], "description": "files (default): paths only; content: path:line:text" },
+                        "head_limit": { "type": "integer", "description": "maximum results (default 50)" },
+                        "context": { "type": "integer", "description": "lines of context around each match in content mode (0-10, default 0)" }
                     },
                     "required": ["pattern"]
                 }),
@@ -112,14 +111,13 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
-                name: "find".to_string(),
-                description: "Find file paths by substring, sorted and capped; do not use an empty path or the pattern `*` (use `grep` or a narrow path/pattern instead).".to_string(),
+                name: "fffind".to_string(),
+                description: "Fuzzy file-path search (frecency-ranked, git-aware, typo-tolerant). Matches the whole workspace-relative path, not just the filename; supports path prefixes ('src/') and globs ('**/*.rs'). Keep queries SHORT — 1-2 terms; multiple words narrow (AND), not OR. Start broad with one term and refine.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Targeted filename/path substring such as `.rs` or `src/main`; never `*` alone." },
-                        "path": { "type": "string", "description": "workspace-relative directory or file; use a narrow directory such as `src`" },
-                        "limit": { "type": "integer", "description": "maximum paths returned (default 100)" }
+                        "pattern": { "type": "string", "description": "fuzzy path query such as 'main', 'tools fff', or 'src/**/*.rs'; never empty or '*' alone" },
+                        "limit": { "type": "integer", "description": "maximum paths returned (default 20)" }
                     },
                     "required": ["pattern"]
                 }),
@@ -137,7 +135,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "chain".to_string(),
-                description: "Run a bounded read-only sequence in ONE round trip: a search step (grep files-mode or find) followed by read steps that consume the matched files via from/take. Use when later steps depend on earlier output; for independent calls, batch them as parallel calls instead. Mutating and shell tools are not allowed in chains.".to_string(),
+                description: "Run a bounded read-only sequence in ONE round trip: a search step (ffgrep files-mode or fffind) followed by read steps that consume the matched files via from/take. Use when later steps depend on earlier output; for independent calls, batch them as parallel calls instead. Mutating and shell tools are not allowed in chains.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -147,7 +145,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "tool": { "type": "string", "description": "read, grep, find, or git" },
+                                    "tool": { "type": "string", "description": "read, ffgrep, fffind, or git" },
                                     "args": { "type": "object", "description": "arguments passed to that tool" },
                                     "from": { "type": "integer", "description": "index of an earlier step whose matched files this read consumes" },
                                     "take": { "type": "string", "enum": ["paths"], "description": "route the referenced step's file paths into this read" },
@@ -260,4 +258,143 @@ pub(crate) fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Va
         .and_then(Value::as_str)
         .and_then(|id| calls.iter().position(|call| call.id == id))
         .unwrap_or(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_chat_tool_call_assembles_fragmented_deltas() {
+        let mut calls = Vec::new();
+        merge_chat_tool_call(
+            &mut calls,
+            StreamToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                function: Some(StreamFunctionCall {
+                    name: Some("read".into()),
+                    arguments: Some("{\"path\":\"".into()),
+                }),
+            },
+        );
+        merge_chat_tool_call(
+            &mut calls,
+            StreamToolCall {
+                index: 0,
+                id: None,
+                function: Some(StreamFunctionCall {
+                    name: None,
+                    arguments: Some("a.rs\"}".into()),
+                }),
+            },
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+    }
+
+    #[test]
+    fn merge_chat_tool_call_grows_sparse_indices() {
+        let mut calls = Vec::new();
+        merge_chat_tool_call(
+            &mut calls,
+            StreamToolCall {
+                index: 2,
+                id: Some("c".into()),
+                function: Some(StreamFunctionCall {
+                    name: Some("bash".into()),
+                    arguments: Some("{}".into()),
+                }),
+            },
+        );
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].id, "c");
+        assert!(calls[0].id.is_empty());
+    }
+
+    #[test]
+    fn tools_schema_contains_all_tools() {
+        let schema = tools_schema();
+        let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names, ["read", "bash", "write", "edit", "ffgrep", "fffind", "git", "chain"]);
+    }
+
+    #[test]
+    fn responses_input_splits_system_and_tool_output() {
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("sys1".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "system".into(),
+                content: Some("sys2".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("out".into()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                name: None,
+            },
+        ];
+        let (instructions, input) = responses_input(&msgs);
+        assert_eq!(instructions.unwrap(), "sys1\n\nsys2");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn responses_input_encodes_assistant_tool_calls() {
+        let msgs = vec![ChatMessage {
+            role: "assistant".into(),
+            content: Some("thinking".into()),
+            tool_calls: Some(vec![LlmToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: FunctionCall { name: "read".into(), arguments: "{}".into() },
+            }]),
+            tool_call_id: None,
+            name: None,
+        }];
+        let (instructions, input) = responses_input(&msgs);
+        assert!(instructions.is_none());
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "c1");
+    }
+
+    #[test]
+    fn response_tool_call_and_index_resolve_by_id() {
+        let mut calls = vec![LlmToolCall {
+            id: "a".into(),
+            call_type: "function".into(),
+            function: FunctionCall { name: "old".into(), arguments: String::new() },
+        }];
+        // Resolve existing id to index 0 even when suggested index is 5.
+        let idx = response_call_index(&calls, 5, &json!({"call_id":"a"}));
+        assert_eq!(idx, 0);
+        // Unknown id falls back to suggested index.
+        assert_eq!(response_call_index(&calls, 5, &json!({"call_id":"miss"})), 5);
+        // Append a new call via response_tool_call.
+        response_tool_call(&mut calls, 1, &json!({"call_id":"b","name":"write","arguments":"{}"}));
+        assert_eq!(calls[1].id, "b");
+        assert_eq!(calls[1].function.name, "write");
+    }
 }

@@ -49,6 +49,10 @@ const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '
 pub(crate) enum TranscriptBlock {
     User(Vec<Line<'static>>),
     Assistant(Vec<Line<'static>>),
+    /// Streamed model reasoning, stored raw. Rendered by `TranscriptView` as
+    /// a one-line preview (collapsed) or full dim italic text (expanded via
+    /// Ctrl+T); not routed through `lines()`.
+    Thinking(String),
     Tool {
         input: Line<'static>,
         output: Option<Line<'static>>,
@@ -65,6 +69,7 @@ impl TranscriptBlock {
         match self {
             TranscriptBlock::User(lines) => lines.iter().collect(),
             TranscriptBlock::Assistant(lines) => lines.iter().collect(),
+            TranscriptBlock::Thinking(_) => vec![],
             TranscriptBlock::Tool {
                 input,
                 output,
@@ -115,15 +120,23 @@ pub(crate) struct App {
     pub(crate) scroll: u16,
     pub(crate) tick: u16,
     pub(crate) quit: bool,
+    pub(crate) last_ctrl_c: Option<Instant>,
     pub(crate) history: Vec<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: String,
     pub(crate) slash_selected: usize,
+    /// How this TUI reached its agent engine, e.g. "connected to local" or
+    /// "connected to daemon at 127.0.0.1:4113". Shown in the status bar only;
+    /// the transcript stays free of startup banners.
+    pub(crate) connection: Option<String>,
     /// Whether the tail `Assistant` block is still open for streaming
     /// coalescence. Tracked so an initial transcript block (e.g. in tests)
     /// does not merge with the first streamed assistant turn; gaps remain
     /// canonical between blocks.
     pub(crate) assistant_open: bool,
+    /// Whether streamed thinking blocks render in full (Ctrl+T) or as a
+    /// one-line preview.
+    pub(crate) show_thinking: bool,
     pub(crate) plan: crate::core::types::Plan,
     pub(crate) transcript_version: u64,
     pub(crate) display_cache: Vec<Line<'static>>,
@@ -289,6 +302,24 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             app.assistant_open = true;
             app.transcript_version = app.transcript_version.wrapping_add(1);
         }
+        SinkLine::Thinking(s) => {
+            if s.is_empty() {
+                return;
+            }
+            app.assistant_open = false;
+            if let Some(TranscriptBlock::Thinking(text)) = app.transcript.last_mut() {
+                text.push_str(&s);
+                // ponytail: throttle re-wraps — reasoning arrives token-by-token
+                // and every version bump re-wraps the whole transcript. tick
+                // advances ~16ms/frame; the block flushes when it closes anyway.
+                if app.tick.is_multiple_of(8) {
+                    app.transcript_version = app.transcript_version.wrapping_add(1);
+                }
+            } else {
+                app.transcript.push(TranscriptBlock::Thinking(s));
+                app.transcript_version = app.transcript_version.wrapping_add(1);
+            }
+        }
         SinkLine::ToolInput(s) => {
             dim_intermediate_assistant_block(app);
             app.assistant_open = false;
@@ -312,7 +343,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::ToolOutput {
-            name: _,
+            name,
             summary,
             success,
             preview,
@@ -338,13 +369,25 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ));
             }
             let output = indent_transcript_line(Line::from(spans));
+            // write/edit previews are a git diff: color it like git does.
+            let is_diff = matches!(name.as_str(), "write" | "edit");
             let preview_lines: Vec<Line<'static>> = preview
                 .iter()
                 .map(|line| {
-                    indent_transcript_line(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(theme::tool_preview_fg()),
-                    )))
+                    let style = if is_diff {
+                        if line.starts_with('+') {
+                            Style::default().fg(Color::LightGreen)
+                        } else if line.starts_with('-') {
+                            Style::default().fg(Color::LightRed)
+                        } else if line.starts_with("@@") {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(theme::tool_preview_fg())
+                        }
+                    } else {
+                        Style::default().fg(theme::tool_preview_fg())
+                    };
+                    indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
                 })
                 .collect();
             app.assistant_open = false;
@@ -471,6 +514,7 @@ mod tests {
                 base_url: String::new(),
                 model: "test".into(),
                 available_models: vec!["test".into()],
+                endpoints: Default::default(),
                 api: crate::core::types::ApiProtocol::Responses,
                 account_id: None,
                 thinking_effort: None,
@@ -505,17 +549,53 @@ mod tests {
             scroll: 0,
             tick: 0,
             quit: false,
+            last_ctrl_c: None,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
             slash_selected: 0,
+            connection: None,
             assistant_open: false,
+            show_thinking: false,
             plan: crate::core::types::Plan::default(),
             transcript_version: 0,
             display_cache: Vec::new(),
             display_cache_width: 0,
             display_cache_version: u64::MAX,
         }
+    }
+
+    #[test]
+    fn thinking_stream_coalesces_and_closes_on_assistant_text() {
+        let mut app = test_app();
+        app.tick = 8; // throttle window open, so every delta bumps the version
+        for chunk in ["Let me ", "think."] {
+            append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Thinking(chunk.into()),
+            );
+        }
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("done".into()),
+        );
+        assert_eq!(app.transcript.len(), 2);
+        assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "Let me think."));
+        assert!(matches!(&app.transcript[1], TranscriptBlock::Assistant(_)));
+        assert!(app.assistant_open);
+    }
+
+    #[test]
+    fn thinking_only_deltas_stay_in_one_block() {
+        let mut app = test_app();
+        for chunk in ["a", "b", "c"] {
+            append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Thinking(chunk.into()),
+            );
+        }
+        assert_eq!(app.transcript.len(), 1);
+        assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "abc"));
     }
 
     #[test]

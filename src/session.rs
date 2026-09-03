@@ -10,6 +10,11 @@ use crate::core::types::ChatMessage;
 
 const SESSION_VERSION: u32 = 1;
 
+/// Serializes tests that redirect XDG_DATA_HOME (it decides where ALL
+/// sessions live, including other tests' fixtures).
+#[cfg(test)]
+pub(crate) static TEST_SESSIONS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct SessionHeader {
     #[serde(rename = "type")]

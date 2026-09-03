@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, DisableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -65,6 +65,9 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         } else {
             info.available_models.clone()
         },
+        // The daemon routes endpoint-prefixed models; the display copy never
+        // talks to a provider.
+        endpoints: Default::default(),
         api: ApiProtocol::Responses,
         account_id: None,
         thinking_effort: None,
@@ -84,6 +87,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
         ));
     }
+    OSC_START.get_or_init(Instant::now);
 
     let client = DaemonClient::new(daemon_url)
         .map_err(|e| std::io::Error::other(format!("failed to connect to daemon: {e}")))?;
@@ -147,7 +151,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>();
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
-    let mut app = App {
+    let app = App {
         transcript: Vec::new(),
         input: crate::ui::input::InputField::new(),
         config: display_config(&info),
@@ -175,23 +179,19 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         scroll: 0,
         tick: 0,
         quit: false,
+        last_ctrl_c: None,
         history: Vec::new(),
         history_index: None,
         history_draft: String::new(),
         slash_selected: 0,
+        connection: Some(connection_label(daemon_url)),
         assistant_open: false,
+        show_thinking: false,
         transcript_version: 0,
         display_cache: Vec::new(),
         display_cache_width: 0,
         display_cache_version: u64::MAX,
     };
-    push_info(
-        &mut app,
-        format!(
-            "connected to {daemon_url} · workspace {} · model {}",
-            info.cwd, info.model
-        ),
-    );
 
     let mut remote = RemoteApp {
         app,
@@ -243,23 +243,11 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // take over; surface colors are resolved from this once.
     super::theme::detect_background();
     enable_raw_mode()?;
-    // Correct fix: consume any OSC 10/11 reply that arrived late.
-    // terminal_colorsaurus writes `\x1b]10;?` / `\x1b]11;?` and reads the
-    // reply; on timeout the reply (`\x1b]10;rgb:…\x07`) stays in the tty
-    // queue and crossterm parses it as Alt+`]` + plain chars + Ctrl-G.
-    // Drain with a short deadline so the full burst is consumed before the
-    // event loop starts. No input hack — just consume at the source.
-    {
-        let drain_deadline = Instant::now() + Duration::from_millis(80);
-        while Instant::now() < drain_deadline {
-            let remaining = drain_deadline.saturating_duration_since(Instant::now());
-            if event::poll(remaining)? {
-                let _ = event::read();
-            } else {
-                break;
-            }
-        }
-    }
+    // No startup drain here: a blind deadline cuts OSC reply bursts in half
+    // and leaks the tail (sans lead-in) into the composer. Late replies —
+    // from the theme query above or from anything else querying this tty,
+    // at any time — are swallowed whole by `strip_osc_report` in the event
+    // loop below.
     let _cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
     // No mouse capture: capturing the mouse makes the terminal hand over
@@ -288,7 +276,19 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             // turn streams in on the worker thread.
             loop {
                 match remote.worker_rx.try_recv() {
-                    Ok(WorkerMessage::Stream(event)) => handle_stream_event(&mut remote, event),
+                    Ok(WorkerMessage::Stream(event)) => {
+                        if remote.app.cancel_requested {
+                            match &event {
+                                StreamEvent::TurnComplete { .. }
+                                | StreamEvent::TurnFailed { .. } => {
+                                    handle_stream_event(&mut remote, event);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        handle_stream_event(&mut remote, event);
+                    }
                     Ok(WorkerMessage::Finished(error)) => finish_turn(&mut remote, error),
                     Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
                 }
@@ -299,6 +299,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             } else if event::poll(Duration::from_millis(16))? {
                 event::read()?
             } else {
+                continue;
+            };
+
+            // Drop OSC 10/11 color reports mis-parsed as keystrokes before
+            // they can type themselves into the composer.
+            let Some(next) = strip_osc_report(next, &mut pending)? else {
                 continue;
             };
 
@@ -349,6 +355,9 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
         StreamEvent::AssistantText(text) => {
             append_sink_line(&mut remote.app, SinkLine::Assistant(text));
         }
+        StreamEvent::Thinking(text) => {
+            append_sink_line(&mut remote.app, SinkLine::Thinking(text));
+        }
         StreamEvent::ToolCall { name, args } => {
             let preview = args.as_str().unwrap_or_default().to_string();
             append_sink_line(
@@ -374,6 +383,33 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                 },
             );
         }
+        StreamEvent::SteeringAccepted { content } => {
+            if let Some(pos) = remote
+                .app
+                .pending_steering
+                .iter()
+                .position(|c| c == &content)
+            {
+                remote.app.pending_steering.remove(pos);
+            } else if !remote.app.pending_steering.is_empty() {
+                // Fallback: content may have been trimmed differently; pop oldest.
+                remote.app.pending_steering.remove(0);
+            }
+            render_user_prompt(&mut remote.app, &content);
+        }
+        StreamEvent::FollowupAccepted { content } => {
+            if let Some(pos) = remote
+                .app
+                .pending_followups
+                .iter()
+                .position(|c| c == &content)
+            {
+                remote.app.pending_followups.remove(pos);
+            } else if !remote.app.pending_followups.is_empty() {
+                remote.app.pending_followups.remove(0);
+            }
+            render_user_prompt(&mut remote.app, &content);
+        }
         StreamEvent::ApprovalRequired { name, input, .. } => {
             // Invariant: the daemon parks at most one approval per turn
             // (agent thread blocks until it is resolved), so overwriting would
@@ -392,17 +428,13 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);
             }
-            if let Some(cached) = cached {
-                remote.app.tool_state.last_cached = Some(cached);
-            }
+            remote.app.tool_state.last_cached = cached;
         }
         StreamEvent::Usage { tokens, cached } => {
             // Live context usage: emitted by the daemon after every LLM call
             // so the status bar updates mid-turn, not just at completion.
             remote.app.tool_state.last_usage = Some(tokens);
-            if cached.is_some() {
-                remote.app.tool_state.last_cached = cached;
-            }
+            remote.app.tool_state.last_cached = cached;
             // Cumulative spend across turns. TurnComplete.usage repeats the
             // final call's count, so only Usage events accumulate.
             remote.app.tool_state.total_usage =
@@ -440,6 +472,16 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
         append_sink_line(&mut remote.app, SinkLine::Error(error));
     }
     let app = &mut remote.app;
+    // If the turn was cancelled, restore queued steering/follow-ups to the
+    // composer so the user can retry (mirrors old local `event.rs` logic).
+    if app.cancel_requested {
+        let mut restored = Vec::new();
+        restored.append(&mut app.pending_steering);
+        restored.append(&mut app.pending_followups);
+        if !restored.is_empty() {
+            app.input = crate::ui::input::InputField::from_text(&restored.join("\n"));
+        }
+    }
     app.busy = false;
     app.cancel_requested = false;
     app.active_tool = None;
@@ -513,6 +555,202 @@ fn arrow_delta(code: KeyCode) -> i32 {
     }
 }
 
+/// How long to hold a suspicious char run while waiting for the rest of an
+/// OSC color report before giving up and replaying it as real input.
+/// Short poll for the next key in the burst, total window for a chunked
+/// terminal reply (some ttys split `\x1b]11;rgb:…\x07` across writes).
+const OSC_LOOKAHEAD: Duration = Duration::from_millis(35);
+const OSC_TOTAL_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// TUI startup instant, so swallowed reports can be attributed: uptime near
+/// zero means our own startup theme query (reply arrived late); a large
+/// uptime means something else queried this tty mid-session.
+static OSC_START: OnceLock<Instant> = OnceLock::new();
+
+/// Best-effort diagnostic journal of OSC runs caught by `strip_osc_report`,
+/// appended to `~/.cache/dex/osc.log`. The reply carries no sender identity,
+/// so the log records when + how late + what; failures are ignored.
+fn log_osc(kind: &str, body: &str) {
+    use std::io::Write;
+    let Some(dir) = dirs::cache_dir() else { return };
+    let path = dir.join("dex/osc.log");
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let up = OSC_START.get_or_init(Instant::now).elapsed().as_secs_f64();
+    let body: String = body.chars().take(80).collect();
+    let _ = writeln!(f, "{ts} uptime={up:.1}s {kind} body={body}");
+}
+
+/// Swallow OSC 10/11 color reports that crossterm mis-parses as keystrokes.
+/// Crossterm has no OSC parsing: `\x1b]11;rgb:0505/1818/2e2e` + BEL arrives
+/// as `Alt+']'`, then one plain-char key per body byte, then `Ctrl+G` (BEL)
+/// or `Alt+'\'` (ST). Such reports come from the startup theme query and
+/// from anything else querying this tty (the terminal itself does), at any
+/// time; unfiltered they type `10;rgb:f6f6/dcdc/acac…` into the composer.
+/// Returns `None` when the run was swallowed; anything that doesn't fit the
+/// report shape is replayed untouched, so real input is never dropped —
+/// worst case it is delayed by one look-ahead window.
+fn strip_osc_report(ev: Event, pending: &mut VecDeque<Event>) -> std::io::Result<Option<Event>> {
+    let lead_in = |e: &Event| {
+        matches!(
+            e,
+            Event::Key(k) if k.code == KeyCode::Char(']') && k.modifiers == KeyModifiers::ALT
+        )
+    };
+    if !lead_in(&ev) {
+        return Ok(Some(ev));
+    }
+    let terminator = |k: &crossterm::event::KeyEvent| {
+        (k.code == KeyCode::Char('g') && k.modifiers == KeyModifiers::CONTROL) // BEL
+            || (k.code == KeyCode::Char('\\') && k.modifiers == KeyModifiers::ALT)
+        // ST
+    };
+
+    // Consume the run: plain chars accumulate into `body`, until a report
+    // terminator, the next report's lead-in, any other key, or a gap.
+    // A chunked tty can split `\x1b]11;rgb:…\x07` across writes with a short
+    // gap; if the prefix so far could still become a valid report, keep
+    // waiting up to the total window instead of replaying the fragment.
+    let mut run: Vec<Event> = vec![ev];
+    let mut body = String::new();
+    let start = Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= OSC_TOTAL_TIMEOUT {
+            break;
+        }
+        let remaining = OSC_TOTAL_TIMEOUT - elapsed;
+        let short = remaining.min(OSC_LOOKAHEAD);
+        let next = match pending.pop_front() {
+            Some(e) => e,
+            None if event::poll(short)? => event::read()?,
+            None => {
+                if is_osc_prefix(&body) && !body.is_empty() {
+                    continue;
+                }
+                break;
+            }
+        };
+        let (char_of, ends) = match &next {
+            Event::Key(k) if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT => {
+                match k.code {
+                    KeyCode::Char(c) => (Some(c), false),
+                    _ => (None, true),
+                }
+            }
+            Event::Key(k) if terminator(k) => (None, true),
+            e if lead_in(e) => (None, true),
+            _ => (None, true),
+        };
+        if let Some(c) = char_of {
+            body.push(c);
+        }
+        run.push(next);
+        if ends {
+            break;
+        }
+    }
+
+    // A back-to-back next report begins with its own lead-in; reclassify it.
+    let next_lead_in = if run.len() > 1 && lead_in(run.last().unwrap()) {
+        run.pop()
+    } else {
+        None
+    };
+
+    if is_osc_report(&body) {
+        log_osc("swallowed", &body);
+        if let Some(lead) = next_lead_in {
+            pending.push_front(lead);
+        }
+        return Ok(None);
+    }
+    // Not a report after all (or the burst was split beyond the look-ahead —
+    // ponytail: 25ms; a tty that chunks reply writes slower than that would
+    // leak the tail): replay everything in order. The lead-in itself is
+    // returned for dispatch (Alt+']' inserts nothing) so a replayed run can
+    // never re-enter this filter and loop.
+    log_osc("replayed", &body);
+    let lead_in_ev = run.remove(0);
+    for e in run.into_iter().rev() {
+        pending.push_front(e);
+    }
+    Ok(Some(lead_in_ev))
+}
+
+/// How the engine is reached: loopback daemons are "local", everything else
+/// is reported by host. Used by the status bar instead of a startup banner.
+pub(crate) fn connection_label(daemon_url: &str) -> String {
+    let authority = daemon_url
+        .split_once("://")
+        .map_or(daemon_url, |(_, rest)| rest);
+    // Authority = [userinfo@]host[:port]; stop at the first path/query char.
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    // Bracketed IPv6 literals: everything through `]` is the host, the rest
+    // (if any) is the port. Otherwise a trailing `:digits` is a port.
+    let host = if let Some(close) = authority.find(']') {
+        &authority[..=close]
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => authority,
+        }
+    };
+    if is_loopback(host) {
+        format!("connected to local at {host}")
+    } else {
+        format!("connected to daemon at {host}")
+    }
+}
+
+fn is_loopback(host: &str) -> bool {
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return true;
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let octets: Vec<_> = bare.split('.').collect();
+    octets.len() == 4 && octets[0] == "127" && octets[1..].iter().all(|o| o.parse::<u8>().is_ok())
+}
+
+/// Body grammar of an OSC 10/11 color report: `10;rgb:` / `11;rgb:` plus at
+/// least three `/`-separated hex components (16-bit or truncated).
+fn is_osc_report(body: &str) -> bool {
+    let rest = body
+        .strip_prefix("10;rgb:")
+        .or_else(|| body.strip_prefix("11;rgb:"))
+        .unwrap_or("");
+    !rest.is_empty()
+        && rest.split('/').count() >= 3
+        && rest.chars().all(|c| c.is_ascii_hexdigit() || c == '/')
+}
+
+fn is_osc_prefix(body: &str) -> bool {
+    if body.is_empty() {
+        return true;
+    }
+    if "10;rgb:".starts_with(body) || "11;rgb:".starts_with(body) {
+        return true;
+    }
+    if let Some(rest) = body
+        .strip_prefix("10;rgb:")
+        .or_else(|| body.strip_prefix("11;rgb:"))
+    {
+        return rest.chars().all(|c| c.is_ascii_hexdigit() || c == '/');
+    }
+    matches!(body, "1" | "10" | "11" | "10;" | "11;")
+}
+
 fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     let app = &mut remote.app;
 
@@ -563,6 +801,13 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         return;
     }
 
+    // Idle double Ctrl+C guard: any non-Ctrl+C key cancels the pending quit.
+    let is_ctrl_c =
+        matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL);
+    if !is_ctrl_c {
+        app.last_ctrl_c = None;
+    }
+
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.busy {
@@ -574,11 +819,26 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                     request_cancel(remote);
                 }
             } else {
-                app.quit = true;
+                // Double Ctrl+C to exit when idle (avoid accidental quit).
+                const DOUBLE_WINDOW: Duration = Duration::from_secs(2);
+                let now = Instant::now();
+                let should_quit = app
+                    .last_ctrl_c
+                    .is_some_and(|t| now.duration_since(t) <= DOUBLE_WINDOW);
+                if should_quit {
+                    app.quit = true;
+                } else {
+                    app.last_ctrl_c = Some(now);
+                    push_info(app, "Press Ctrl+C again to exit".to_string());
+                }
             }
         }
         KeyCode::Esc if app.busy => {
             request_cancel(remote);
+        }
+        KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
+            app.show_thinking = !app.show_thinking;
+            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
             KeyCode::Up => {
@@ -597,7 +857,8 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             _ => app.input.handle_key(key),
         },
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            submit_prompt(remote);
+            let is_followup = key.modifiers.contains(KeyModifiers::ALT);
+            submit_prompt(remote, is_followup);
         }
         KeyCode::PageUp => {
             scroll_transcript(app, -20);
@@ -653,12 +914,62 @@ fn request_cancel(remote: &mut RemoteApp) {
     }
 }
 
-fn submit_prompt(remote: &mut RemoteApp) {
-    if remote.app.busy {
-        return;
-    }
+fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let line = remote.app.input.text().trim().to_string();
     if line.is_empty() {
+        return;
+    }
+    // While busy, queue steering (mid-turn) or follow-up (chained turn) to
+    // the daemon instead of starting a new turn. The daemon's `steering_rx` /
+    // `followup_rx` (consumed inside `process_turn` and the outer follow-up
+    // loop) mirrors the old in-memory `event.rs::submit(is_followup)` path.
+    if remote.app.busy {
+        if is_followup {
+            remote.app.pending_followups.push(line.clone());
+        } else {
+            remote.app.pending_steering.push(line.clone());
+        }
+        let history_line = line.clone();
+        remote.app.history_push(history_line);
+        remote.app.input.reset();
+        let client = remote.client.clone();
+        let sid = remote.session_id.clone();
+        let result = if is_followup {
+            client.followup(&sid, &line)
+        } else {
+            client.steer(&sid, &line)
+        };
+        if let Err(e) = result {
+            // No active turn to queue into (409) or network error: restore to
+            // pending badge error and keep input for retry.
+            if is_followup {
+                remote.app.pending_followups.retain(|c| c != &line);
+            } else {
+                remote.app.pending_steering.retain(|c| c != &line);
+            }
+            let msg = e.to_string();
+            if msg.contains("409") || msg.contains("CONFLICT") {
+                push_info(
+                    &mut remote.app,
+                    format!(
+                        "no active turn to queue {} into (turn may have just finished); sent as new prompt on next Enter",
+                        if is_followup { "follow-up" } else { "steer" }
+                    ),
+                );
+                remote.app.input = crate::ui::input::InputField::from_text(&line);
+            } else {
+                push_info(
+                    &mut remote.app,
+                    format!(
+                        "failed to queue {}: {e}",
+                        if is_followup { "follow-up" } else { "steer" }
+                    ),
+                );
+            }
+        }
+        // On success the daemon will emit `SteeringAccepted` / `FollowupAccepted`
+        // which clears `pending_*` and renders the prompt. Keep the badge
+        // visible until then.
         return;
     }
 
@@ -774,7 +1085,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll"
+                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
                     .to_string(),
             );
             push_info(
@@ -783,7 +1094,8 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "while working: Esc/Ctrl+C cancels the turn".to_string(),
+                "while working: Enter queues steer · Alt+Enter queues follow-up · Esc/Ctrl+C cancels and restores queued input"
+                    .to_string(),
             );
         }
         _ if line.starts_with("/skill:") => {
@@ -904,4 +1216,48 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_labels_classify_host() {
+        assert_eq!(
+            connection_label("http://127.0.0.1:4113"),
+            "connected to local at 127.0.0.1"
+        );
+        assert_eq!(
+            connection_label("http://localhost:4113"),
+            "connected to local at localhost"
+        );
+        assert_eq!(
+            connection_label("http://[::1]:4113"),
+            "connected to local at [::1]"
+        );
+        assert_eq!(
+            connection_label("daemon.internal:4113"),
+            "connected to daemon at daemon.internal"
+        );
+        assert_eq!(
+            connection_label("https://agent.example.com/api"),
+            "connected to daemon at agent.example.com"
+        );
+    }
+
+    #[test]
+    fn recognizes_leaked_color_reports() {
+        // The exact bodies observed typing themselves into the composer.
+        assert!(is_osc_report("10;rgb:f6f6/dcdc/acac"));
+        assert!(is_osc_report("11;rgb:0505/1818/2e2e"));
+        assert!(is_osc_report("10;rgb:05/18/2e"));
+        // Not reports: replayed as real input.
+        assert!(!is_osc_report("hello"));
+        assert!(!is_osc_report(""));
+        assert!(!is_osc_report("10;rgb:"));
+        assert!(!is_osc_report("12;rgb:0505/1818/2e2e"));
+        assert!(!is_osc_report("11;rgb:zzzz/1818/2e2e"));
+        assert!(!is_osc_report("10;rgb:0505/1818"));
+    }
 }

@@ -121,3 +121,65 @@ impl ToolState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_file_path_resolves_xdg_then_home() {
+        let prev_xdg = env::var_os("XDG_CACHE_HOME");
+        let prev_home = env::var_os("HOME");
+
+        env::set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-test");
+        assert_eq!(cache_file_path().unwrap(), PathBuf::from("/tmp/xdg-cache-test/dex-tool-cache.json"));
+
+        env::remove_var("XDG_CACHE_HOME");
+        env::set_var("HOME", "/tmp/fakehome2");
+        assert_eq!(cache_file_path().unwrap(), PathBuf::from("/tmp/fakehome2/.cache/dex-tool-cache.json"));
+
+        match prev_xdg {
+            Some(v) => env::set_var("XDG_CACHE_HOME", v),
+            None => env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prev_home {
+            Some(v) => env::set_var("HOME", v),
+            None => env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn cache_fingerprint_is_stable_for_missing_file() {
+        // No real file -> no fingerprint suffix
+        let fp = cache_fingerprint("read", r#"{"path":"/tmp/definitely-missing-dex-12345"}"#);
+        assert_eq!(fp, "");
+    }
+
+    #[test]
+    fn tool_state_insert_marks_dirty_and_clear_resets() {
+        let mut s = ToolState::default();
+        assert!(!s.dirty);
+        s.insert("k".into(), "v".into());
+        assert!(s.dirty);
+        assert_eq!(s.cache.get("k").unwrap(), "v");
+        s.clear();
+        assert!(s.cache.is_empty());
+        // second clear when already empty does not dirty again (still dirty from first clear, but not extra)
+        let dirty_before = s.dirty;
+        s.clear();
+        assert_eq!(s.dirty, dirty_before);
+    }
+
+    #[test]
+    fn tool_state_load_is_empty_when_cache_disabled() {
+        // default env has DEX_TOOL_CACHE != "1"
+        let prev = env::var_os("DEX_TOOL_CACHE");
+        env::remove_var("DEX_TOOL_CACHE");
+        let s = ToolState::load();
+        assert!(s.cache.is_empty());
+        match prev {
+            Some(v) => env::set_var("DEX_TOOL_CACHE", v),
+            None => env::remove_var("DEX_TOOL_CACHE"),
+        }
+    }
+}
