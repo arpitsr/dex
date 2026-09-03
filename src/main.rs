@@ -30,8 +30,8 @@ use std::io::{self, Write};
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut config =
         LlmConfig::from_env(args.base_url.clone(), args.model.clone(), args.permission)?;
-    // P9: auto-detect verification at the one-shot boundary too.
-    if config.verify_command.is_none() {
+    // Verification opt-in only — see daemon/server.rs.
+    if config.verify_command.is_none() && std::env::var("DEX_VERIFY").as_deref() == Ok("1") {
         config.verify_command = crate::llm::config::detect_verify_command();
     }
     let mut skill_dirs = skill_dirs();

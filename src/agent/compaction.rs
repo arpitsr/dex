@@ -238,29 +238,32 @@ pub(crate) fn find_cutoff(messages: &[ChatMessage]) -> Option<usize> {
 }
 
 pub(crate) fn compact_history(
-    config: &LlmConfig,
+    _config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
-    cancel: &dyn CancellationSource,
+    _cancel: &dyn CancellationSource,
 ) -> Result<bool, String> {
     let cutoff = match find_cutoff(messages) {
         Some(c) => c,
         None => return Ok(false),
     };
 
-    // Summarize the old segment (between the first user message and cutoff).
+    // Fast deterministic summary by default — no LLM round-trip. Set
+    // DEX_COMPACTION_LLM=1 to use the model summarizer when quality matters.
     let old: Vec<ChatMessage> = messages[1..cutoff].to_vec();
-    let summarized = match summarize_old_messages(config, &old, cancel) {
-        Ok(s) if !s.trim().is_empty() => s,
-        Ok(_) => deterministic_summary(&old),
-        Err(e) => {
-            let msg = e.to_string();
-            // Cancellation or transient API error should not abort the turn
-            // if we can still make progress deterministically.
-            if msg.contains("cancelled") || msg.contains("cancellation") {
-                return Err(format!("history compaction cancelled: {msg}"));
+    let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
+        match summarize_old_messages(_config, &old, _cancel) {
+            Ok(s) if !s.trim().is_empty() => s,
+            Ok(_) => deterministic_summary(&old),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("cancelled") || msg.contains("cancellation") {
+                    return Err(format!("history compaction cancelled: {msg}"));
+                }
+                deterministic_summary(&old)
             }
-            deterministic_summary(&old)
         }
+    } else {
+        deterministic_summary(&old)
     };
 
     // If a previous summary exists, it sits at index 1 and is part of `old`,

@@ -303,7 +303,7 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(file.max_tool_iterations)
-                .unwrap_or(60),
+                .unwrap_or(25),
             max_prompt_tokens: env::var("DEX_MAX_PROMPT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
