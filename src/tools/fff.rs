@@ -1,4 +1,4 @@
-//! fff-powered search: `ffgrep` (content) and `fffind` (paths), backed by the
+//! fff-powered search: `grep` (content) and `find` (paths) — aliases `ffgrep`/`fffind` kept for compat, backed by the
 //! fff-search crate (the engine behind pi's fff extension and fff.nvim).
 //! One shared picker per process; fff spawns its own background scan and
 //! filesystem watcher, so results stay fresh without rescans.
@@ -220,7 +220,7 @@ pub(crate) fn tool_fffind(args: &Map<String, Value>) -> Result<String, ToolError
     let query = query_arg(args)?;
     if query.trim() == "*" {
         return Err(ToolError::InvalidArgument(
-            "fffind pattern must be targeted (not '*'); use grep-style constraints instead"
+            "find pattern must be targeted (alias fffind) (not '*'); use grep-style constraints instead"
                 .to_string(),
         ));
     }

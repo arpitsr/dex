@@ -4,10 +4,12 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-use crate::core::types::{ChatMessage, Plan, Provider};
+use crate::core::types::{ChatMessage, Provider};
+#[allow(unused_imports)]
+use crate::core::types::Plan;
 use crate::session::Session;
 
-use super::{push_info, App, InputField};
+use super::{push_info, rebuild_transcript, App, InputField};
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "Exit the REPL"),
@@ -19,18 +21,6 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/name", "Rename the current session"),
     ("/model", "Show or switch the model"),
     ("/provider", "Show or switch the provider"),
-    ("/goal", "Set or show the task goal"),
-    ("/plan", "Show the plan"),
-    ("/plan add", "Add a plan step"),
-    ("/plan done", "Mark a plan step done"),
-    ("/plan clear", "Clear the plan"),
-    ("/constraint add", "Add a task constraint"),
-    ("/constraint clear", "Clear all constraints"),
-    ("/accept add", "Add an acceptance criterion"),
-    ("/accept done", "Mark an acceptance criterion checked"),
-    ("/accept clear", "Clear acceptance criteria"),
-    ("/budget", "Show or set the task budget"),
-    ("/budget clear", "Clear the task budget"),
     ("/waive <reason>", "Waive verification with a reason"),
     ("/undo", "Undo the last recorded file change"),
     ("/help", "Show available commands"),
@@ -46,39 +36,7 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
     if app.busy || !input.starts_with('/') || input.contains('\n') {
         return Vec::new();
     }
-    if input.starts_with("/plan") {
-        let choices = ["/plan", "/plan add ", "/plan done ", "/plan clear"];
-        let q = input.to_ascii_lowercase();
-        return choices
-            .iter()
-            .filter(|c| c.starts_with(&q))
-            .map(|c| (c.to_string(), "Plan command".to_string()))
-            .collect();
-    }
-    if input.starts_with("/constraint") {
-        let choices = ["/constraint add ", "/constraint clear"];
-        let q = input.to_ascii_lowercase();
-        return choices
-            .iter()
-            .filter(|c| c.starts_with(&q))
-            .map(|c| (c.to_string(), "Constraint command".to_string()))
-            .collect();
-    }
-    if input.starts_with("/accept") {
-        let choices = ["/accept add ", "/accept done ", "/accept clear"];
-        let q = input.to_ascii_lowercase();
-        return choices
-            .iter()
-            .filter(|c| c.starts_with(&q))
-            .map(|c| (c.to_string(), "Acceptance command".to_string()))
-            .collect();
-    }
-    if input.starts_with("/goal")
-        && !input.starts_with("/goal ")
-        && "/goal".starts_with(&input.to_ascii_lowercase())
-    {
-        return vec![("/goal ".to_string(), "Set the task goal".to_string())];
-    }
+
     if let Some(query) = input.strip_prefix("/model ") {
         let query = query.to_ascii_lowercase();
         return app
@@ -115,6 +73,53 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
             })
             .collect();
     }
+    if input == "/resume" || input.starts_with("/resume ") {
+        let query = input
+            .strip_prefix("/resume")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let Ok(sessions) = Session::list(&app.cwd) else {
+            return Vec::new();
+        };
+        // Hide the current session and empty sessions — they are the
+        // just-created placeholder and make `0` point at an empty transcript.
+        let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
+            .into_iter()
+            .filter(|(path, header)| {
+                if header.id() == app.session.id() {
+                    return false;
+                }
+                // Skip sessions with no persisted messages (only header).
+                match crate::session::load_messages_from_session(path) {
+                    Ok(msgs) => !msgs.is_empty(),
+                    Err(_) => false,
+                }
+            })
+            .collect();
+        return filtered
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, header))| {
+                if query.is_empty() {
+                    return true;
+                }
+                let name = header.name().unwrap_or("").to_ascii_lowercase();
+                let id = header.id().to_ascii_lowercase();
+                i.to_string().starts_with(&query)
+                    || name.contains(&query)
+                    || id.starts_with(&query)
+                    || header.timestamp().to_ascii_lowercase().contains(&query)
+            })
+            .map(|(i, (_, header))| {
+                let name = header.name().unwrap_or("(unnamed)");
+                (
+                    format!("/resume {i}"),
+                    format!("{} · {}", name, header.timestamp()),
+                )
+            })
+            .collect();
+    }
     if input.contains(' ') {
         return Vec::new();
     }
@@ -145,7 +150,18 @@ pub(super) fn complete_slash(app: &mut App) -> bool {
     else {
         return false;
     };
-    app.input = InputField::from_text(&format!("{command} "));
+    // Choices that take an argument already end in a space; don't stack a
+    // second one ("/plan add  " trims to a bare "/plan add" that matches no
+    // handler arm and reports "unknown command").
+    let completed = if command.ends_with(' ') {
+        command.clone()
+    } else {
+        format!("{command} ")
+    };
+    if app.input.text() == completed {
+        return false;
+    }
+    app.input = InputField::from_text(&completed);
     app.slash_selected = 0;
     true
 }
@@ -183,19 +199,78 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             push_info(app, format!("permission mode: {:?}", app.config.permission));
             push_info(app, format!("workspace: {}", app.cwd));
         }
-        "/resume" => match Session::list(&app.cwd) {
-            Ok(sessions) if !sessions.is_empty() => {
+        "/resume" => {
+            let sessions = Session::list(&app.cwd).unwrap_or_default();
+            let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
+                .into_iter()
+                .filter(|(path, header)| {
+                    if header.id() == app.session.id() {
+                        return false;
+                    }
+                    matches!(
+                        crate::session::load_messages_from_session(path),
+                        Ok(msgs) if !msgs.is_empty()
+                    )
+                })
+                .collect();
+            if filtered.is_empty() {
+                push_info(app, "no sessions found.".to_string());
+            } else {
                 push_info(app, "sessions:".to_string());
-                for (i, (path, header)) in sessions.iter().enumerate() {
+                for (i, (path, header)) in filtered.iter().enumerate() {
                     let name = header.name().unwrap_or("(unnamed)");
                     push_info(app, format!("  {}: {} ({})", i, name, path.display()));
                 }
             }
-            _ => push_info(app, "no sessions found.".to_string()),
-        },
+        }
         _ if line.starts_with("/resume ") => {
             let selector = line["/resume ".len()..].trim();
-            match Session::resume(&app.cwd, selector) {
+            let sessions = Session::list(&app.cwd).unwrap_or_default();
+            let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
+                .into_iter()
+                .filter(|(path, header)| {
+                    if header.id() == app.session.id() {
+                        return false;
+                    }
+                    matches!(
+                        crate::session::load_messages_from_session(path),
+                        Ok(msgs) if !msgs.is_empty()
+                    )
+                })
+                .collect();
+            let path_opt = if let Ok(idx) = selector.parse::<usize>() {
+                filtered.get(idx).map(|(p, _)| p.clone())
+            } else {
+                let q = selector.to_ascii_lowercase();
+                filtered
+                    .iter()
+                    .find(|(p, h)| {
+                        h.id().to_ascii_lowercase().starts_with(&q)
+                            || h.name().unwrap_or("").to_ascii_lowercase().contains(&q)
+                            || p.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase()
+                                .starts_with(&q)
+                    })
+                    .map(|(p, _)| p.clone())
+                    .or_else(|| {
+                        // Fallback to legacy path-based resume for compatibility.
+                        let cand = std::path::PathBuf::from(selector);
+                        filtered
+                            .iter()
+                            .find(|(p, _)| p == &cand)
+                            .map(|(p, _)| p.clone())
+                    })
+            };
+            let Some(path) = path_opt else {
+                push_info(
+                    app,
+                    format!("could not resume session: {selector} not found"),
+                );
+                return false;
+            };
+            match Session::from_path(&path) {
                 Ok(session) => {
                     let loaded = session
                         .path()
@@ -208,6 +283,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     }
                     let session_path = session.path().map(|p| p.to_path_buf());
                     app.session = session;
+                    rebuild_transcript(app);
                     apply_session_state(app, session_path.as_deref());
                     push_info(
                         app,
@@ -261,243 +337,6 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 "available providers: opencode, openai-codex".to_string(),
             );
         }
-        "/goal" => {
-            if let Some(g) = app.plan.goal.clone() {
-                push_info(app, format!("goal: {g}"));
-            } else {
-                push_info(app, "no goal set; use /goal <text>".to_string());
-            }
-            if !app.plan.steps.is_empty() {
-                let steps = app.plan.steps.clone();
-                for (i, (s, done)) in steps.iter().enumerate() {
-                    push_info(
-                        app,
-                        format!("  {} {} {}", if *done { "[x]" } else { "[ ]" }, i + 1, s),
-                    );
-                }
-            }
-        }
-        _ if line.starts_with("/goal ") => {
-            let text = line["/goal ".len()..].trim().to_string();
-            if text.is_empty() {
-                push_info(app, "usage: /goal <text>".to_string());
-            } else {
-                app.plan.goal = Some(text.clone());
-                if let Err(e) = save_plan(app) {
-                    push_info(app, format!("could not persist goal: {e}"));
-                } else {
-                    push_info(app, format!("goal set: {text}"));
-                }
-            }
-        }
-        "/plan" => {
-            if app.plan.is_empty() {
-                push_info(
-                    app,
-                    "no plan yet; use /goal, /plan add, /constraint add, /accept add".to_string(),
-                );
-            } else {
-                if let Some(g) = app.plan.goal.clone() {
-                    push_info(app, format!("Goal: {g}"));
-                }
-                if !app.plan.constraints.is_empty() {
-                    push_info(app, "Constraints:".to_string());
-                    let constraints = app.plan.constraints.clone();
-                    for c in constraints {
-                        push_info(app, format!("  - {c}"));
-                    }
-                }
-                let done = app.plan.steps.iter().filter(|(_, d)| *d).count();
-                let total = app.plan.steps.len();
-                if total > 0 {
-                    push_info(app, format!("Plan {done}/{total}"));
-                    let steps = app.plan.steps.clone();
-                    for (i, (s, done)) in steps.iter().enumerate() {
-                        push_info(
-                            app,
-                            format!("  {} {} {}", if *done { "[x]" } else { "[ ]" }, i + 1, s),
-                        );
-                    }
-                }
-                if !app.plan.acceptance.is_empty() {
-                    push_info(app, "Acceptance:".to_string());
-                    let acceptance = app.plan.acceptance.clone();
-                    for (i, (s, checked)) in acceptance.iter().enumerate() {
-                        push_info(
-                            app,
-                            format!("  {} {} {}", if *checked { "[x]" } else { "[ ]" }, i + 1, s),
-                        );
-                    }
-                }
-                if app.plan.is_complete() {
-                    push_info(app, "plan complete ✓".to_string());
-                }
-            }
-        }
-        _ if line.starts_with("/plan add ") => {
-            let text = line["/plan add ".len()..].trim().to_string();
-            if text.is_empty() {
-                push_info(app, "usage: /plan add <step>".to_string());
-            } else {
-                app.plan.steps.push((text.clone(), false));
-                if let Err(e) = save_plan(app) {
-                    push_info(app, format!("could not persist plan: {e}"));
-                } else {
-                    push_info(app, format!("added step {}: {text}", app.plan.steps.len()));
-                }
-            }
-        }
-        _ if line.starts_with("/plan done ") => {
-            let n = line["/plan done ".len()..]
-                .trim()
-                .parse::<usize>()
-                .unwrap_or(0);
-            if n == 0 || n > app.plan.steps.len() {
-                push_info(
-                    app,
-                    format!("usage: /plan done <1..{}>", app.plan.steps.len()),
-                );
-            } else {
-                app.plan.steps[n - 1].1 = true;
-                if let Err(e) = save_plan(app) {
-                    push_info(app, format!("could not persist plan: {e}"));
-                } else {
-                    push_info(app, format!("marked step {n} done"));
-                }
-            }
-        }
-        "/plan clear" => {
-            app.plan = Plan::default();
-            if let Err(e) = save_plan(app) {
-                push_info(app, format!("could not persist plan: {e}"));
-            } else {
-                push_info(app, "plan cleared".to_string());
-            }
-        }
-        _ if line.starts_with("/constraint add ") => {
-            let text = line["/constraint add ".len()..].trim().to_string();
-            if text.is_empty() {
-                push_info(app, "usage: /constraint add <text>".to_string());
-            } else {
-                app.plan.constraints.push(text.clone());
-                if let Err(e) = save_plan(app) {
-                    push_info(app, format!("could not persist constraints: {e}"));
-                } else {
-                    push_info(app, format!("added constraint: {text}"));
-                }
-            }
-        }
-        "/constraint clear" => {
-            app.plan.constraints.clear();
-            if let Err(e) = save_plan(app) {
-                push_info(app, format!("could not persist constraints: {e}"));
-            } else {
-                push_info(app, "constraints cleared".to_string());
-            }
-        }
-        _ if line.starts_with("/accept add ") => {
-            let text = line["/accept add ".len()..].trim().to_string();
-            if text.is_empty() {
-                push_info(app, "usage: /accept add <criterion>".to_string());
-            } else {
-                app.plan.acceptance.push((text.clone(), false));
-                if let Err(e) = save_plan(app) {
-                    push_info(app, format!("could not persist acceptance: {e}"));
-                } else {
-                    push_info(
-                        app,
-                        format!(
-                            "added acceptance criterion {}: {text}",
-                            app.plan.acceptance.len()
-                        ),
-                    );
-                }
-            }
-        }
-        _ if line.starts_with("/accept done ") => {
-            let n = line["/accept done ".len()..]
-                .trim()
-                .parse::<usize>()
-                .unwrap_or(0);
-            if n == 0 || n > app.plan.acceptance.len() {
-                push_info(
-                    app,
-                    format!("usage: /accept done <1..{}>", app.plan.acceptance.len()),
-                );
-            } else {
-                app.plan.acceptance[n - 1].1 = true;
-                if let Err(e) = save_plan(app) {
-                    push_info(app, format!("could not persist acceptance: {e}"));
-                } else {
-                    push_info(app, format!("marked acceptance criterion {n} checked"));
-                }
-            }
-        }
-        "/accept clear" => {
-            app.plan.acceptance.clear();
-            if let Err(e) = save_plan(app) {
-                push_info(app, format!("could not persist acceptance: {e}"));
-            } else {
-                push_info(app, "acceptance criteria cleared".to_string());
-            }
-        }
-        "/budget" => match app.plan.budget.clone() {
-            Some(b) => push_info(
-                app,
-                format!(
-                    "budget: {}s · {} iterations · ${:.2}",
-                    b.max_seconds.unwrap_or(0),
-                    b.max_tool_iterations.unwrap_or(0),
-                    b.max_cost_usd.unwrap_or(0.0)
-                ),
-            ),
-            None => push_info(
-                app,
-                "no budget set; use /budget <seconds> [iterations] [cost]".to_string(),
-            ),
-        },
-        "/budget clear" => {
-            app.plan.budget = None;
-            if let Err(e) = save_plan(app) {
-                push_info(app, format!("could not persist budget: {e}"));
-            } else {
-                push_info(app, "budget cleared".to_string());
-            }
-        }
-        _ if line.starts_with("/budget ") => {
-            let parts: Vec<&str> = line["/budget ".len()..].split_whitespace().collect();
-            if parts.is_empty() {
-                push_info(
-                    app,
-                    "usage: /budget <seconds> [tool_iterations] [cost_usd]".to_string(),
-                );
-            } else {
-                let max_seconds = parts[0].parse::<u64>().ok();
-                if max_seconds.is_none() {
-                    push_info(
-                        app,
-                        "usage: /budget <seconds> [tool_iterations] [cost_usd]".to_string(),
-                    );
-                } else {
-                    let mut budget = crate::core::types::Budget {
-                        max_seconds,
-                        ..crate::core::types::Budget::default()
-                    };
-                    if let Some(iters) = parts.get(1) {
-                        budget.max_tool_iterations = iters.parse::<u32>().ok();
-                    }
-                    if let Some(cost) = parts.get(2) {
-                        budget.max_cost_usd = cost.parse::<f64>().ok();
-                    }
-                    app.plan.budget = Some(budget);
-                    if let Err(e) = save_plan(app) {
-                        push_info(app, format!("could not persist budget: {e}"));
-                    } else {
-                        push_info(app, "budget set (enforced this session)".to_string());
-                    }
-                }
-            }
-        }
         _ if line.starts_with("/waive ") => {
             let reason = line["/waive ".len()..].trim().to_string();
             if reason.is_empty() {
@@ -532,7 +371,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         "/help" => {
             push_info(
                 app,
-                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>] /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear]"
+                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>]"
                     .to_string(),
             );
             push_info(

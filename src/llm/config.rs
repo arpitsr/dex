@@ -24,10 +24,7 @@ pub(crate) struct FileConfig {
     pub(crate) reserve_tokens: Option<u64>,
     pub(crate) keep_recent_tokens: Option<u64>,
     pub(crate) permission: Option<String>,
-    pub(crate) max_tool_iterations: Option<usize>,
-    pub(crate) max_prompt_tokens: Option<u64>,
     pub(crate) max_tool_output_bytes: Option<usize>,
-    pub(crate) max_turn_seconds: Option<u64>,
     pub(crate) http_connect_timeout_secs: Option<u64>,
     pub(crate) http_request_timeout_secs: Option<u64>,
     pub(crate) verify_command: Option<String>,
@@ -109,6 +106,49 @@ fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u6
         }
     }
     None
+}
+
+/// Cost for one prompt, using models.dev pricing when available.
+/// `input`/`cache_read` are per 1M tokens in the catalog; output tiers
+/// and context-tier pricing are omitted for now (ponytail: add when a
+/// model actually bills them differently enough to matter).
+pub(crate) fn cost_for_prompt(
+    model: &str,
+    prompt_tokens: u64,
+    cached_tokens: Option<u64>,
+) -> Option<f64> {
+    let catalog = load_dex_catalog()?;
+    let needle = model.to_ascii_lowercase();
+    let mut cost_val: Option<&serde_json::Value> = None;
+    if let Some(providers) = catalog.as_object() {
+        for (_prov, entry) in providers {
+            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+                if let Some(m) = models.get(needle.as_str()).or_else(|| {
+                    models
+                        .iter()
+                        .find(|(k, _)| k.to_ascii_lowercase() == needle)
+                        .map(|(_, v)| v)
+                }) {
+                    if let Some(c) = m.get("cost") {
+                        cost_val = Some(c);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let cost = cost_val?;
+    let input_rate = cost.get("input").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cache_read_rate = cost
+        .get("cache_read")
+        .or_else(|| cost.get("cacheRead"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(input_rate);
+    let cached = cached_tokens.unwrap_or(0).min(prompt_tokens);
+    let fresh = prompt_tokens.saturating_sub(cached);
+    let total =
+        fresh as f64 * input_rate / 1_000_000.0 + cached as f64 * cache_read_rate / 1_000_000.0;
+    Some(total)
 }
 
 fn load_dex_models_cache() -> Option<Vec<String>> {
@@ -346,7 +386,7 @@ pub(crate) fn permission_from_env_or_file(
     let value = env::var("DEX_PERMISSION")
         .ok()
         .or_else(|| file.permission.clone())
-        .unwrap_or_else(|| "ask-writes".to_string());
+        .unwrap_or_else(|| "trusted".to_string());
     PermissionMode::parse(&value).map_err(Into::into)
 }
 
@@ -367,9 +407,6 @@ pub(crate) struct LlmConfig {
     pub(crate) reserve_tokens: u64,
     pub(crate) keep_recent_tokens: u64,
     pub(crate) permission: PermissionMode,
-    pub(crate) max_tool_iterations: usize,
-    pub(crate) max_prompt_tokens: u64,
-    pub(crate) max_turn_seconds: u64,
     pub(crate) verify_command: Option<String>,
     pub(crate) client: reqwest::blocking::Client,
 }
@@ -456,17 +493,12 @@ impl LlmConfig {
             ),
             Provider::OpenAiCodex => load_codex_credentials()?,
         };
-        // Resolve context window once, then derive max_prompt_tokens from it
-        // Dex: models.dev catalog (limit.context) > provider default. No hard-coded table.
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
             .or(file.context_window)
             .or_else(|| load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)))
             .unwrap_or_else(|| provider_default_context_window(provider));
-        let derived_max_prompt = context_window
-            .saturating_sub(16_000)
-            .min(context_window * 3 / 4);
         // Pi: reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env::var("DEX_RESERVE_TOKENS")
             .ok()
@@ -542,21 +574,6 @@ impl LlmConfig {
             keep_recent_tokens,
             verify_command: env::var("DEX_VERIFY").ok().or(file.verify_command.clone()),
             permission,
-            max_tool_iterations: env::var("DEX_MAX_TOOL_ITERATIONS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(file.max_tool_iterations)
-                .unwrap_or(60),
-            max_prompt_tokens: env::var("DEX_MAX_PROMPT_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(file.max_prompt_tokens)
-                .unwrap_or(derived_max_prompt),
-            max_turn_seconds: env::var("DEX_MAX_TURN_SECONDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(file.max_turn_seconds)
-                .unwrap_or(3600),
             client,
             endpoints,
         };
@@ -601,10 +618,6 @@ impl LlmConfig {
                 } else {
                     self.context_window = provider_default_context_window(self.provider);
                 }
-                self.max_prompt_tokens = self
-                    .context_window
-                    .saturating_sub(16_000)
-                    .min(self.context_window * 3 / 4);
             }
         }
         result
@@ -617,6 +630,7 @@ impl LlmConfig {
     }
 
     /// Tokens reserved for the model's reply (pi default 16384).
+    #[allow(dead_code)]
     pub(crate) fn reserve_tokens(&self) -> u64 {
         self.reserve_tokens
     }
@@ -689,9 +703,6 @@ mod tests {
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
             permission: PermissionMode::AskWrites,
-            max_tool_iterations: 60,
-            max_prompt_tokens: 96_000,
-            max_turn_seconds: 3600,
             verify_command: None,
             client: reqwest::blocking::Client::new(),
         };

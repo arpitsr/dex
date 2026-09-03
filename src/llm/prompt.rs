@@ -24,19 +24,13 @@ pub(crate) fn project_context() -> Option<String> {
 /// where the model sees it at each tool decision — never duplicated here.
 pub(crate) fn system_prompt(skills: &[Skill]) -> String {
     let mut prompt = concat!(
-        "You are a coding agent. Work directly with the provided tools — read, search, edit, run, verify — and report the result. \
-         Do not narrate a plan, ask permission for clearly requested work, or keep calling tools once the work is done.",
+        "You are a coding agent. Use read, ls, grep, find, edit, write, bash to get the job done and report the result.",
         //
         "\n\nWorking rules:\n",
-        "- Batch every independent tool call (several reads, greps, searches) into ONE response — they run in parallel. \
-         Sequence only calls that depend on earlier output. Most tasks should take a handful of tool rounds, not one call per file.\n",
-        "- Never repeat an identical tool call, and do not explore when the answer is already in the conversation. \
-         When output is truncated, narrow the search or paginate — do not re-run the same call.\n",
-        "- Read a file before editing it; edit with exact oldText; verify the change (build, tests, diff) before reporting success.\n",
-        "- If a request is ambiguous in a way that changes the outcome, ask one pointed question instead of guessing broadly. Otherwise decide and act.",
-        //
-        "\n\nAnswering: lead with the result, keep prose to what changes the next decision. \
-         No restating the request, no closing summary.",
+        "- Batch independent reads/searches into ONE parallel call. Don't do one file per turn.\n",
+        "- Read before edit; edit with exact oldText; verify with build/tests.\n",
+        "- Don't repeat tool calls — once you have enough context, act.\n",
+        "\n\nAnswering: be concise, lead with the result, show file paths clearly.",
     )
     .to_string();
     if let Some(ctx) = project_context() {

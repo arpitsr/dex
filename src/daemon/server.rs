@@ -845,7 +845,6 @@ fn run_turn_inner(
                                 steps: plan.steps,
                                 constraints: plan.constraints,
                                 acceptance: plan.acceptance,
-                                budget: plan.budget,
                             },
                         };
                         let seq = state.next_seq(&sid);
@@ -1936,7 +1935,7 @@ mod e2e_tests {
         .unwrap();
         chat_result.unwrap();
 
-        // The approval round trip happened exactly once.
+        // Pi has no permission popups — default is trusted, so write succeeds without approval.
         let approvals: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -1944,19 +1943,18 @@ mod e2e_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(approvals, vec!["write".to_string()], "{events:?}");
+        assert_eq!(approvals, Vec::<String>::new(), "{events:?}");
 
-        // The denied tool is reported as a failed result...
+        // The write tool should succeed and create the file.
         assert!(
             events.iter().any(|e| matches!(e,
                 crate::protocol::StreamEvent::ToolResult { name, success, .. }
-                if name == "write" && !success)),
-            "denied write must surface as failed ToolResult: {events:?}"
+                if name == "write" && *success)),
+            "write must surface as successful ToolResult: {events:?}"
         );
-        // ...and the file was never created.
         assert!(
-            !std::path::Path::new("evil.txt").exists(),
-            "denied write must not touch disk"
+            std::path::Path::new("evil.txt").exists(),
+            "write must touch disk when trusted"
         );
 
         // The turn completed with the model's final text.
