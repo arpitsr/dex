@@ -23,6 +23,7 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
             print!("{text}");
             io::stdout().flush().ok();
         }
+        StreamEvent::Thinking(_) => {}
         StreamEvent::ToolCall { name, .. } => {
             eprintln!("\n  > {name}...");
         }
@@ -59,6 +60,12 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
         StreamEvent::TurnComplete { .. } => {}
         StreamEvent::Usage { .. } => {}
         StreamEvent::Plan { .. } => {}
+        StreamEvent::SteeringAccepted { content } => {
+            eprintln!("[steer] {content}");
+        }
+        StreamEvent::FollowupAccepted { content } => {
+            eprintln!("[follow-up] {content}");
+        }
     }
     None
 }

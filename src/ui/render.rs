@@ -199,8 +199,12 @@ pub(super) fn ui_status(app: &App) -> String {
             .checked_div(app.config.context_window)
             .unwrap_or(0)
     };
+    let conn = app
+        .connection
+        .clone()
+        .unwrap_or_else(|| "connected to local".to_string());
     let mut base = format!(
-        "{} · {} / {}{} · {} / {} tokens ({}%)",
+        "{conn} · {} · {} / {}{} · {} / {} tokens ({}%)",
         cwd,
         app.config.provider.name(),
         app.config.model,
@@ -213,7 +217,16 @@ pub(super) fn ui_status(app: &App) -> String {
     // at a fraction of full input price); omitted until a provider reports it.
     if let Some(cached) = app.tool_state.last_cached {
         if cached > 0 {
-            base.push_str(&format!(" · {} cached", format_tokens(cached)));
+            if tokens > 0 {
+                let hit_pct = cached
+                    .saturating_mul(100)
+                    .checked_div(tokens)
+                    .unwrap_or(0)
+                    .min(100);
+                base.push_str(&format!(" · {} cached ({}%)", format_tokens(cached), hit_pct));
+            } else {
+                base.push_str(&format!(" · {} cached", format_tokens(cached)));
+            }
         }
     }
     // Cumulative prompt tokens across all LLM calls this TUI process has
@@ -356,6 +369,23 @@ pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
     renderer.render(&blocks, &ThemeConfig::default())
 }
 
+/// Render a streamed thinking block: collapsed = a single dim italic
+/// "Thinking…" indicator; expanded (Ctrl+T) = the full text, dim italic.
+fn thinking_display_lines(text: &str, expanded: bool, width: u16) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(theme::muted_fg())
+        .add_modifier(Modifier::ITALIC);
+    let line =
+        |s: &str| super::indent_transcript_line(Line::from(Span::styled(s.to_string(), style)));
+    if expanded {
+        return text
+            .lines()
+            .flat_map(|l| wrap_line_display(&line(l), width))
+            .collect();
+    }
+    vec![line(&truncate_display("Thinking…", width))]
+}
+
 struct TranscriptView;
 
 impl TranscriptView {
@@ -376,6 +406,10 @@ impl TranscriptView {
             for (idx, block) in app.transcript.iter().enumerate() {
                 if idx > 0 {
                     display.push(Line::default());
+                }
+                if let super::TranscriptBlock::Thinking(text) = block {
+                    display.extend(thinking_display_lines(text, app.show_thinking, area.width));
+                    continue;
                 }
                 for line in block.lines() {
                     display.extend(wrap_line_display(line, area.width));
@@ -1077,6 +1111,7 @@ mod tests {
                 base_url: "http://localhost".to_string(),
                 model: "test-model".to_string(),
                 available_models: vec!["test-model".to_string()],
+                endpoints: Default::default(),
                 api: ApiProtocol::Responses,
                 account_id: None,
                 thinking_effort: None,
@@ -1111,11 +1146,14 @@ mod tests {
             scroll: 0,
             tick: 0,
             quit: false,
+            last_ctrl_c: None,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
             slash_selected: 0,
+            connection: None,
             assistant_open: false,
+            show_thinking: false,
             plan: crate::core::types::Plan::default(),
             transcript_version: 0,
             display_cache: Vec::new(),
@@ -1167,6 +1205,29 @@ mod tests {
             layout.footer.y
         );
         assert_eq!(layout.footer.height, status_height());
+    }
+
+    #[test]
+    fn thinking_display_collapsed_previews_expanded_shows_all() {
+        let text = "first line\n\nsecond line";
+        let collapsed = thinking_display_lines(text, false, 80);
+        assert_eq!(collapsed.len(), 1);
+        let joined: String = collapsed[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(joined.contains("Thinking…"), "{joined}");
+        // Collapsed is a bare indicator: no thought content leaks through.
+        assert!(!joined.contains("second line"), "{joined}");
+
+        let expanded = thinking_display_lines(text, true, 80);
+        assert!(expanded.len() >= 3, "{}", expanded.len());
+        let all: String = expanded
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+        assert!(all.contains("first line") && all.contains("second line"));
     }
 
     #[test]

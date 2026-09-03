@@ -21,7 +21,8 @@ use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
-    LoadSkillRequest, ReattachResponse, SkillInfo, StreamEnvelope, StreamEvent,
+    FollowupRequest, LoadSkillRequest, ReattachResponse, SkillInfo, SteerRequest, StreamEnvelope,
+    StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills, skill_dirs};
@@ -37,6 +38,8 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/chat", post(chat))
         .route("/api/sessions/{id}/approve", post(approve))
         .route("/api/sessions/{id}/cancel", post(cancel))
+        .route("/api/sessions/{id}/steer", post(steer))
+        .route("/api/sessions/{id}/followup", post(followup))
         .route("/api/sessions/{id}/skill", post(load_skill))
         // P10: versioned reattach/replay, P9: trace, P8: undo.
         .route("/api/sessions/{id}/events", get(session_events))
@@ -352,6 +355,13 @@ async fn chat(
             return Err(StatusCode::NOT_FOUND);
         }
     }
+    // Pre-create per-turn channels so `POST /steer` / `POST /followup`
+    // have a target as soon as the turn is registered (avoids a race where
+    // the client sends steering in the gap between `active_turns` insert and
+    // the `spawn_blocking` thread creating its channels).
+    let mut steering_rx_opt: Option<std_mpsc::Receiver<String>> = None;
+    let mut followup_rx_opt: Option<std_mpsc::Receiver<String>> = None;
+    let mut cancel_for_turn: Option<CancellationToken> = None;
     if replay_envelope.is_none() {
         {
             let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
@@ -371,6 +381,24 @@ async fn chat(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(session_id.clone(), cancel.clone());
+        cancel_for_turn = Some(cancel);
+        // Steering / follow-up queues for this turn (mirrors old local
+        // `event.rs` channels). Insert now so the HTTP handlers can push
+        // immediately.
+        let (steering_tx, steering_rx) = std_mpsc::channel::<String>();
+        let (followup_tx, followup_rx) = std_mpsc::channel::<String>();
+        state
+            .steering_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.clone(), steering_tx);
+        state
+            .followup_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.clone(), followup_tx);
+        steering_rx_opt = Some(steering_rx);
+        followup_rx_opt = Some(followup_rx);
     }
 
     let (tx, mut rx) = mpsc::channel::<StreamEnvelope>(256);
@@ -388,9 +416,19 @@ async fn chat(
         let state_for_turn = state.clone();
         let sid = session_id.clone();
         let idem_key = idempotency_key;
-        let cancel = CancellationToken::new();
+        let cancel = cancel_for_turn.unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            run_agent_turn(state_for_turn, sid, req, cancel, tx, idem_key, request_hash);
+            run_agent_turn(
+                state_for_turn,
+                sid,
+                req,
+                cancel,
+                tx,
+                idem_key,
+                request_hash,
+                steering_rx_opt,
+                followup_rx_opt,
+            );
         });
     }
 
@@ -412,6 +450,7 @@ async fn chat(
 
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Fully
 /// blocking; called from `spawn_blocking` only.
+#[allow(clippy::too_many_arguments)]
 fn run_agent_turn(
     state: Arc<DaemonState>,
     session_id: String,
@@ -420,9 +459,11 @@ fn run_agent_turn(
     tx: mpsc::Sender<StreamEnvelope>,
     idempotency_key: Option<String>,
     request_hash: u64,
+    steering_rx: Option<std_mpsc::Receiver<String>>,
+    followup_rx: Option<std_mpsc::Receiver<String>>,
 ) {
-    // Use a guard so active_turns/cancel_tokens/pending approvals are cleaned
-    // even when run_turn_inner panics inside spawn_blocking.
+    // Use a guard so active_turns/cancel_tokens/pending approvals/steering
+    // are cleaned even when run_turn_inner panics inside spawn_blocking.
     struct TurnGuard {
         state: Arc<DaemonState>,
         session_id: String,
@@ -454,14 +495,114 @@ fn run_agent_turn(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&self.session_id);
+            self.state
+                .steering_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
+            self.state
+                .followup_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
         }
     }
     let _guard = TurnGuard {
         state: state.clone(),
         session_id: session_id.clone(),
     };
+    // Steering / follow-up channels for this turn (mirrors the old in-memory
+    // `event.rs` submit path). `POST /steer` and `POST /followup` push into
+    // these; the agent loop consumes them between iterations / chained turns.
+    // When `chat` pre-creates the queues to avoid a race, reuse them; else
+    // (direct `run_agent_turn` calls, e.g. tests) create them here.
+    let (steering_rx, followup_rx) = match (steering_rx, followup_rx) {
+        (Some(sr), Some(fr)) => (sr, fr),
+        _ => {
+            let (steering_tx, sr) = std_mpsc::channel::<String>();
+            let (followup_tx, fr) = std_mpsc::channel::<String>();
+            state
+                .steering_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.clone(), steering_tx);
+            state
+                .followup_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.clone(), followup_tx);
+            (sr, fr)
+        }
+    };
+    let (steering_accepted_tx, steering_accepted_rx) = std_mpsc::channel::<String>();
+    let (followup_accepted_tx, followup_accepted_rx) = std_mpsc::channel::<String>();
+    // Forward accepted steers/follow-ups onto the SSE stream so the remote
+    // TUI can clear its `pending_*` badge and render the prompt. Journaled
+    // so a reattach replay reconstructs the transcript.
+    {
+        let tx_clone = tx.clone();
+        let state_clone = state.clone();
+        let sid = session_id.clone();
+        let entry_path = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sid)
+            .map(|e| e.path.clone());
+        std::thread::spawn(move || {
+            let mut journal = entry_path
+                .as_deref()
+                .and_then(|p| Session::from_path(p).ok());
+            while let Ok(content) = steering_accepted_rx.recv() {
+                let event = StreamEvent::SteeringAccepted {
+                    content: content.clone(),
+                };
+                let seq = state_clone.next_seq(&sid);
+                if let Some(j) = journal.as_mut() {
+                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                }
+                let _ = tx_clone.blocking_send(StreamEnvelope { seq, event });
+            }
+        });
+    }
+    {
+        let tx_clone = tx.clone();
+        let state_clone = state.clone();
+        let sid = session_id.clone();
+        let entry_path = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sid)
+            .map(|e| e.path.clone());
+        std::thread::spawn(move || {
+            let mut journal = entry_path
+                .as_deref()
+                .and_then(|p| Session::from_path(p).ok());
+            while let Ok(content) = followup_accepted_rx.recv() {
+                let event = StreamEvent::FollowupAccepted {
+                    content: content.clone(),
+                };
+                let seq = state_clone.next_seq(&sid);
+                if let Some(j) = journal.as_mut() {
+                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                }
+                let _ = tx_clone.blocking_send(StreamEnvelope { seq, event });
+            }
+        });
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_turn_inner(&state, &session_id, &req, &cancel, &tx)
+        run_turn_inner(
+            &state,
+            &session_id,
+            &req,
+            &cancel,
+            &tx,
+            Some(&steering_rx),
+            Some(&steering_accepted_tx),
+            Some(&followup_rx),
+            Some(&followup_accepted_tx),
+        )
     }));
     // Drop the guard now before sending the terminal event so a new turn can
     // be accepted promptly; drop ordering handles pending approvals/active turns.
@@ -511,12 +652,17 @@ fn run_agent_turn(
     let _ = tx.blocking_send(env);
 }
 
+#[allow(clippy::too_many_arguments, unused_assignments)]
 fn run_turn_inner(
     state: &Arc<DaemonState>,
     session_id: &str,
     req: &ChatRequest,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<StreamEnvelope>,
+    steering_rx: Option<&std_mpsc::Receiver<String>>,
+    steering_accepted_tx: Option<&std_mpsc::Sender<String>>,
+    followup_rx: Option<&std_mpsc::Receiver<String>>,
+    followup_accepted_tx: Option<&std_mpsc::Sender<String>>,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
         let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -635,55 +781,70 @@ fn run_turn_inner(
         let state = state.clone();
         let session_path = session.path().map(|p| p.to_path_buf());
         let sid = session_id.to_string();
+        let cancel = cancel.clone();
         std::thread::spawn(move || {
             // Reopen so journal writes never fight the agent loop's handle;
             // events land in the separate `<id>.events.jsonl` file.
             let mut journal = session_path
                 .as_deref()
                 .and_then(|p| Session::from_path(p).ok());
-            while let Ok(sl) = sink_rx.recv() {
-                let event = match sl {
-                    SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
-                    SinkLine::ToolInput(preview) => {
-                        let mut parts = preview.splitn(2, ' ');
-                        let name = parts.next().unwrap_or_default().to_string();
-                        let args = parts.next().unwrap_or_default().to_string();
-                        StreamEvent::ToolCall {
-                            name,
-                            args: serde_json::Value::String(args),
+            loop {
+                match sink_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(sl) => {
+                        let event = match sl {
+                            SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
+                            SinkLine::Thinking(text) => StreamEvent::Thinking(text),
+                            SinkLine::ToolInput(preview) => {
+                                let mut parts = preview.splitn(2, ' ');
+                                let name = parts.next().unwrap_or_default().to_string();
+                                let args = parts.next().unwrap_or_default().to_string();
+                                StreamEvent::ToolCall {
+                                    name,
+                                    args: serde_json::Value::String(args),
+                                }
+                            }
+                            SinkLine::ToolOutput {
+                                name,
+                                summary,
+                                success,
+                                preview,
+                                duration,
+                            } => StreamEvent::ToolResult {
+                                name,
+                                summary,
+                                success,
+                                preview,
+                                duration,
+                            },
+                            SinkLine::System(text) => StreamEvent::System(text),
+                            SinkLine::Error(text) => StreamEvent::Error(text),
+                            SinkLine::Usage { tokens, cached } => {
+                                StreamEvent::Usage { tokens, cached }
+                            }
+                            SinkLine::Plan(plan) => StreamEvent::Plan {
+                                goal: plan.goal,
+                                steps: plan.steps,
+                                constraints: plan.constraints,
+                                acceptance: plan.acceptance,
+                                budget: plan.budget,
+                            },
+                        };
+                        let seq = state.next_seq(&sid);
+                        if let Some(s) = journal.as_mut() {
+                            let _ = s.append_event(
+                                seq,
+                                &serde_json::to_string(&event).unwrap_or_default(),
+                            );
+                        }
+                        let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if cancel.is_cancelled() {
+                            break;
                         }
                     }
-                    SinkLine::ToolOutput {
-                        name,
-                        summary,
-                        success,
-                        preview,
-                        duration,
-                    } => StreamEvent::ToolResult {
-                        name,
-                        summary,
-                        success,
-                        preview,
-                        duration,
-                    },
-                    SinkLine::System(text) => StreamEvent::System(text),
-                    SinkLine::Error(text) => StreamEvent::Error(text),
-                    SinkLine::Usage { tokens, cached } => {
-                        StreamEvent::Usage { tokens, cached }
-                    }
-                    SinkLine::Plan(plan) => StreamEvent::Plan {
-                        goal: plan.goal,
-                        steps: plan.steps,
-                        constraints: plan.constraints,
-                        acceptance: plan.acceptance,
-                        budget: plan.budget,
-                    },
-                };
-                let seq = state.next_seq(&sid);
-                if let Some(s) = journal.as_mut() {
-                    let _ = s.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
             }
         });
     }
@@ -736,19 +897,73 @@ fn run_turn_inner(
     }
 
     let mut tool_state = ToolState::load();
-    let turn_result = process_turn(
-        &config,
-        &mut messages,
-        &mut tool_state,
-        None,
-        None,
-        Some(&mut session),
-        &config,
-        cancel,
-        &console,
-    );
-    let usage = tool_state.last_usage;
-    let cached = tool_state.last_cached;
+    #[allow(unused_assignments)]
+    // Outer loop for follow-up chaining (mirrors old local `event.rs` loop):
+    // `process_turn` consumes steering mid-turn; follow-ups are drained after
+    // each successful turn and chained without a new HTTP request.
+    let mut final_response = String::new();
+    let mut final_usage = None;
+    let mut final_cached = None;
+    let turn_result: Result<String, Box<dyn std::error::Error>>;
+    loop {
+        let result = process_turn(
+            &config,
+            &mut messages,
+            &mut tool_state,
+            steering_rx,
+            steering_accepted_tx,
+            Some(&mut session),
+            &config,
+            cancel,
+            &console,
+        );
+        match result {
+            Ok(resp) => {
+                final_response = resp;
+                final_usage = tool_state.last_usage;
+                final_cached = tool_state.last_cached;
+                // Drain follow-ups queued while this turn ran.
+                let followups: Vec<String> = followup_rx
+                    .as_ref()
+                    .map(|rx| rx.try_iter().collect())
+                    .unwrap_or_default();
+                if followups.is_empty() {
+                    turn_result = Ok(final_response.clone());
+                    break;
+                }
+                for content in followups {
+                    if let Some(tx) = followup_accepted_tx {
+                        let _ = tx.send(content.clone());
+                    }
+                    let msg = ChatMessage {
+                        role: "user".into(),
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: Some("follow-up".into()),
+                    };
+                    session
+                        .append_message(msg.clone())
+                        .map_err(|e| format!("failed to persist followup: {e}"))?;
+                    messages.push(msg);
+                }
+                if cancel.is_cancelled() {
+                    turn_result = Err("cancelled by user".into());
+                    break;
+                }
+                // chained follow-up: loop and run another turn with the same
+                // session/messages/tool_state but without new turn_start marker
+                // (the followup is already persisted).
+                continue;
+            }
+            Err(e) => {
+                turn_result = Err(e);
+                break;
+            }
+        }
+    }
+    let usage = final_usage;
+    let cached = final_cached;
     // Durable terminal marker (P8): a completed turn is recorded before the
     // event is relayed; a failed one gets `turn_failed` in run_agent_turn.
     match &turn_result {
@@ -879,6 +1094,55 @@ async fn cancel(
     }
 
     Json(json!({ "status": "ok" }))
+}
+
+async fn steer(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SteerRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Session must exist; steering only valid while a turn is active.
+    {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if !sessions.contains_key(&session_id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    let tx = {
+        let map = state.steering_txs.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&session_id).cloned()
+    }
+    .ok_or(StatusCode::CONFLICT)?;
+    tx.send(content).map_err(|_| StatusCode::CONFLICT)?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn followup(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<FollowupRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if !sessions.contains_key(&session_id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    let tx = {
+        let map = state.followup_txs.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&session_id).cloned()
+    }
+    .ok_or(StatusCode::CONFLICT)?;
+    tx.send(content).map_err(|_| StatusCode::CONFLICT)?;
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 /// Resolve a session file path from the registry, or 404.
@@ -1069,4 +1333,495 @@ async fn session_name(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "status": "ok" })))
+}
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use axum::extract::{Path, Query};
+
+    fn state_with_session(path: &std::path::Path) -> (Arc<DaemonState>, String) {
+        let state = Arc::new(DaemonState::new());
+        let session = Session::from_path(path).unwrap();
+        let id = session.id().to_string();
+        state.sessions.lock().unwrap().insert(
+            id.clone(),
+            SessionEntry {
+                path: path.to_path_buf(),
+                name: None,
+                cwd: "/tmp/dex-test-cwd".into(),
+            },
+        );
+        (state, id)
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_unknown_session_and_bad_protocol_version() {
+        let state = Arc::new(DaemonState::new());
+        let req = ChatRequest {
+            prompt: "hi".into(),
+            skill_dirs: vec![],
+            base_url: None,
+            model: None,
+            permission: None,
+            plan: None,
+        };
+        // unknown session -> 404
+        let r = chat(
+            State(state.clone()),
+            Path("nope".into()),
+            axum::http::HeaderMap::new(),
+            Json(req.clone()),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+
+        // newer protocol version -> 400 (checked before session lookup)
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-dex-protocol", "2".parse().unwrap());
+        let r = chat(State(state), Path("nope".into()), headers, Json(req)).await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn steer_and_followup_validate_content_and_turn_state() {
+        let state = Arc::new(DaemonState::new());
+        // empty content -> 400
+        let r = steer(State(state.clone()), Path("s".into()), Json(SteerRequest { content: "  ".into() })).await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        let r = followup(State(state.clone()), Path("s".into()), Json(FollowupRequest { content: "".into() })).await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        // unknown session -> 404
+        let r = steer(State(state.clone()), Path("s".into()), Json(SteerRequest { content: "x".into() })).await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+        // registered session without active turn -> 409 (nothing to steer)
+        state.sessions.lock().unwrap().insert(
+            "s".into(),
+            SessionEntry { path: "/tmp/does-not-exist.jsonl".into(), name: None, cwd: "/tmp".into() },
+        );
+        let r = steer(State(state.clone()), Path("s".into()), Json(SteerRequest { content: "x".into() })).await;
+        assert!(matches!(r, Err(StatusCode::CONFLICT)));
+        let r = followup(State(state), Path("s".into()), Json(FollowupRequest { content: "x".into() })).await;
+        assert!(matches!(r, Err(StatusCode::CONFLICT)));
+    }
+
+    #[tokio::test]
+    async fn load_skill_rejects_bad_names() {
+        let state = Arc::new(DaemonState::new());
+        for bad in ["", "../evil", "has space", "slash/ed"] {
+            let r = load_skill(
+                State(state.clone()),
+                Path("s".into()),
+                Json(LoadSkillRequest { name: bad.into(), skill_dirs: vec![] }),
+            )
+            .await;
+            assert!(matches!(r, Err(StatusCode::BAD_REQUEST)), "expected 400 for {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
+    async fn approve_unknown_request_is_404_and_cross_session_is_restored() {
+        let state = Arc::new(DaemonState::new());
+        // no such request_id -> 404
+        let r = approve(
+            State(state.clone()),
+            Path("sess-a".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "missing".into(),
+                decision: crate::protocol::ApprovalDecision::AllowOnce,
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+
+        // pending parked under sess-a; decision sent against sess-b -> 404 and restored
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.pending_approvals.lock().unwrap().insert(
+            "req-1".into(),
+            PendingApproval {
+                session_id: "sess-a".into(),
+                response: tx,
+                name: "bash".into(),
+                input: "{}".into(),
+            },
+        );
+        let r = approve(
+            State(state.clone()),
+            Path("sess-b".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "req-1".into(),
+                decision: crate::protocol::ApprovalDecision::AllowOnce,
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+        assert!(state.pending_approvals.lock().unwrap().contains_key("req-1"), "pending must be restored for the legitimate session");
+        assert!(rx.try_recv().is_err(), "restored approval must not be resolved");
+
+        // correct session resolves it
+        let r = approve(
+            State(state.clone()),
+            Path("sess-a".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "req-1".into(),
+                decision: crate::protocol::ApprovalDecision::Deny,
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(rx.try_recv().ok(), Some(crate::core::types::ApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn cancel_denies_pending_approvals_for_the_session() {
+        let state = Arc::new(DaemonState::new());
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        {
+            let mut pending = state.pending_approvals.lock().unwrap();
+            pending.insert(
+                "r-a".into(),
+                PendingApproval { session_id: "s-a".into(), response: tx_a, name: "write".into(), input: "{}".into() },
+            );
+            pending.insert(
+                "r-b".into(),
+                PendingApproval { session_id: "s-b".into(), response: tx_b, name: "write".into(), input: "{}".into() },
+            );
+        }
+
+        let _ = cancel(State(state), Path("s-a".into())).await;
+
+        assert_eq!(rx_a.try_recv().ok(), Some(crate::core::types::ApprovalDecision::Deny));
+        assert!(rx_b.try_recv().is_err(), "other sessions must be untouched");
+    }
+
+    #[tokio::test]
+    async fn session_events_replay_after_cursor() {
+        // Hand-crafted session files: fully hermetic, no env redirects.
+        let dir = std::env::temp_dir().join(format!("dex-srv-events-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "test-events-1";
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            r#"{"type":"session","version":1,"id":"test-events-1","timestamp":"t","cwd":"/tmp/x"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.events.jsonl")),
+            r#"{"seq":0,"payload":{"type":"system","data":"one"}}
+{"seq":1,"payload":{"type":"system","data":"two"}}
+"#,
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("since".to_string(), "0".to_string());
+        // `since` is exclusive: seq 0 is skipped, seq 1 replays.
+        let r = session_events(State(state.clone()), Path(id.clone()), Query(params)).await.unwrap();
+        assert_eq!(r.events.len(), 1);
+        assert_eq!(r.events[0].seq, 1);
+        assert_eq!(r.next_seq, 2);
+        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "two"));
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("since".to_string(), "1".to_string());
+        let r = session_events(State(state), Path(id), Query(params)).await.unwrap();
+        assert!(r.events.is_empty(), "fully consumed cursor replays nothing");
+        assert_eq!(r.next_seq, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
+    async fn create_session_registers_and_lists_from_disk() {
+        // Redirects where ALL sessions live; serialize against other tests
+        // that read/write the sessions dir.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let data_dir = std::env::temp_dir().join(format!("dex-srv-create-{}", std::process::id()));
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+
+        let state = Arc::new(DaemonState::new());
+        let r = create_session(
+            State(state.clone()),
+            Json(CreateSessionRequest { cwd: "/tmp/dex-create-cwd".into(), name: Some("t".into()) }),
+        )
+        .await
+        .unwrap();
+        let id = r.0["session_id"].as_str().unwrap().to_string();
+        assert!(!id.is_empty());
+        assert!(state.sessions.lock().unwrap().contains_key(&id), "session must be registered");
+
+        let listed = list_sessions(State(state)).await.0["sessions"].as_array().unwrap().clone();
+        assert!(listed.iter().any(|s| s["session_id"].as_str() == Some(id.as_str())));
+
+        // cleanup: the created session file lives under data_dir
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[cfg(test)]
+mod permission_gate_tests {
+    use super::*;
+
+    /// The daemon permission ceiling is the security boundary between a
+    /// remote client and trusted-mode tool execution: a client may only
+    /// request a STRICTER mode than the daemon's own. Runs before any LLM
+    /// call, so it is testable with no provider.
+    #[test]
+    fn permission_ceiling_blocks_client_escalation_and_bad_plan() {
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Hermetic session storage.
+        let data_dir = std::env::temp_dir().join(format!("dex-perm-{}", std::process::id()));
+        let prev_data = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+
+        let session = Session::new("/tmp/dex-perm-cwd".into(), None).unwrap();
+        let path = session.path().unwrap().to_path_buf();
+        let id = session.id().to_string();
+        drop(session);
+
+        let state = Arc::new(DaemonState::new());
+        state.sessions.lock().unwrap().insert(
+            id.clone(),
+            SessionEntry { path: path.clone(), name: None, cwd: "/tmp".into() },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let cancel = CancellationToken::new();
+
+        // Deterministic provider config for the pass-through case: fake key,
+        // unroutable local base URL (connection refused, no network).
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["DEX_PERMISSION", "DEX_PROVIDER", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API"]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        std::env::set_var("DEX_PERMISSION", "read-only");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:9");
+        std::env::set_var("OPENAI_API", "chat");
+
+        let mk_req = |permission: Option<&str>, plan: Option<&str>| ChatRequest {
+            prompt: "go".into(),
+            skill_dirs: vec![],
+            base_url: None,
+            model: None,
+            permission: permission.map(String::from),
+            plan: plan.map(String::from),
+        };
+
+        // 1. Client escalating to trusted against a read-only daemon: rejected.
+        let err = run_turn_inner(
+            &state, &id, &mk_req(Some("trusted"), None), &cancel, &tx, None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(err.contains("escalation denied"), "got: {err}");
+        // Nothing journaled: the turn never started.
+        assert_ne!(
+            crate::session::Session::last_turn_state(&path),
+            "turn_start",
+            "rejected turn must not journal turn_start"
+        );
+
+        // 2. Client requesting the same (stricter-or-equal) mode passes the
+        // gate and fails later, at the LLM call — a different error.
+        let err = run_turn_inner(
+            &state, &id, &mk_req(Some("read-only"), None), &cancel, &tx, None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(!err.contains("escalation denied"), "gate must not fire for non-escalation: {err}");
+
+        // 3. Invalid plan JSON from the client is rejected, not stored.
+        let err = run_turn_inner(
+            &state, &id, &mk_req(Some("read-only"), Some("{not json")), &cancel, &tx, None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid plan JSON"), "got: {err}");
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        match prev_data {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("trace.jsonl"));
+    }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use crate::client::http::{ChatOptions, DaemonClient};
+    use axum::body::Body;
+    use axum::extract::State as AxumState;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn spawn_app(app: Router) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Full remote loop over real HTTP: real daemon router + real
+    /// DaemonClient + a fake chat-completions provider. The model asks to
+    /// `write` a file, the client denies the approval, the denied tool
+    /// result flows back, and the model finishes with plain text. Covers
+    /// client SSE parsing, the approval round trip, and the daemon turn
+    /// machinery in one pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
+    async fn client_denies_write_then_turn_completes() {
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Fake provider: request 0 asks for a write; later requests finish.
+        const TOOL_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"write","arguments":"{\"path\":\"evil.txt\",\"content\":\"hi\"}"}}]}}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        const DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\ndata: [DONE]\n\n";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let fake_llm = Router::new().route(
+            "/chat/completions",
+            post(move |AxumState(_): AxumState<Arc<AtomicUsize>>| {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let body = if n == 0 { TOOL_SSE } else { DONE_SSE };
+                    axum::http::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(body.to_string()))
+                        .unwrap()
+                }
+            }),
+        );
+        // Axum requires typed state; attach the counter (already Arc'd).
+        let fake_llm = fake_llm.with_state(calls.clone());
+        let llm_base = spawn_app(fake_llm).await;
+
+        let daemon_base = spawn_app(router(Arc::new(DaemonState::new()))).await;
+
+        // Deterministic daemon environment: no user config, approvals on,
+        // LLM pointed at the fake provider.
+        let data_dir = std::env::temp_dir().join(format!("dex-e2e-{}", std::process::id()));
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_DATA_HOME", "DEX_CONFIG", "DEX_PERMISSION", "DEX_PROVIDER",
+            "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API", "DEX_VERIFY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::env::set_var("DEX_CONFIG", "/tmp/dex-no-such-config-e2e.json");
+        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENAI_BASE_URL", &llm_base);
+        std::env::set_var("OPENAI_API", "chat");
+        std::env::set_var("DEX_VERIFY", "true");
+
+        // All client work happens on one blocking thread: reqwest::blocking
+        // panics if created or dropped inside an async context.
+        let (_session_id, events, chat_result) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&daemon_base).unwrap();
+            client.wait_until_ready(Duration::from_secs(10)).unwrap();
+            let session_id = client
+                .create_session("/tmp/dex-e2e-cwd", Some("e2e"))
+                .unwrap()
+                .session_id;
+            let mut events: Vec<crate::protocol::StreamEvent> = Vec::new();
+            let r = client
+                .chat(
+                    &session_id,
+                    "write a file please",
+                    ChatOptions::default(),
+                    &mut |event| {
+                        let decision = match &event {
+                            crate::protocol::StreamEvent::ApprovalRequired { .. } => {
+                                Some(crate::protocol::ApprovalDecision::Deny)
+                            }
+                            _ => None,
+                        };
+                        events.push(event);
+                        decision
+                    },
+                )
+                .map_err(|e| e.to_string());
+            (session_id, events, r)
+            // client drops here, on the blocking pool
+        })
+        .await
+        .unwrap();
+        chat_result.unwrap();
+
+        // The approval round trip happened exactly once.
+        let approvals: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::protocol::StreamEvent::ApprovalRequired { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(approvals, vec!["write".to_string()], "{events:?}");
+
+        // The denied tool is reported as a failed result...
+        assert!(
+            events.iter().any(|e| matches!(e,
+                crate::protocol::StreamEvent::ToolResult { name, success, .. }
+                if name == "write" && !success)),
+            "denied write must surface as failed ToolResult: {events:?}"
+        );
+        // ...and the file was never created.
+        assert!(!std::path::Path::new("evil.txt").exists(), "denied write must not touch disk");
+
+        // The turn completed with the model's final text.
+        let last = events.last().unwrap();
+        match last {
+            crate::protocol::StreamEvent::TurnComplete { response, .. } => {
+                assert_eq!(response, "all done");
+            }
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+        // The model was called twice: tool call, then final answer.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file("evil.txt");
+    }
 }
