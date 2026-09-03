@@ -179,6 +179,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         scroll: 0,
         tick: 0,
         quit: false,
+        last_ctrl_c: None,
         history: Vec::new(),
         history_index: None,
         history_draft: String::new(),
@@ -427,17 +428,13 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);
             }
-            if let Some(cached) = cached {
-                remote.app.tool_state.last_cached = Some(cached);
-            }
+            remote.app.tool_state.last_cached = cached;
         }
         StreamEvent::Usage { tokens, cached } => {
             // Live context usage: emitted by the daemon after every LLM call
             // so the status bar updates mid-turn, not just at completion.
             remote.app.tool_state.last_usage = Some(tokens);
-            if cached.is_some() {
-                remote.app.tool_state.last_cached = cached;
-            }
+            remote.app.tool_state.last_cached = cached;
             // Cumulative spend across turns. TurnComplete.usage repeats the
             // final call's count, so only Usage events accumulate.
             remote.app.tool_state.total_usage =
@@ -804,6 +801,13 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         return;
     }
 
+    // Idle double Ctrl+C guard: any non-Ctrl+C key cancels the pending quit.
+    let is_ctrl_c =
+        matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL);
+    if !is_ctrl_c {
+        app.last_ctrl_c = None;
+    }
+
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.busy {
@@ -815,7 +819,18 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                     request_cancel(remote);
                 }
             } else {
-                app.quit = true;
+                // Double Ctrl+C to exit when idle (avoid accidental quit).
+                const DOUBLE_WINDOW: Duration = Duration::from_secs(2);
+                let now = Instant::now();
+                let should_quit = app
+                    .last_ctrl_c
+                    .is_some_and(|t| now.duration_since(t) <= DOUBLE_WINDOW);
+                if should_quit {
+                    app.quit = true;
+                } else {
+                    app.last_ctrl_c = Some(now);
+                    push_info(app, "Press Ctrl+C again to exit".to_string());
+                }
             }
         }
         KeyCode::Esc if app.busy => {

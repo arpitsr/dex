@@ -217,7 +217,16 @@ pub(super) fn ui_status(app: &App) -> String {
     // at a fraction of full input price); omitted until a provider reports it.
     if let Some(cached) = app.tool_state.last_cached {
         if cached > 0 {
-            base.push_str(&format!(" · {} cached", format_tokens(cached)));
+            if tokens > 0 {
+                let hit_pct = cached
+                    .saturating_mul(100)
+                    .checked_div(tokens)
+                    .unwrap_or(0)
+                    .min(100);
+                base.push_str(&format!(" · {} cached ({}%)", format_tokens(cached), hit_pct));
+            } else {
+                base.push_str(&format!(" · {} cached", format_tokens(cached)));
+            }
         }
     }
     // Cumulative prompt tokens across all LLM calls this TUI process has
@@ -1137,6 +1146,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             quit: false,
+            last_ctrl_c: None,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
