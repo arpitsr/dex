@@ -42,3 +42,10 @@ fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
 
 [dev-dependencies]
 http = "1"
+
+# Symbols for profilers (parca-agent / perf / heaptrack) without touching
+# release output: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

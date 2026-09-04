@@ -166,10 +166,18 @@ pub(crate) fn read_stream(
                 // Print complete lines live; keep any partial tail buffered.
                 pending.push_str(&text);
                 while let Some(pos) = pending.find('\n') {
-                    let complete: String = pending.drain(..=pos).collect();
+                    // Memmove the remainder to the front instead of
+                    // collecting a new String per completed line.
+                    let complete = &pending[..=pos];
                     printer.feed_line(complete.trim_end_matches('\n'));
+                    pending.replace_range(..=pos, "");
                 }
-                io::stdout().flush()?;
+                // One flush per delta is a syscall per token; sink consumers
+                // get their liveness from the channel (console printing needs
+                // the flush).
+                if sink.is_none() {
+                    io::stdout().flush()?;
+                }
             }
             for delta in choice.delta.tool_calls.unwrap_or_default() {
                 merge_chat_tool_call(&mut tool_calls, delta);
@@ -263,10 +271,17 @@ pub(crate) fn read_responses_stream(
                     content.push_str(delta);
                     pending.push_str(delta);
                     while let Some(pos) = pending.find('\n') {
-                        let complete: String = pending.drain(..=pos).collect();
+                        // Memmove the remainder to the front instead of
+                        // collecting a new String per completed line.
+                        let complete = &pending[..=pos];
                         printer.feed_line(complete.trim_end_matches('\n'));
+                        pending.replace_range(..=pos, "");
                     }
-                    io::stdout().flush()?;
+                    // One flush per delta is a syscall per token; sink
+                    // consumers don't need it (console printing does).
+                    if sink.is_none() {
+                        io::stdout().flush()?;
+                    }
                 }
             }
             "response.output_item.added" => {

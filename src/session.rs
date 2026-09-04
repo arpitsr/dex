@@ -2,8 +2,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -126,11 +126,17 @@ struct SessionStateEntry {
     value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Session {
     header: SessionHeader,
     path: Option<PathBuf>,
     counter: u64,
+    /// Reused append handle for the main JSONL, opened lazily on first write;
+    /// one write syscall per line, same as the old open-append-write-close —
+    /// the cache only removes the per-append open/close.
+    journal: Option<File>,
+    /// Same for the events journal: the hot path, one line per stream delta.
+    events_journal: Option<File>,
 }
 
 impl Session {
@@ -174,6 +180,8 @@ impl Session {
             header,
             path: Some(path),
             counter: 0,
+            journal: None,
+            events_journal: None,
         };
         let skills = crate::skills::discover_skills(&crate::skills::skill_dirs());
         session.record_skills(&skills);
@@ -193,12 +201,17 @@ impl Session {
     }
 
     pub(crate) fn from_path(path: &Path) -> io::Result<Self> {
-        let file = fs::read_to_string(path)?;
-        let mut lines = file.lines();
-        let first = lines
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty session file"))?;
-        let header: SessionHeader = serde_json::from_str(first).map_err(|e| {
+        // Stream instead of read_to_string: session files grow with the
+        // message history and only the header plus a line count are needed.
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut first = String::new();
+        if reader.read_line(&mut first)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty session file",
+            ));
+        }
+        let header: SessionHeader = serde_json::from_str(first.trim_end()).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("bad session header: {}", e),
@@ -216,11 +229,19 @@ impl Session {
                 format!("unsupported session version {}", header.version),
             ));
         }
-        let counter = lines.count() as u64;
+        // Count the lines after the header without materializing the file.
+        let mut counter = 0u64;
+        let mut buf = Vec::new();
+        while reader.read_until(b'\n', &mut buf)? > 0 {
+            counter += 1;
+            buf.clear();
+        }
         Ok(Self {
             header,
             path: Some(path.to_path_buf()),
             counter,
+            journal: None,
+            events_journal: None,
         })
     }
 
@@ -236,6 +257,8 @@ impl Session {
             },
             path: None,
             counter: 0,
+            journal: None,
+            events_journal: None,
         }
     }
 
@@ -262,11 +285,11 @@ impl Session {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        if let Some(first) = text.lines().next() {
-                            if let Ok(header) = serde_json::from_str::<SessionHeader>(first) {
-                                sessions.push((path, header));
-                            }
+                    // Only the header is needed; session files grow large.
+                    if let Some(first) = read_first_line(&path) {
+                        if let Ok(header) = serde_json::from_str::<SessionHeader>(first.trim_end())
+                        {
+                            sessions.push((path, header));
                         }
                     }
                 }
@@ -291,12 +314,12 @@ impl Session {
                     for file in files.flatten() {
                         let path = file.path();
                         if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                            if let Ok(text) = fs::read_to_string(&path) {
-                                if let Some(first) = text.lines().next() {
-                                    if let Ok(header) = serde_json::from_str::<SessionHeader>(first)
-                                    {
-                                        sessions.push((path, header));
-                                    }
+                            // Only the header is needed; session files grow large.
+                            if let Some(first) = read_first_line(&path) {
+                                if let Ok(header) =
+                                    serde_json::from_str::<SessionHeader>(first.trim_end())
+                                {
+                                    sessions.push((path, header));
                                 }
                             }
                         }
@@ -410,24 +433,31 @@ impl Session {
         self.append_line(&entry)
     }
 
+    /// Append handle used by both journals: create-on-demand, always append.
+    fn open_append(path: &Path) -> io::Result<File> {
+        fs::OpenOptions::new().create(true).append(true).open(path)
+    }
+
     fn append_line<T: Serialize>(&mut self, entry: &T) -> io::Result<()> {
-        if let Some(path) = &self.path {
-            let line = serde_json::to_string(entry).map_err(io::Error::other)?;
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
-            writeln!(file, "{}", line)?;
-            // Industry harnesses (pi, claude) don't fsync every line — they
-            // rely on OS buffer + periodic flush. Sync only when
-            // durability matters (turn boundaries / effect journal) or when
-            // DEX_DURABLE=1 is set for strict recovery testing.
-            let durable = std::env::var("DEX_DURABLE").as_deref() == Ok("1")
-                || line.contains("\"type\":\"turn_")
-                || line.contains("\"type\":\"effect_");
-            if durable {
-                file.sync_data()?;
-            }
+        // Path is only needed to open the handle — avoid allocating per line.
+        if self.journal.is_none() {
+            let Some(path) = self.path.as_deref() else {
+                return Ok(());
+            };
+            self.journal = Some(Self::open_append(path)?);
+        }
+        let line = serde_json::to_string(entry).map_err(io::Error::other)?;
+        let file = self.journal.as_mut().expect("journal handle set above");
+        writeln!(file, "{line}")?;
+        // Industry harnesses (pi, claude) don't fsync every line — they
+        // rely on OS buffer + periodic flush. Sync only when
+        // durability matters (turn boundaries / effect journal) or when
+        // DEX_DURABLE=1 is set for strict recovery testing.
+        let durable = std::env::var("DEX_DURABLE").as_deref() == Ok("1")
+            || line.contains("\"type\":\"turn_")
+            || line.contains("\"type\":\"effect_");
+        if durable {
+            file.sync_data()?;
         }
         Ok(())
     }
@@ -476,22 +506,37 @@ impl Session {
     /// assigned by the daemon (monotonic per session, seeded from disk on
     /// restart); the journal is what `/api/sessions/{id}/events?since=` replays.
     pub(crate) fn append_event(&mut self, seq: u64, payload: &str) -> io::Result<()> {
-        let Some(path) = self.events_path() else {
-            return Ok(());
-        };
-        let payload: Value = serde_json::from_str(payload).unwrap_or(Value::String(payload.into()));
-        let line = serde_json::json!({"seq": seq, "ts": Self::now_iso(), "payload": payload});
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(file, "{}", line)?;
+        // events_path() allocates (with_extension) — only compute it when the
+        // handle needs to be opened, not once per streamed delta.
+        if self.events_journal.is_none() {
+            let Some(path) = self.events_path() else {
+                return Ok(());
+            };
+            self.events_journal = Some(Self::open_append(&path)?);
+        }
+        let file = self
+            .events_journal
+            .as_mut()
+            .expect("events journal handle set above");
+        // The payload comes straight from serde_json::to_string, so it is
+        // already valid JSON: the envelope is composed in place instead of
+        // parse -> json! -> re-serialize per streamed delta. An empty payload
+        // (serialization failed upstream) becomes an empty JSON string so the
+        // line stays parseable for replay.
+        let payload = if payload.is_empty() { "\"\"" } else { payload };
+        let ts = Self::now_iso();
+        writeln!(
+            file,
+            "{{\"seq\":{seq},\"ts\":\"{ts}\",\"payload\":{payload}}}"
+        )?;
         // Event journal is replayable but not critical for crash recovery —
-        // sync only for terminal events or when DEX_DURABLE=1.
-        let is_terminal = payload.to_string().contains("TurnComplete")
-            || payload.to_string().contains("TurnFailed")
-            || std::env::var("DEX_DURABLE").as_deref() == Ok("1");
-        if is_terminal {
+        // sync only for terminal events or when DEX_DURABLE=1. (The old sniff
+        // grepped for the Rust variant names, which never appear in the
+        // serialized `type` field, so it never fired without DEX_DURABLE.)
+        let durable = std::env::var("DEX_DURABLE").as_deref() == Ok("1")
+            || payload.contains("\"type\":\"turn_complete\"")
+            || payload.contains("\"type\":\"turn_failed\"");
+        if durable {
             file.sync_data()?;
         }
         Ok(())
@@ -523,12 +568,25 @@ impl Session {
     /// Highest event seq recorded for a session (0 when none).
     pub(crate) fn max_event_seq(path: &Path) -> u64 {
         let events_path = path.with_extension("events.jsonl");
-        let Ok(text) = fs::read_to_string(&events_path) else {
+        // Stream line by line; the journal is the hot file (one line per
+        // stream delta) and replay only needs the max seq, not the text.
+        let Ok(file) = File::open(&events_path) else {
             return 0;
         };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
         let mut max = 0;
-        for line in text.lines() {
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // append_event writes {"seq":N,...}; skip parsing other shapes.
+            if !line.contains("\"seq\":") {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
                 if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
                     max = max.max(seq);
                 }
@@ -540,12 +598,25 @@ impl Session {
     /// Terminal state of the most recent turn: "complete", "failed", or
     /// "interrupted" when a `turn_start` has no terminal entry after it.
     pub(crate) fn last_turn_state(path: &Path) -> &'static str {
-        let Ok(text) = fs::read_to_string(path) else {
+        // Stream line by line; sessions hold thousands of non-marker entries.
+        let Ok(file) = File::open(path) else {
             return "unknown";
         };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
         let mut state = "none";
-        for line in text.lines() {
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // Turn entries serialize as {"type":"turn_*",...}; skip parsing
+            // everything else.
+            if !line.contains("\"type\":\"turn_") {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
                 continue;
             };
             match value.get("type").and_then(Value::as_str) {
@@ -580,18 +651,27 @@ fn skills_state_value(skills: &[crate::core::types::Skill]) -> String {
 }
 
 pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
-    let text = fs::read_to_string(path)?;
+    // Stream line by line: session files grow with history and only the
+    // post-`clear` tail is kept.
+    let mut reader = BufReader::new(File::open(path)?);
     let mut messages = Vec::new();
-    for (i, line) in text.lines().enumerate().skip(1) {
+    let mut line = String::new();
+    let mut line_no = 1; // header; matches the old skip(1) numbering
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        line_no += 1;
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = match serde_json::from_str(line) {
+        let value: Value = match serde_json::from_str(line.trim_end()) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(
                     "[session] skipping bad line {} in {}: {}",
-                    i + 1,
+                    line_no,
                     path.display(),
                     e
                 );
@@ -606,7 +686,7 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
                 Ok(_) => {}
                 Err(e) => eprintln!(
                     "[session] skipping unparseable message at line {} in {}: {}",
-                    i + 1,
+                    line_no,
                     path.display(),
                     e
                 ),
@@ -614,6 +694,51 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
         }
     }
     Ok(messages)
+}
+
+/// Cheap emptiness probe for `/resume` listings: does the file hold any
+/// message entries after the last `clear`? Streams line by line without
+/// parsing the whole history (`load_messages_from_session` semantics for the
+/// `!is_empty()` question); a trailing `clear` means no messages, so the
+/// full file is scanned.
+pub(crate) fn has_messages(path: &Path) -> bool {
+    let Ok(mut reader) = File::open(path).map(BufReader::new) else {
+        return false;
+    };
+    let mut line = String::new();
+    let mut found = false;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return found,
+            Ok(_) => {}
+        }
+        // Entries serialize as {"type":"message",...}; `clear` restarts the
+        // transcript, so a later clear resets the answer to false. System
+        // messages are dropped by load, so they don't count as content.
+        if line.contains("\"type\":\"message\"") {
+            if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
+                // role is top level: SessionMessageEntry flattens ChatMessage.
+                if v.get("role").and_then(Value::as_str) != Some("system") {
+                    found = true;
+                }
+            }
+        }
+        if line.contains("\"type\":\"clear\"") {
+            found = false;
+        }
+    }
+}
+
+/// Read only the first line of a file: session listings only ever need the
+/// header, and session files grow with the message history.
+fn read_first_line(path: &Path) -> Option<String> {
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let mut first = String::new();
+    match reader.read_line(&mut first) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(first),
+    }
 }
 
 pub(crate) fn load_plan(path: &Path) -> crate::core::types::Plan {
@@ -632,19 +757,28 @@ pub(crate) fn save_plan(session: &mut Session, plan: &crate::core::types::Plan) 
 pub(crate) fn load_session_state(
     path: &Path,
 ) -> io::Result<std::collections::HashMap<String, String>> {
-    let text = fs::read_to_string(path)?;
+    let mut reader = BufReader::new(File::open(path)?);
     let mut state = std::collections::HashMap::new();
-    for line in text.lines().skip(1) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    let mut line = String::new();
+    reader.read_line(&mut line)?; // header
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        // set_state writes {"type":"session_state",...}; quotes inside state
+        // values are JSON-escaped, so this substring can only be the marker.
+        if !line.contains("\"type\":\"session_state\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
             continue;
         };
-        if value.get("type").and_then(Value::as_str) == Some("session_state") {
-            if let (Some(key), Some(val)) = (
-                value.get("key").and_then(Value::as_str),
-                value.get("value").and_then(Value::as_str),
-            ) {
-                state.insert(key.into(), val.into());
-            }
+        if let (Some(key), Some(val)) = (
+            value.get("key").and_then(Value::as_str),
+            value.get("value").and_then(Value::as_str),
+        ) {
+            state.insert(key.into(), val.into());
         }
     }
     Ok(state)
@@ -775,6 +909,20 @@ mod tests {
         let clear = r#"{"type":"clear","id":"2","timestamp":"2020-01-01T00:00:00Z"}"#;
         fs::write(&path, format!("{}\n{}\n{}\n", header, message, clear)).unwrap();
         assert!(load_messages_from_session(&path).unwrap().is_empty());
+        // has_messages must agree with load: a trailing clear empties the
+        // transcript even though message entries appear earlier in the file.
+        assert!(!has_messages(&path));
+        // A clear followed by new messages counts again.
+        fs::write(
+            &path,
+            format!("{}\n{}\n{}\n{}\n", header, message, clear, message),
+        )
+        .unwrap();
+        assert!(has_messages(&path));
+        // System-only sessions hold no displayable content.
+        let system = r#"{"type":"message","id":"3","timestamp":"2020-01-01T00:00:00Z","role":"system","content":"note"}"#;
+        fs::write(&path, format!("{}\n{}\n", header, system)).unwrap();
+        assert!(!has_messages(&path));
         let _ = fs::remove_file(path);
     }
 

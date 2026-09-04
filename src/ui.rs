@@ -47,33 +47,92 @@ const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '
 /// `in_assistant_stream` bookkeeping at every call site.
 #[derive(Debug)]
 pub(crate) enum TranscriptBlock {
-    User(Vec<Line<'static>>),
-    Assistant(Vec<Line<'static>>),
+    User {
+        stamp: u64,
+        lines: Vec<Line<'static>>,
+    },
+    Assistant {
+        stamp: u64,
+        lines: Vec<Line<'static>>,
+    },
     /// Streamed model reasoning, stored raw. Rendered by `TranscriptView` as
     /// a one-line preview (collapsed) or full dim italic text (expanded via
     /// Ctrl+T); not routed through `lines()`.
-    Thinking(String),
+    Thinking {
+        stamp: u64,
+        text: String,
+    },
     Tool {
+        stamp: u64,
         input: Line<'static>,
         output: Option<Line<'static>>,
         preview: Vec<Line<'static>>,
     },
-    System(Line<'static>),
-    Error(Line<'static>),
-    Info(Line<'static>),
+    System {
+        stamp: u64,
+        line: Line<'static>,
+    },
+    Error {
+        stamp: u64,
+        line: Line<'static>,
+    },
+    Info {
+        stamp: u64,
+        line: Line<'static>,
+    },
+}
+
+impl TranscriptBlock {
+    /// Content stamp: bumped on every mutation after construction so the
+    /// per-block display cache (`App.wrapped_cache`) can tell a changed block
+    /// from a stable one without re-wrapping the whole transcript.
+    fn stamp(&self) -> u64 {
+        match self {
+            Self::User { stamp, .. }
+            | Self::Assistant { stamp, .. }
+            | Self::Thinking { stamp, .. }
+            | Self::Tool { stamp, .. }
+            | Self::System { stamp, .. }
+            | Self::Error { stamp, .. }
+            | Self::Info { stamp, .. } => *stamp,
+        }
+    }
+
+    fn bump(&mut self) {
+        let stamp = match self {
+            Self::User { stamp, .. }
+            | Self::Assistant { stamp, .. }
+            | Self::Thinking { stamp, .. }
+            | Self::Tool { stamp, .. }
+            | Self::System { stamp, .. }
+            | Self::Error { stamp, .. }
+            | Self::Info { stamp, .. } => stamp,
+        };
+        *stamp = stamp.wrapping_add(1);
+    }
+}
+
+/// Per-block wrapped display rows, parallel to `transcript`. Blocks are
+/// append-only, so a streaming flush re-wraps only the blocks whose stamp
+/// changed instead of the whole transcript.
+pub(crate) struct WrappedBlock {
+    /// Block stamp the rows were wrapped at; `u64::MAX` = not wrapped yet.
+    stamp: u64,
+    rows: Vec<Line<'static>>,
 }
 
 impl TranscriptBlock {
     /// Lines that belong to this block, in display order.
     pub(crate) fn lines(&self) -> Vec<&Line<'static>> {
         match self {
-            TranscriptBlock::User(lines) => lines.iter().collect(),
-            TranscriptBlock::Assistant(lines) => lines.iter().collect(),
-            TranscriptBlock::Thinking(_) => vec![],
+            TranscriptBlock::User { lines, .. } => lines.iter().collect(),
+            TranscriptBlock::Assistant { lines, .. } => lines.iter().collect(),
+            TranscriptBlock::Thinking { .. } => vec![],
             TranscriptBlock::Tool {
                 input,
                 output,
                 preview,
+                ..
             } => {
                 let mut out = Vec::with_capacity(1 + output.is_some() as usize + preview.len());
                 out.push(input);
@@ -83,9 +142,9 @@ impl TranscriptBlock {
                 out.extend(preview.iter());
                 out
             }
-            TranscriptBlock::System(line) => vec![line],
-            TranscriptBlock::Error(line) => vec![line],
-            TranscriptBlock::Info(line) => vec![line],
+            TranscriptBlock::System { line, .. } => vec![line],
+            TranscriptBlock::Error { line, .. } => vec![line],
+            TranscriptBlock::Info { line, .. } => vec![line],
         }
     }
 }
@@ -142,10 +201,20 @@ pub(crate) struct App {
     /// as any non-thinking line arrives or the turn ends.
     pub(crate) thinking_open: bool,
     pub(crate) plan: crate::core::types::Plan,
-    pub(crate) transcript_version: u64,
+    /// Assistant deltas buffered between throttle windows. `markdown_lines`
+    /// (term-md + tree-sitter) runs on the buffer at most once per ~8 ticks
+    /// instead of once per token; `flush_assistant` drains it into the tail
+    /// `Assistant` block.
+    pub(crate) assistant_pending: String,
+    /// Wrapped rows per transcript block, parallel to `transcript`. Kept in
+    /// sync (and `display_cache` rebuilt) by `TranscriptView::render` only
+    /// when a block's stamp changes, a block is added, or the width changes.
+    pub(crate) wrapped_cache: Vec<WrappedBlock>,
+    /// Terminal width the `wrapped_cache` rows were wrapped to.
+    pub(crate) wrapped_width: u16,
+    /// Concatenated wrapped rows with block-gap separators; sliced to the
+    /// visible window each frame so a full-transcript clone never happens.
     pub(crate) display_cache: Vec<Line<'static>>,
-    pub(crate) display_cache_width: u16,
-    pub(crate) display_cache_version: u64,
 }
 
 impl App {
@@ -263,11 +332,13 @@ fn indent_transcript_line(mut line: Line<'static>) -> Line<'static> {
 }
 
 pub(super) fn push_info_line(app: &mut App, line: Line<'static>) {
+    flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
-    app.transcript
-        .push(TranscriptBlock::Info(indent_transcript_line(line)));
-    app.transcript_version = app.transcript_version.wrapping_add(1);
+    app.transcript.push(TranscriptBlock::Info {
+        stamp: 0,
+        line: indent_transcript_line(line),
+    });
 }
 
 pub(super) fn push_info(app: &mut App, text: String) {
@@ -277,15 +348,46 @@ pub(super) fn push_info(app: &mut App, text: String) {
     );
 }
 
+/// Drain the buffered assistant deltas into the tail `Assistant` block,
+/// rendering the markdown once for the whole buffered chunk. Call before
+/// anything reads the transcript or pushes a non-assistant block, so pending
+/// text always lands in the block that was streaming it.
+fn flush_assistant(app: &mut App) {
+    if app.assistant_pending.is_empty() {
+        return;
+    }
+    let new_lines: Vec<Line<'static>> = render::markdown_lines(app.assistant_pending.trim_end())
+        .into_iter()
+        .map(indent_transcript_line)
+        .collect();
+    app.assistant_pending.clear();
+    if app.assistant_open {
+        if let Some(TranscriptBlock::Assistant { lines, stamp }) = app.transcript.last_mut() {
+            lines.extend(new_lines);
+            *stamp = stamp.wrapping_add(1);
+            return;
+        }
+    }
+    app.transcript.push(TranscriptBlock::Assistant {
+        stamp: 0,
+        lines: new_lines,
+    });
+    app.assistant_open = true;
+}
+
 /// Route a streamed console line into the transcript with the same styling
 /// the local engine uses, so remote and local turns look identical.
 /// Each `SinkLine` maps to one `TranscriptBlock` (or an extension of the
 /// tail `Assistant` block while streaming). No empty gap `Line`s are stored;
 /// `TranscriptView` inserts a single blank `Line` between any two blocks.
 pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
-    // Anything other than a thinking delta closes the open thinking block;
-    // the forced version bump settles the collapsed indicator even when the
-    // tail delta's throttled bump didn't fire.
+    // Anything other than a thinking delta closes the open thinking block.
+    // Non-assistant lines first drain the pending assistant buffer so it
+    // lands in the block that was streaming it; assistant deltas drain in
+    // their own arm.
+    if !matches!(sl, SinkLine::Assistant(_)) {
+        flush_assistant(app);
+    }
     if !matches!(sl, SinkLine::Thinking(_)) {
         close_thinking(app);
     }
@@ -296,44 +398,44 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 // blank line between paragraphs). Keep it inside the tail
                 // Assistant block so the inter-block gutter remains canonical.
                 if app.assistant_open {
-                    if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
+                    flush_assistant(app);
+                    if let Some(TranscriptBlock::Assistant { lines, stamp }) =
+                        app.transcript.last_mut()
+                    {
                         lines.push(Line::default());
-                        app.transcript_version = app.transcript_version.wrapping_add(1);
+                        *stamp = stamp.wrapping_add(1);
                     }
                 }
                 return;
             }
-            let new_lines: Vec<Line<'static>> = render::markdown_lines(s.trim_end())
-                .into_iter()
-                .map(indent_transcript_line)
-                .collect();
-            if app.assistant_open {
-                if let Some(TranscriptBlock::Assistant(existing)) = app.transcript.last_mut() {
-                    existing.extend(new_lines);
-                    app.transcript_version = app.transcript_version.wrapping_add(1);
-                    return;
-                }
+            // ponytail: buffer deltas — markdown (term-md + tree-sitter) runs
+            // at most once per throttle window instead of once per line. Each
+            // sink line is one complete markdown line (stream.rs trims the
+            // trailing newline), so rejoin buffered lines with '\n' to keep
+            // paragraph structure across the throttle window.
+            if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
+                app.assistant_pending.push('\n');
             }
-            app.transcript.push(TranscriptBlock::Assistant(new_lines));
-            app.assistant_open = true;
-            app.transcript_version = app.transcript_version.wrapping_add(1);
+            app.assistant_pending.push_str(&s);
+            if app.tick.is_multiple_of(8) {
+                flush_assistant(app);
+            }
         }
         SinkLine::Thinking(s) => {
             if s.is_empty() {
                 return;
             }
             app.assistant_open = false;
-            if let Some(TranscriptBlock::Thinking(text)) = app.transcript.last_mut() {
+            if let Some(TranscriptBlock::Thinking { text, stamp }) = app.transcript.last_mut() {
                 text.push_str(&s);
-                // ponytail: throttle re-wraps — reasoning arrives token-by-token
-                // and every version bump re-wraps the whole transcript. tick
-                // advances ~16ms/frame; the block flushes when it closes anyway.
+                // ponytail: throttle re-wraps — reasoning arrives token-by-
+                // token; the block settles on close, which bumps unconditionally.
                 if app.tick.is_multiple_of(8) {
-                    app.transcript_version = app.transcript_version.wrapping_add(1);
+                    *stamp = stamp.wrapping_add(1);
                 }
             } else {
-                app.transcript.push(TranscriptBlock::Thinking(s));
-                app.transcript_version = app.transcript_version.wrapping_add(1);
+                app.transcript
+                    .push(TranscriptBlock::Thinking { stamp: 0, text: s });
             }
             app.thinking_open = true;
         }
@@ -353,11 +455,11 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ),
             ]));
             app.transcript.push(TranscriptBlock::Tool {
+                stamp: 0,
                 input,
                 output: None,
                 preview: Vec::new(),
             });
-            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::ToolOutput {
             name,
@@ -412,18 +514,20 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             if let Some(TranscriptBlock::Tool {
                 output: out,
                 preview: prev,
+                stamp,
                 ..
             }) = app.transcript.last_mut()
             {
                 if out.is_none() {
                     *out = Some(output);
                     *prev = preview_lines;
-                    app.transcript_version = app.transcript_version.wrapping_add(1);
+                    *stamp = stamp.wrapping_add(1);
                     return;
                 }
             }
             // Fallback: no open ToolInput (e.g. replay); synthesize a block.
             app.transcript.push(TranscriptBlock::Tool {
+                stamp: 0,
                 input: indent_transcript_line(Line::from(Span::styled(
                     "▸ tool",
                     Style::default().fg(Color::Yellow),
@@ -431,18 +535,16 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 output: Some(output),
                 preview: preview_lines,
             });
-            app.transcript_version = app.transcript_version.wrapping_add(1);
         }
         SinkLine::System(s) => {
             app.assistant_open = false;
-            app.transcript
-                .push(TranscriptBlock::System(indent_transcript_line(Line::from(
-                    vec![
-                        Span::styled("· ", Style::default().fg(theme::muted_fg())),
-                        Span::styled(s, Style::default().fg(theme::muted_fg())),
-                    ],
-                ))));
-            app.transcript_version = app.transcript_version.wrapping_add(1);
+            app.transcript.push(TranscriptBlock::System {
+                stamp: 0,
+                line: indent_transcript_line(Line::from(vec![
+                    Span::styled("· ", Style::default().fg(theme::muted_fg())),
+                    Span::styled(s, Style::default().fg(theme::muted_fg())),
+                ])),
+            });
         }
         // Usage updates flow into the status bar via StreamEvent::Usage in
         // the remote handler, not into the transcript.
@@ -452,14 +554,13 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
         }
         SinkLine::Error(s) => {
             app.assistant_open = false;
-            app.transcript
-                .push(TranscriptBlock::Error(indent_transcript_line(Line::from(
-                    vec![
-                        Span::styled("! ", Style::default().fg(Color::Red)),
-                        Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
-                    ],
-                ))));
-            app.transcript_version = app.transcript_version.wrapping_add(1);
+            app.transcript.push(TranscriptBlock::Error {
+                stamp: 0,
+                line: indent_transcript_line(Line::from(vec![
+                    Span::styled("! ", Style::default().fg(Color::Red)),
+                    Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
+                ])),
+            });
         }
     }
     // ponytail: sticky autoscroll — don't force true on every append;
@@ -468,23 +569,37 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
 }
 
 /// Close the streaming thinking block, if any: stops the collapsed
-/// indicator's dot animation and forces a re-render so it settles at its
-/// static "Thinking ..." frame even when the last delta's throttled
-/// version bump didn't fire.
+/// indicator's dot animation. The per-block display cache holds the settled
+/// "Thinking ..." row already (the dots are a per-frame overlay), but the
+/// stamp bump forces a re-wrap so an expanded (Ctrl+T) block shows any text
+/// that arrived since the last throttled bump.
 pub(super) fn close_thinking(app: &mut App) {
     if app.thinking_open {
         app.thinking_open = false;
-        app.transcript_version = app.transcript_version.wrapping_add(1);
+        if let Some(block) = app.transcript.last_mut() {
+            block.bump();
+        }
+    }
+}
+
+/// Ctrl+T toggles expanded thinking. The wrapped rows of a thinking block
+/// depend on that flag, so stamp-bump every thinking block to force a re-wrap.
+pub(super) fn bump_thinking_stamps(app: &mut App) {
+    for block in &mut app.transcript {
+        if matches!(block, TranscriptBlock::Thinking { .. }) {
+            block.bump();
+        }
     }
 }
 
 fn dim_intermediate_assistant_block(app: &mut App) {
-    if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
+    if let Some(TranscriptBlock::Assistant { lines, stamp }) = app.transcript.last_mut() {
         for line in lines.iter_mut() {
             for span in &mut line.spans {
                 span.style = span.style.fg(theme::muted_fg());
             }
         }
+        *stamp = stamp.wrapping_add(1);
     }
 }
 
@@ -505,6 +620,7 @@ pub(super) fn scroll_transcript(app: &mut App, delta: i32) {
 /// Render the user's submitted prompt with the shared transcript grid.
 /// No empty gap `Line`s are stored; gutter is inserted by `TranscriptView`.
 pub(super) fn render_user_prompt(app: &mut App, line: &str) {
+    flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
     let user_bg = Style::default()
@@ -522,17 +638,19 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
         ]));
     }
     block_lines.push(Line::from(edge_pad));
-    app.transcript.push(TranscriptBlock::User(block_lines));
-    app.transcript_version = app.transcript_version.wrapping_add(1);
+    app.transcript.push(TranscriptBlock::User {
+        stamp: 0,
+        lines: block_lines,
+    });
     app.autoscroll = true;
 }
 
 pub(crate) fn rebuild_transcript(app: &mut App) {
     app.transcript.clear();
+    app.assistant_pending.clear();
     app.assistant_open = false;
     app.thinking_open = false;
     app.active_tool = None;
-    app.transcript_version = app.transcript_version.wrapping_add(1);
     let msgs = app.messages.clone();
     for msg in msgs.iter().skip(1) {
         match msg.role.as_str() {
@@ -584,6 +702,9 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
             }
         }
     }
+    // The last replayed message may be assistant text still sitting in the
+    // delta buffer; drain it so the rebuilt transcript is complete.
+    flush_assistant(app);
     app.autoscroll = true;
 }
 
@@ -647,10 +768,10 @@ mod tests {
             show_thinking: false,
             thinking_open: false,
             plan: crate::core::types::Plan::default(),
-            transcript_version: 0,
+            assistant_pending: String::new(),
+            wrapped_cache: Vec::new(),
+            wrapped_width: 0,
             display_cache: Vec::new(),
-            display_cache_width: 0,
-            display_cache_version: u64::MAX,
         }
     }
 
@@ -674,8 +795,14 @@ mod tests {
             "assistant text closes the thinking block"
         );
         assert_eq!(app.transcript.len(), 2);
-        assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "Let me think."));
-        assert!(matches!(&app.transcript[1], TranscriptBlock::Assistant(_)));
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptBlock::Thinking { text, .. } if text == "Let me think."
+        ));
+        assert!(matches!(
+            &app.transcript[1],
+            TranscriptBlock::Assistant { .. }
+        ));
         assert!(app.assistant_open);
     }
 
@@ -689,8 +816,71 @@ mod tests {
             );
         }
         assert_eq!(app.transcript.len(), 1);
-        assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "abc"));
+        assert!(
+            matches!(&app.transcript[0], TranscriptBlock::Thinking { text, .. } if text == "abc")
+        );
         assert!(app.thinking_open);
+    }
+
+    #[test]
+    fn assistant_lines_buffer_until_the_throttle_window() {
+        let mut app = test_app();
+        app.tick = 1; // inside a throttle window
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("hello".into()),
+        );
+        assert_eq!(app.assistant_pending, "hello");
+        assert!(app.transcript.is_empty(), "nothing renders mid-window");
+
+        app.tick = 8;
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("world".into()),
+        );
+        assert!(app.assistant_pending.is_empty());
+        assert!(app.assistant_open);
+        // Two complete markdown lines inside one window keep their line
+        // break (the daemon coalescer joins with '\n' as well).
+        let TranscriptBlock::Assistant { lines, .. } = &app.transcript[0] else {
+            panic!("expected assistant block");
+        };
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("world"), "{text}");
+        assert!(
+            !text.contains("helloworld"),
+            "line break lost while buffering: {text}"
+        );
+
+        // A non-assistant line drains the buffer before its own block lands.
+        app.tick = 1;
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("tail".into()),
+        );
+        assert_eq!(app.assistant_pending, "tail");
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash echo".into()),
+        );
+        assert!(app.assistant_pending.is_empty());
+        assert_eq!(app.transcript.len(), 2);
+        let TranscriptBlock::Assistant { lines, .. } = &app.transcript[0] else {
+            panic!("expected assistant block");
+        };
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("tail"), "buffered tail flushed first: {text}");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptBlock::Tool { .. })
+        ));
     }
 
     #[test]
@@ -823,8 +1013,10 @@ mod tests {
             name: None,
             ..Default::default()
         });
-        app.transcript
-            .push(TranscriptBlock::Info(Line::from("old")));
+        app.transcript.push(TranscriptBlock::Info {
+            stamp: 0,
+            line: Line::from("old"),
+        });
         app.tool_state.total_usage = 42;
         app.tool_state.total_cost = 1.5;
         app.tool_state.last_usage = Some(7);
@@ -863,7 +1055,7 @@ mod tests {
         assert!(
             app.transcript
                 .iter()
-                .any(|b| matches!(b, TranscriptBlock::Info(l) if l.spans.iter().any(|s| s.content.contains("turn is running"))))
+                  .any(|b| matches!(b, TranscriptBlock::Info { line, .. } if line.spans.iter().any(|s| s.content.contains("turn is running"))))
         );
     }
 }

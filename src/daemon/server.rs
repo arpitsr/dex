@@ -831,70 +831,97 @@ fn run_turn_inner(
             let mut journal = session_path
                 .as_deref()
                 .and_then(|p| Session::from_path(p).ok());
+            let mut deferred: Option<SinkLine> = None;
             loop {
-                match sink_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(sl) => {
-                        let event = match sl {
-                            SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
-                            SinkLine::Thinking(text) => StreamEvent::Thinking(text),
-                            SinkLine::ToolInput(preview) => {
-                                let mut parts = preview.splitn(2, ' ');
-                                let name = parts.next().unwrap_or_default().to_string();
-                                let args = parts.next().unwrap_or_default().to_string();
-                                StreamEvent::ToolCall {
-                                    name,
-                                    args: serde_json::Value::String(args),
-                                }
+                let sl = match deferred.take() {
+                    Some(sl) => sl,
+                    None => match sink_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(sl) => sl,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if cancel.is_cancelled() {
+                                break;
                             }
-                            SinkLine::ToolOutput {
-                                name,
-                                summary,
-                                success,
-                                preview,
-                                duration,
-                            } => StreamEvent::ToolResult {
-                                name,
-                                summary,
-                                success,
-                                preview,
-                                duration,
-                            },
-                            SinkLine::System(text) => StreamEvent::System(text),
-                            SinkLine::Error(text) => StreamEvent::Error(text),
-                            SinkLine::Usage {
-                                tokens,
-                                cached,
-                                cost,
-                                output,
-                            } => StreamEvent::Usage {
-                                tokens,
-                                cached,
-                                cost,
-                                output,
-                            },
-                            SinkLine::Plan(plan) => StreamEvent::Plan {
-                                goal: plan.goal,
-                                steps: plan.steps,
-                                constraints: plan.constraints,
-                                acceptance: plan.acceptance,
-                            },
-                        };
-                        let seq = state.next_seq(&sid);
-                        if let Some(s) = journal.as_mut() {
-                            let _ = s.append_event(
-                                seq,
-                                &serde_json::to_string(&event).unwrap_or_default(),
-                            );
+                            continue;
                         }
-                        let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if cancel.is_cancelled() {
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    },
+                };
+                // Coalesce per-token thinking deltas: providers stream one
+                // sink line per token, and each event costs a seq bump, a
+                // journal append, and an SSE write. Drain every already
+                // queued consecutive line of the same kind into one event
+                // (a different line kind is held back and handled next, in
+                // order). Thinking deltas are raw token fragments and join
+                // verbatim; Assistant events are complete markdown lines
+                // (stream.rs trims the trailing newline) and join with '\n'
+                // so paragraph structure survives coalescing.
+                let mut batch = sl;
+                loop {
+                    match (&mut batch, sink_rx.try_recv()) {
+                        (SinkLine::Thinking(buf), Ok(SinkLine::Thinking(text))) => {
+                            buf.push_str(&text);
+                        }
+                        (SinkLine::Assistant(buf), Ok(SinkLine::Assistant(text))) => {
+                            buf.push('\n');
+                            buf.push_str(&text);
+                        }
+                        (_, Ok(other)) => {
+                            deferred = Some(other);
                             break;
                         }
+                        (_, Err(_)) => break,
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+                let event = match batch {
+                    SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
+                    SinkLine::Thinking(text) => StreamEvent::Thinking(text),
+                    SinkLine::ToolInput(preview) => {
+                        let mut parts = preview.splitn(2, ' ');
+                        let name = parts.next().unwrap_or_default().to_string();
+                        let args = parts.next().unwrap_or_default().to_string();
+                        StreamEvent::ToolCall {
+                            name,
+                            args: serde_json::Value::String(args),
+                        }
+                    }
+                    SinkLine::ToolOutput {
+                        name,
+                        summary,
+                        success,
+                        preview,
+                        duration,
+                    } => StreamEvent::ToolResult {
+                        name,
+                        summary,
+                        success,
+                        preview,
+                        duration,
+                    },
+                    SinkLine::System(text) => StreamEvent::System(text),
+                    SinkLine::Error(text) => StreamEvent::Error(text),
+                    SinkLine::Usage {
+                        tokens,
+                        cached,
+                        cost,
+                        output,
+                    } => StreamEvent::Usage {
+                        tokens,
+                        cached,
+                        cost,
+                        output,
+                    },
+                    SinkLine::Plan(plan) => StreamEvent::Plan {
+                        goal: plan.goal,
+                        steps: plan.steps,
+                        constraints: plan.constraints,
+                        acceptance: plan.acceptance,
+                    },
+                };
+                let seq = state.next_seq(&sid);
+                if let Some(s) = journal.as_mut() {
+                    let _ = s.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+                }
+                let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
             }
         });
     }

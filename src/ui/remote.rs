@@ -24,9 +24,9 @@ use crate::session::Session;
 
 use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
 use super::{
-    append_sink_line, close_thinking, push_info, push_info_line, render_user_prompt,
-    resolve_approval, scroll_transcript, view, App, DisableAlternateScroll, EnableAlternateScroll,
-    PendingApproval, TerminalCleanup,
+    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, push_info,
+    push_info_line, render_user_prompt, resolve_approval, scroll_transcript, view, App,
+    DisableAlternateScroll, EnableAlternateScroll, PendingApproval, TerminalCleanup,
 };
 
 /// Messages flowing from the per-turn worker thread into the UI loop.
@@ -229,10 +229,10 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         assistant_open: false,
         show_thinking: false,
         thinking_open: false,
-        transcript_version: 0,
+        assistant_pending: String::new(),
+        wrapped_cache: Vec::new(),
+        wrapped_width: 0,
         display_cache: Vec::new(),
-        display_cache_width: 0,
-        display_cache_version: u64::MAX,
     };
 
     let mut remote = RemoteApp {
@@ -314,16 +314,20 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         // Events consumed while classifying arrow bursts, replayed on the
         // next iterations of the loop.
         let mut pending: VecDeque<Event> = VecDeque::new();
+        // ponytail: draw on change, not on a 60 fps heartbeat — every frame
+        // rebuilds the whole view (O(transcript)), which showed up as the top
+        // idle CPU cost. Draw when state changed (worker message / input
+        // event) or while a turn is animating (spinner + thinking dots);
+        // otherwise just park in event::poll.
+        let mut dirty = true;
         loop {
-            // Advance the animation frame so the spinner + status update.
-            remote.app.tick = remote.app.tick.wrapping_add(1);
-            terminal.draw(|f| view(f, &mut remote.app))?;
-
             // Drain worker messages: the transcript updates live while the
             // turn streams in on the worker thread.
+            let mut streamed = false;
             loop {
                 match remote.worker_rx.try_recv() {
                     Ok(WorkerMessage::Stream(event)) => {
+                        streamed = true;
                         if remote.app.cancel_requested {
                             match &event {
                                 StreamEvent::TurnComplete { .. }
@@ -336,14 +340,25 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                         }
                         handle_stream_event(&mut remote, event);
                     }
-                    Ok(WorkerMessage::Finished(error)) => finish_turn(&mut remote, error),
+                    Ok(WorkerMessage::Finished(error)) => {
+                        streamed = true;
+                        finish_turn(&mut remote, error);
+                    }
                     Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
                 }
             }
 
+            let busy = remote.app.busy;
+            if dirty || streamed || busy {
+                // Advance the animation frame so the spinner + status update.
+                remote.app.tick = remote.app.tick.wrapping_add(1);
+                terminal.draw(|f| view(f, &mut remote.app))?;
+                dirty = false;
+            }
+
             let next = if let Some(event) = pending.pop_front() {
                 event
-            } else if event::poll(Duration::from_millis(16))? {
+            } else if event::poll(Duration::from_millis(if busy { 16 } else { 250 }))? {
                 event::read()?
             } else {
                 continue;
@@ -377,6 +392,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                 Event::Resize(..) => {} // frame recomputed each draw
                 _ => {}
             }
+
+            dirty = true;
 
             if remote.app.quit {
                 break;
@@ -527,6 +544,9 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
         append_sink_line(&mut remote.app, SinkLine::Error(error));
     }
     let app = &mut remote.app;
+    // Drain any assistant deltas still in the throttle buffer so the final
+    // text is in the transcript before the turn is torn down.
+    flush_assistant(app);
     // If the turn was cancelled, restore queued steering/follow-ups to the
     // composer so the user can retry (mirrors old local `event.rs` logic).
     if app.cancel_requested {
@@ -914,7 +934,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         }
         KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
             app.show_thinking = !app.show_thinking;
-            app.transcript_version = app.transcript_version.wrapping_add(1);
+            bump_thinking_stamps(app);
         }
         _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
             KeyCode::Up => {
@@ -1429,7 +1449,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                         .and_then(|s| s.path().map(|p| p.to_path_buf()))
                 });
             remote.app.transcript.clear();
-            remote.app.transcript_version = remote.app.transcript_version.wrapping_add(1);
+            remote.app.assistant_pending.clear();
             remote.app.assistant_open = false;
             remote.app.active_tool = None;
             match remote.client.reattach(&sid) {

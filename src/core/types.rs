@@ -225,15 +225,17 @@ pub(crate) struct FunctionCall {
     pub(crate) arguments: String,
 }
 
+/// Serialized straight onto the wire; borrows the request history instead of
+/// cloning it per call (`messages` can hold the whole compacted session).
 #[derive(Serialize)]
-pub(crate) struct ChatRequest {
-    pub(crate) model: String,
-    pub(crate) messages: Vec<ChatMessage>,
+pub(crate) struct ChatRequest<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) messages: &'a [ChatMessage],
     pub(crate) tools: Vec<ToolDefinition>,
     pub(crate) stream: bool,
     pub(crate) stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: &'a Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

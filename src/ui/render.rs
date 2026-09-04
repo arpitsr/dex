@@ -11,7 +11,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::slash;
 use super::wrapping::wrap_line;
-use super::{format_tokens, theme, transcript_indent, App, InputField, TRANSCRIPT_INDENT};
+use super::{
+    format_tokens, theme, transcript_indent, App, InputField, WrappedBlock, TRANSCRIPT_INDENT,
+};
 
 pub(super) fn surface_padding() -> Padding {
     Padding {
@@ -563,6 +565,31 @@ fn thinking_indicator_line(thinking_open: bool, tick: u16, width: u16) -> Line<'
 
 struct TranscriptView;
 
+/// Wrapped rows for a transcript block at `width`. Thinking blocks are
+/// cached in their settled form — collapsed "Thinking ..." or the full dim
+/// text when expanded — so the streaming dots stay a per-frame overlay on
+/// the tail row and never trigger a re-wrap themselves.
+fn wrap_block(
+    block: &super::TranscriptBlock,
+    width: u16,
+    show_thinking: bool,
+) -> Vec<Line<'static>> {
+    match block {
+        super::TranscriptBlock::Thinking { text, .. } => {
+            if show_thinking {
+                thinking_display_lines(text, true, false, 0, width)
+            } else {
+                vec![thinking_indicator_line(false, 0, width)]
+            }
+        }
+        _ => block
+            .lines()
+            .into_iter()
+            .flat_map(|l| wrap_line_display(l, width))
+            .collect(),
+    }
+}
+
 impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         // Clear the transcript area first: without this a shorter frame (e.g. after
@@ -573,37 +600,52 @@ impl TranscriptView {
         // would otherwise persist as a ghost until the next full clear (resize).
         f.render_widget(Clear, area);
         let visible = area.height as usize;
-        // ponytail: cache wrapped display — scroll alone shouldn't re-wrap O(N)
-        let cache_valid = app.display_cache_width == area.width
-            && app.display_cache_version == app.transcript_version;
-        if !cache_valid {
+        // ponytail: per-block wrap cache — transcript blocks are append-only,
+        // so a streaming flush re-wraps only the blocks whose content stamp
+        // changed (usually the tail) instead of the whole transcript. Scroll
+        // and resize reuse cached rows; only the visible window is cloned
+        // into the paragraph each draw.
+        let mut changed = app.wrapped_width != area.width;
+        if changed {
+            app.wrapped_cache.clear();
+            app.display_cache.clear();
+            app.wrapped_width = area.width;
+        }
+        // Keep the cache parallel to the transcript. A shorter transcript
+        // (reset/resume) drops stale entries; appended blocks start unwrapped.
+        if app.wrapped_cache.len() > app.transcript.len() {
+            app.wrapped_cache.truncate(app.transcript.len());
+            changed = true;
+        }
+        while app.wrapped_cache.len() < app.transcript.len() {
+            app.wrapped_cache.push(WrappedBlock {
+                stamp: u64::MAX,
+                rows: Vec::new(),
+            });
+            changed = true;
+        }
+        for (idx, block) in app.transcript.iter().enumerate() {
+            if app.wrapped_cache[idx].stamp == block.stamp() {
+                continue;
+            }
+            let rows = wrap_block(block, area.width, app.show_thinking);
+            app.wrapped_cache[idx] = WrappedBlock {
+                stamp: block.stamp(),
+                rows,
+            };
+            changed = true;
+        }
+        if changed {
+            // Re-concatenate the already-wrapped rows (no re-wrapping); this
+            // runs only on content or width changes, never for scroll.
             let mut display: Vec<Line<'static>> = Vec::new();
-            for (idx, block) in app.transcript.iter().enumerate() {
+            for (idx, wb) in app.wrapped_cache.iter().enumerate() {
                 if idx > 0 {
                     display.push(Line::default());
                 }
-                if let super::TranscriptBlock::Thinking(text) = block {
-                    // Only the tail block can be the open one (any other
-                    // sink line closes it); earlier blocks are settled and
-                    // must stay frozen at "Thinking ..." instead of
-                    // re-animating with the live tick.
-                    let open = app.thinking_open && idx + 1 == app.transcript.len();
-                    display.extend(thinking_display_lines(
-                        text,
-                        app.show_thinking,
-                        open,
-                        app.tick,
-                        area.width,
-                    ));
-                    continue;
-                }
-                for line in block.lines() {
-                    display.extend(wrap_line_display(line, area.width));
-                }
+                display.extend(wb.rows.iter().cloned());
             }
             app.display_cache = display;
-            app.display_cache_width = area.width;
-            app.display_cache_version = app.transcript_version;
         }
         // The open thinking block's collapsed indicator animates in place:
         // its cached line is rewritten every frame (O(1)) instead of
@@ -615,7 +657,7 @@ impl TranscriptView {
             && !app.show_thinking
             && matches!(
                 app.transcript.last(),
-                Some(super::TranscriptBlock::Thinking(_))
+                Some(super::TranscriptBlock::Thinking { .. })
             )
         {
             if let Some(last) = app.display_cache.last_mut() {
@@ -638,9 +680,16 @@ impl TranscriptView {
         // emits a phantom empty row before any all-whitespace line that is
         // exactly `area.width` wide — the submitted-prompt box's edge rows are
         // exactly that, so Wrap rendered dark holes inside the box.
-        let transcript = Paragraph::new(app.display_cache.clone())
-            .style(Style::default().fg(Color::Gray))
-            .scroll((app.scroll, 0));
+        // ponytail: clone only the visible window; a full-transcript clone
+        // per frame was the remaining O(N) term once wrapping was cached.
+        let window: Vec<Line<'static>> = app
+            .display_cache
+            .iter()
+            .skip(app.scroll as usize)
+            .take(visible)
+            .cloned()
+            .collect();
+        let transcript = Paragraph::new(window).style(Style::default().fg(Color::Gray));
         f.render_widget(transcript, area);
     }
 }
@@ -1440,11 +1489,12 @@ mod tests {
     fn test_app() -> super::super::App {
         let cwd = "/tmp/dex-ui-test".to_string();
         super::super::App {
-            transcript: vec![super::super::TranscriptBlock::Assistant(vec![
-                super::super::indent_transcript_line(Line::from(
+            transcript: vec![super::super::TranscriptBlock::Assistant {
+                stamp: 0,
+                lines: vec![super::super::indent_transcript_line(Line::from(
                     "hello from the transcript — this line is intentionally long enough to wrap",
-                )),
-            ])],
+                ))],
+            }],
             input: InputField::new(),
             config: super::super::LlmConfig {
                 provider: Provider::OpenCode,
@@ -1496,10 +1546,10 @@ mod tests {
             show_thinking: false,
             thinking_open: false,
             plan: crate::core::types::Plan::default(),
-            transcript_version: 0,
+            assistant_pending: String::new(),
+            wrapped_cache: Vec::new(),
+            wrapped_width: 0,
             display_cache: Vec::new(),
-            display_cache_width: 0,
-            display_cache_version: u64::MAX,
         }
     }
 
@@ -1601,11 +1651,20 @@ mod tests {
         // block — the open one — may animate.
         let mut app = test_app();
         app.transcript = vec![
-            super::super::TranscriptBlock::Thinking("settled thoughts".into()),
-            super::super::TranscriptBlock::Assistant(vec![super::super::indent_transcript_line(
-                Line::from("tool turn in between"),
-            )]),
-            super::super::TranscriptBlock::Thinking("live thoughts".into()),
+            super::super::TranscriptBlock::Thinking {
+                stamp: 0,
+                text: "settled thoughts".into(),
+            },
+            super::super::TranscriptBlock::Assistant {
+                stamp: 0,
+                lines: vec![super::super::indent_transcript_line(Line::from(
+                    "tool turn in between",
+                ))],
+            },
+            super::super::TranscriptBlock::Thinking {
+                stamp: 0,
+                text: "live thoughts".into(),
+            },
         ];
         app.thinking_open = true;
         app.tick = 8; // animated frame for this tick is "Thinking .."
@@ -1625,6 +1684,53 @@ mod tests {
         assert!(lines.iter().any(|l| l == "Thinking ..."), "{lines:?}");
         // The open tail block still animates.
         assert!(lines.iter().any(|l| l == "Thinking .."), "{lines:?}");
+    }
+
+    #[test]
+    fn streamed_flush_merges_into_display_without_losing_blocks() {
+        // The per-block wrap cache must absorb a streamed delta into the
+        // rendered display: new block wrapped, settled head block reused,
+        // gap preserved, no stale rows.
+        let mut app = test_app();
+        app.tick = 8;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let head_rows = app.wrapped_cache[0].rows.len();
+
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("more text".into()),
+        );
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+
+        assert_eq!(app.transcript.len(), 2);
+        assert_eq!(app.wrapped_cache.len(), 2);
+        assert_eq!(
+            app.wrapped_cache[0].rows.len(),
+            head_rows,
+            "head block rows must be reused, not re-wrapped"
+        );
+        let text =
+            |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let lines: Vec<String> = app
+            .display_cache
+            .iter()
+            .map(|l| text(l).trim().to_string())
+            .collect();
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("hello from the transcript")));
+        assert!(lines.iter().any(|l| l.contains("more text")));
+        assert_eq!(
+            lines.iter().filter(|l| l.is_empty()).count(),
+            1,
+            "exactly one gap between the two blocks"
+        );
     }
 
     #[test]
@@ -1936,7 +2042,7 @@ mod tests {
         ));
         assert!(matches!(
             app.transcript[2],
-            super::super::TranscriptBlock::Assistant(_)
+            super::super::TranscriptBlock::Assistant { .. }
         ));
 
         // Build the same flattened display TranscriptView uses and assert a
@@ -2252,7 +2358,7 @@ mod tests {
         // [Assistant(hello)] + streamed Assistant => two blocks, tail holds both.
         assert_eq!(app.transcript.len(), 2);
         let tail = match &app.transcript[1] {
-            super::super::TranscriptBlock::Assistant(lines) => lines,
+            super::super::TranscriptBlock::Assistant { lines, .. } => lines,
             other => panic!("expected tail Assistant block, got {other:?}"),
         };
         let first_pos = tail
