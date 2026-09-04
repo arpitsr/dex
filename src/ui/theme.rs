@@ -85,15 +85,20 @@ pub(crate) fn popup_bg() -> Color {
     }
 }
 
-/// Foreground for prominent text on the composer/surface. For light themes
-/// this is black; for dark themes white; when the theme is unknown the
-/// terminal's own default foreground is inherited so text can never end up
-/// the same color as the surface behind it.
+/// Foreground for prominent text on the composer/surface: the terminal's own
+/// default foreground, so it always contrasts with the background and with
+/// the surfaces derived from it. Fixed ANSI slots (`Color::Black` /
+/// `Color::White`) must not be used here: they are palette entries that
+/// themes routinely remap toward the background tint (e.g. Gruvbox Light sets
+/// color 0 to the cream background), which renders text unreadable. When the
+/// theme is unknown the default foreground is inherited (`Reset`) instead.
 pub(crate) fn surface_fg() -> Color {
-    match background() {
-        Background::Light => Color::Black,
-        Background::Dark => Color::White,
-        Background::Unknown => Color::Reset,
+    match palette() {
+        Some(p) => {
+            let (r, g, b) = p.foreground;
+            Color::Rgb(r, g, b)
+        }
+        None => Color::Reset,
     }
 }
 
@@ -178,8 +183,10 @@ mod tests {
                 other => panic!("color leaks theme: {other:?}"),
             }
         }
-        if background() == Background::Light {
-            assert_eq!(surface_fg(), Color::Black);
+        // With a known theme the surface foreground is the terminal's own
+        // default foreground, never a fixed ANSI slot the theme may remap.
+        if background() != Background::Unknown {
+            assert!(matches!(surface_fg(), Color::Rgb(..)));
         }
         // Unknown theme must inherit the terminal fg (Reset), never a fixed
         // color that could match the surface it sits on.
