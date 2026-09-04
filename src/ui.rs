@@ -453,11 +453,14 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // at most once per throttle window instead of once per line. Each
             // sink line is one complete markdown line (stream.rs trims the
             // trailing newline), so rejoin buffered lines with '\n' to keep
-            // paragraph structure across the throttle window.
+            // paragraph structure across the throttle window. Normalize blank
+            // lines around block-level markdown so dense model output still
+            // renders with air between sections.
+            let chunk = render::with_block_gaps(&app.assistant_pending, &s);
             if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
                 app.assistant_pending.push('\n');
             }
-            app.assistant_pending.push_str(&s);
+            app.assistant_pending.push_str(&chunk);
             if app.tick.is_multiple_of(8) {
                 flush_assistant(app);
             }
@@ -894,7 +897,7 @@ mod tests {
             &mut app,
             crate::core::types::SinkLine::Assistant("hello".into()),
         );
-        assert_eq!(app.assistant_pending, "hello");
+        assert_eq!(app.assistant_pending, "hello\n");
         assert!(app.transcript.is_empty(), "nothing renders mid-window");
 
         app.tick = 8;
@@ -926,7 +929,7 @@ mod tests {
             &mut app,
             crate::core::types::SinkLine::Assistant("tail".into()),
         );
-        assert_eq!(app.assistant_pending, "tail");
+        assert_eq!(app.assistant_pending, "tail\n");
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolInput("bash echo".into()),
