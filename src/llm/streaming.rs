@@ -87,7 +87,12 @@ pub(crate) fn complete(
                 Ok(ok) => Ok(ok),
                 Err(e) if !is_mid_stream(&*e) && try_responses_fallback(config, &e.to_string()) => {
                     // Empirical protocol inference: responses API rejected the
-                    // model — try chat-completions once and remember.
+                    // model — try chat-completions once and remember. The gate
+                    // is deliberately broad: any pre-output failure on a 200'd
+                    // /responses call (immediate EOF, connect blip) re-issues
+                    // the whole turn over chat-completions; once anything has
+                    // streamed, MidStreamError blocks the retry so a partial
+                    // transcript is never duplicated.
                     match crate::llm::client::call_chat_completions(
                         config,
                         messages,
