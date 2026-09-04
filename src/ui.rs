@@ -374,11 +374,14 @@ pub(crate) const NOTICE_LIFETIME: Duration = Duration::from_secs(2);
 
 /// Mouse drag selection over the transcript, in `display_cache` (row, col)
 /// cell space. `anchor`/`end` are the raw press/release points; `norm()`
-/// orders them for highlight and copy.
+/// orders them for highlight and copy. `sticky` selections (double-click
+/// word picks) survive mouse-up so the highlight stays visible until the
+/// next click.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Selection {
     pub(crate) anchor: (usize, usize),
     pub(crate) end: (usize, usize),
+    pub(crate) sticky: bool,
 }
 
 impl Selection {
@@ -395,6 +398,25 @@ impl Selection {
     pub(crate) fn is_empty(&self) -> bool {
         self.anchor == self.end
     }
+}
+
+/// Expand a click at char index `col` on a display line to the enclosing
+/// word: the maximal run of non-whitespace chars. `None` past the line's
+/// text or when the click lands on whitespace.
+pub(crate) fn word_bounds(line: &Line<'static>, col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    Some((start, end))
 }
 
 /// OSC 52 clipboard set: `ESC ] 52 ; c ; <base64> ST`. Honored by xterm,
@@ -997,23 +1019,45 @@ mod tests {
         let s = Selection {
             anchor: (5, 2),
             end: (3, 7),
+            sticky: false,
         };
         assert_eq!(s.norm(), ((3, 7), (5, 2)));
         let s = Selection {
             anchor: (2, 9),
             end: (2, 1),
+            sticky: false,
         };
         assert_eq!(s.norm(), ((2, 1), (2, 9)));
         assert!(Selection {
             anchor: (1, 1),
-            end: (1, 1)
+            end: (1, 1),
+            sticky: false
         }
         .is_empty());
         assert!(!Selection {
             anchor: (1, 1),
-            end: (1, 2)
+            end: (1, 2),
+            sticky: false
         }
         .is_empty());
+    }
+
+    #[test]
+    fn word_bounds_selects_enclosing_word() {
+        let line = Line::from("run cargo test --all-targets");
+        // Click inside "cargo" → whole word.
+        assert_eq!(word_bounds(&line, 5), Some((4, 9)));
+        assert_eq!(word_bounds(&line, 4), Some((4, 9)));
+        assert_eq!(word_bounds(&line, 8), Some((4, 9)));
+        // Word at line start/end ("--all-targets" spans 15..28).
+        assert_eq!(word_bounds(&line, 1), Some((0, 3)));
+        assert_eq!(word_bounds(&line, 27), Some((15, 28)));
+        // Whitespace click or past end → no selection.
+        assert_eq!(word_bounds(&line, 3), None);
+        assert_eq!(word_bounds(&line, 28), None);
+        // Spans are joined before scanning.
+        let spans = Line::from(vec![Span::from("run "), Span::from("cargo")]);
+        assert_eq!(word_bounds(&spans, 6), Some((4, 9)));
     }
 
     #[test]
