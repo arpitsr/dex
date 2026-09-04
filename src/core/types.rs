@@ -341,6 +341,8 @@ pub(crate) enum StopReason {
     Length,
     /// Stopped to execute tool calls.
     ToolUse,
+    /// Cut off by a provider-side content filter — the reply is partial.
+    ContentFilter,
 }
 
 /// Chat-completions wire shape for usage. Cache detail nests under

@@ -208,6 +208,10 @@ fn run_sse<P: StreamParser>(
         for event in parser.feed(&line) {
             match event {
                 StreamEvent::Thinking(thought) => {
+                    // Reasoning counts as flowed output: it renders live on the
+                    // transcript, so a retry after a drop here would duplicate
+                    // it, even though reasoning is never persisted to the
+                    // session journal. Deliberate — don't narrow this to Text.
                     output_flowed = true;
                     if let Some(sink) = &sink {
                         sink.send(SinkLine::Thinking(thought)).ok();
@@ -293,6 +297,7 @@ fn stop_reason_from_finish(finish: &str) -> Option<StopReason> {
         "stop" => Some(StopReason::Stop),
         "length" => Some(StopReason::Length),
         "tool_calls" | "function_call" => Some(StopReason::ToolUse),
+        "content_filter" => Some(StopReason::ContentFilter),
         // Unrecognized provider reason — leave unset rather than guess.
         _ => None,
     }
@@ -397,13 +402,21 @@ impl ResponsesParser {
                 }));
             }
         }
-        let truncated = response.pointer("/incomplete_details/reason")
-            == Some(&Value::String("max_output_tokens".to_string()));
-        events.push(StreamEvent::Stop(if truncated {
-            StopReason::Length
-        } else {
-            StopReason::Stop
-        }));
+        // `response.completed` (no incomplete details) is a clean stop;
+        // `response.incomplete` reports why the reply was cut off. An
+        // unrecognized reason stays unset rather than claiming a clean stop.
+        let stop = match response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("max_output_tokens") => Some(StopReason::Length),
+            Some("content_filter") => Some(StopReason::ContentFilter),
+            Some(_) => None,
+            None => Some(StopReason::Stop),
+        };
+        if let Some(stop) = stop {
+            events.push(StreamEvent::Stop(stop));
+        }
     }
 }
 
@@ -762,6 +775,7 @@ mod tests {
             ("length", StopReason::Length),
             ("tool_calls", StopReason::ToolUse),
             ("function_call", StopReason::ToolUse),
+            ("content_filter", StopReason::ContentFilter),
         ] {
             let (tx, _rx) = mpsc::channel();
             let resp = sse_response(&[
@@ -776,7 +790,7 @@ mod tests {
         // Unrecognized reasons stay unset instead of being guessed.
         let (tx, _rx) = mpsc::channel();
         let resp = sse_response(&[
-            r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"junk"}]}"#,
             "data: [DONE]",
         ]);
         let turn = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
@@ -857,7 +871,8 @@ mod tests {
     }
 
     /// `response.completed` normalizes to a clean stop; `response.incomplete`
-    /// with `max_output_tokens` normalizes to Length (truncated output).
+    /// normalizes by reason (max_output_tokens → Length, content_filter →
+    /// ContentFilter); an unrecognized reason stays unset.
     #[test]
     fn responses_stream_maps_terminal_events_to_stop_reasons() {
         let (tx, _rx) = mpsc::channel();
@@ -884,6 +899,24 @@ mod tests {
         ]);
         let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(turn.stop_reason, Some(StopReason::Stop));
+
+        // Incomplete for a content filter is a partial reply too.
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+            "data: [DONE]",
+        ]);
+        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(turn.stop_reason, Some(StopReason::ContentFilter));
+
+        // An unrecognized incomplete reason must not claim a clean stop.
+        let (tx, _rx) = mpsc::channel();
+        let resp = sse_response(&[
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"junk"}}}"#,
+            "data: [DONE]",
+        ]);
+        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(turn.stop_reason, None);
     }
 
     /// The mid-stream marker applies only once output has flowed; before

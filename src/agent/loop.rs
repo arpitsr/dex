@@ -238,17 +238,23 @@ pub(crate) fn process_turn(
             last_usage = Some(u.prompt_tokens);
             record_usage(config, state, console, u);
         }
-        // The provider cut the reply off at the output-token limit: whatever
-        // landed is likely mid-sentence. Say so instead of silently keeping
-        // a truncated reply as if it were complete.
-        if turn.stop_reason == Some(StopReason::Length) {
-            let note = "model output hit the output-token limit and may be truncated";
-            match console.sink() {
-                Some(sink) => {
-                    sink.send(SinkLine::System(note.to_string())).ok();
-                }
-                None => with_console(false, || eprintln!("[dex] {note}")),
+        // The provider cut the reply off mid-generation (output-token limit
+        // or a content filter): whatever landed is likely incomplete. Say so
+        // instead of silently keeping a truncated reply as if it were complete.
+        let emit_note = |note: &str| match console.sink() {
+            Some(sink) => {
+                sink.send(SinkLine::System(note.to_string())).ok();
             }
+            None => with_console(false, || eprintln!("[dex] {note}")),
+        };
+        match turn.stop_reason {
+            Some(StopReason::Length) => {
+                emit_note("model output hit the output-token limit and may be truncated");
+            }
+            Some(StopReason::ContentFilter) => {
+                emit_note("model output was cut off by a content filter and may be incomplete");
+            }
+            _ => {}
         }
         let message = turn.message;
 
