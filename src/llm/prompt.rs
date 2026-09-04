@@ -1,15 +1,19 @@
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 
-use crate::core::types::*;
-use crate::skills::*;
+use crate::core::types::Skill;
+use crate::skills::format_skills_for_prompt;
 
-pub(crate) fn project_context() -> Option<String> {
+/// Nearest project file walking up from the cwd (`AGENTS.md` wins, else
+/// `CLAUDE.md`), returned as a path so callers can stat before reading.
+fn project_file() -> Option<PathBuf> {
     let mut dir = env::current_dir().ok()?;
     loop {
         for name in ["AGENTS.md", "CLAUDE.md"] {
-            if let Ok(content) = fs::read_to_string(dir.join(name)) {
-                return Some(content);
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
         if !dir.pop() {
@@ -17,6 +21,11 @@ pub(crate) fn project_context() -> Option<String> {
         }
     }
     None
+}
+
+pub(crate) fn project_context() -> Option<String> {
+    let path = project_file()?;
+    fs::read_to_string(path).ok()
 }
 
 /// Base system prompt, pi-style: identity plus imperative working rules.

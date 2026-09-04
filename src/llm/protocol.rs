@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-use crate::core::types::*;
+use crate::core::types::{
+    ChatMessage, FunctionCall, FunctionDef, LlmToolCall, StreamToolCall, ToolDefinition,
+};
 
 pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) {
     while calls.len() <= delta.index {
@@ -288,7 +290,12 @@ pub(crate) fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Va
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        merge_chat_tool_call, response_call_index, response_tool_call, responses_input,
+        tools_schema, ChatMessage, FunctionCall, LlmToolCall, StreamToolCall,
+    };
+    use crate::core::types::StreamFunctionCall;
+    use serde_json::json;
 
     #[test]
     fn merge_chat_tool_call_assembles_fragmented_deltas() {

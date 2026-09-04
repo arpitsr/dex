@@ -3,15 +3,21 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::agent::compaction::*;
-use crate::agent::state::*;
-use crate::core::console::*;
-use crate::core::format::*;
-use crate::core::types::*;
-use crate::llm::client::*;
-use crate::llm::config::*;
-use crate::session::*;
-use crate::tools::*;
+use crate::agent::compaction::{compact_history, effective_tokens, KEEP_RECENT_MESSAGES};
+use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
+use crate::core::console::{
+    with_console, Console, SpinnerGuard, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK,
+    TOOL_OUTPUT_COLOR,
+};
+use crate::core::format::{
+    model_tool_result, short_arg, terminal_preview, tool_preview, tool_preview_body,
+    tool_result_summary,
+};
+use crate::core::types::{ChatMessage, LlmToolCall, SinkLine, Usage};
+use crate::llm::client::ModelClient;
+use crate::llm::config::LlmConfig;
+use crate::session::Session;
+use crate::tools::{execute_outcome, ToolOutcome};
 
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
     let mut paths = std::collections::HashSet::new();
@@ -224,10 +230,11 @@ pub(crate) fn process_turn(
             }
         }
 
-        let effective_messages: Vec<ChatMessage> = messages.clone();
-
+        // Single clone for the provider worker thread happens inside
+        // `call_client_cancellable`; no snapshot clone here (messages is
+        // not mutated concurrently during the LLM call).
         let (message, usage) =
-            match call_client_cancellable(client, cancel, &effective_messages, true, console) {
+            match call_client_cancellable(client, cancel, messages, true, console) {
                 Ok(result) => result,
                 Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
                     return Err("cancelled by user".into());
@@ -292,13 +299,15 @@ pub(crate) fn process_turn(
                     .collect()
             };
 
+            // Hoisted: one getcwd per iteration, not per tool result.
+            let turn_cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
             for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
                 let cache_key = format!(
                     "{}:{}:{}{}",
-                    std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
+                    turn_cwd,
                     name,
                     input,
                     cache_fingerprint(&name, &input)
@@ -366,21 +375,7 @@ pub(crate) fn process_turn(
                         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "chain"
                     );
                     let skip_first = !counts_only || !ok;
-                    // Every tool renders the same transcript shape: outcome
-                    // line, then a capped snippet with a `… +N more` tail.
-                    // write/edit show the review-oriented unified diff and
-                    // read its numbered snippet; other tools share the
-                    // generic informational preview. Failures fall back to
-                    // the error text so the cause stays visible.
-                    let preview = match diff.as_deref() {
-                        Some(diff) if matches!(name.as_str(), "write" | "edit") && ok => {
-                            diff_preview_lines(diff, 30)
-                        }
-                        _ if name == "read" && ok => {
-                            read_preview_lines(&result, TRANSCRIPT_PREVIEW_LINES)
-                        }
-                        _ => tool_result_preview(&result, TRANSCRIPT_PREVIEW_LINES, skip_first),
-                    };
+                    let preview = tool_preview(&name, ok, diff.as_deref(), &result, skip_first);
                     let _ = sink.send(SinkLine::ToolOutput {
                         name: name.clone(),
                         summary,
@@ -390,14 +385,7 @@ pub(crate) fn process_turn(
                     });
                 } else {
                     with_console(console.sink().is_some(), || {
-                        // Headless one-shot path: same GitHub-style snippet
-                        // the TUI shows, not just the "edited …" line.
-                        let body = match diff.as_deref() {
-                            Some(d) if matches!(name.as_str(), "write" | "edit") && ok => {
-                                terminal_preview(d)
-                            }
-                            _ => terminal_preview(&result),
-                        };
+                        let body = tool_preview_body(&name, ok, diff.as_deref(), &result);
                         eprintln!(
                             "{}[tool output] {}:\n{}{}",
                             TOOL_OUTPUT_COLOR, name, body, RESET

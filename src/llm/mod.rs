@@ -7,5 +7,3 @@ pub(crate) mod protocol;
 pub(crate) mod responses;
 pub(crate) mod stream;
 pub(crate) mod streaming;
-
-pub(crate) use client::*;

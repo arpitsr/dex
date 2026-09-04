@@ -400,7 +400,7 @@ async fn chat(
         followup_rx_opt = Some(followup_rx);
     }
 
-    let (tx, mut rx) = mpsc::channel::<StreamEnvelope>(256);
+    let (tx, rx) = mpsc::channel::<StreamEnvelope>(256);
 
     if let Some(env) = replay_envelope {
         // Replay: emit the recorded terminal envelope, then close.
@@ -1701,7 +1701,8 @@ mod handler_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let data_dir = std::env::temp_dir().join(format!("dex-srv-create-{}", std::process::id()));
-        let prev = std::env::var_os("XDG_DATA_HOME");
+        let _env =
+            crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
 
         let state = Arc::new(DaemonState::new());
@@ -1730,10 +1731,6 @@ mod handler_tests {
             .any(|s| s["session_id"].as_str() == Some(id.as_str())));
 
         // cleanup: the created session file lives under data_dir
-        match prev {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
@@ -1754,7 +1751,18 @@ mod permission_gate_tests {
 
         // Hermetic session storage.
         let data_dir = std::env::temp_dir().join(format!("dex-perm-{}", std::process::id()));
-        let prev_data = std::env::var_os("XDG_DATA_HOME");
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_DATA_HOME",
+            "DEX_PERMISSION",
+            "DEX_PROVIDER",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_API",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        let _env = crate::session::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
 
         let session = Session::new("/tmp/dex-perm-cwd".into(), None).unwrap();
@@ -1787,6 +1795,7 @@ mod permission_gate_tests {
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
+        let _env2 = crate::session::EnvGuard(saved);
         std::env::set_var("DEX_PERMISSION", "read-only");
         std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENAI_API_KEY", "test-key");
@@ -1857,16 +1866,6 @@ mod permission_gate_tests {
         .unwrap_err();
         assert!(err.contains("invalid plan JSON"), "got: {err}");
 
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-        match prev_data {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("trace.jsonl"));
@@ -1942,6 +1941,7 @@ mod e2e_tests {
         let data_dir = std::env::temp_dir().join(format!("dex-e2e-{}", std::process::id()));
         let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
             "XDG_DATA_HOME",
+            "DEX_CONFIG",
             "DEX_PERMISSION",
             "DEX_PROVIDER",
             "OPENAI_API_KEY",
@@ -1957,7 +1957,11 @@ mod e2e_tests {
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
+        let _env = crate::session::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
+        // No real user config may leak in: a machine's config.yaml can pin a
+        // provider-prefixed model that re-routes base_url away from the mock.
+        std::env::set_var("DEX_CONFIG", data_dir.join("absent-config.yaml"));
         std::env::set_var("DEX_PERMISSION", "ask-writes");
         std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENAI_API_KEY", "test-key");
@@ -2042,12 +2046,6 @@ mod e2e_tests {
         // The model was called twice: tool call, then final answer.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file("evil.txt");
     }
