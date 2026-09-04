@@ -27,10 +27,10 @@ use crate::session::Session;
 
 use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
 use super::{
-    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, mouse_display_cell,
-    push_banner, push_info, push_info_line, render_user_prompt, resolve_approval,
-    scroll_transcript, selection_text, view, word_bounds, App, EnableMouseScroll, PendingApproval,
-    Selection, TerminalCleanup,
+    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, line_selection_text,
+    line_width, mouse_display_cell, push_banner, push_info, push_info_line, render_user_prompt,
+    resolve_approval, scroll_transcript, selection_text, view, word_bounds, App, EnableMouseScroll,
+    PendingApproval, Selection, TerminalCleanup,
 };
 
 /// Messages flowing from the per-turn worker thread into the UI loop.
@@ -56,8 +56,9 @@ struct RemoteApp {
     /// Shared with the active worker so approvals arriving after a cancel
     /// request are denied instead of parking the turn on the overlay.
     cancel_flag: Arc<AtomicBool>,
-    /// Last left press (time + transcript cell) for double-click detection.
-    last_click: Option<(Instant, (usize, usize))>,
+    /// Last left press (time, transcript cell, consecutive-click count) for
+    /// double-/triple-click detection; the count caps at 3.
+    last_click: Option<(Instant, (usize, usize), u8)>,
 }
 
 /// Build a display-only config from the daemon's reported runtime info. The
@@ -427,15 +428,16 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
 }
 
 /// Window between two left presses on the same transcript cell that counts
-/// as a double-click (word select).
-const DOUBLE_CLICK: Duration = Duration::from_millis(500);
+/// as a repeated click (double = word select, triple = line select).
+const MULTI_CLICK: Duration = Duration::from_millis(500);
 
 /// Mouse routing: wheel scrolls the transcript; left press/drag/release
 /// selects transcript text with a visible highlight and copies it to the
 /// system clipboard (OSC 52) on release. A click clears; Shift+drag still
-/// bypasses mouse reporting for native selection. A double-click (second
-/// press on the same cell within `DOUBLE_CLICK`) selects the word under it
-/// and keeps the highlight until the next click.
+/// bypasses mouse reporting for native selection. Repeated presses on the
+/// same cell within `MULTI_CLICK` select more: double-click the word under
+/// it, triple-click the whole line (and dragging a line select extends it
+/// by whole rows). Both keep the highlight until the next click.
 fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
     match m.kind {
         MouseEventKind::ScrollUp => scroll_transcript(&mut remote.app, -3),
@@ -449,26 +451,35 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                 remote.app.display_cache.len(),
                 &m,
             );
-            let double_click = match (remote.last_click, cell) {
-                (Some((at, last)), Some(c)) => at.elapsed() <= DOUBLE_CLICK && last == c,
-                _ => false,
+            let clicks = match (remote.last_click, cell) {
+                (Some((at, last, n)), Some(c)) if at.elapsed() <= MULTI_CLICK && last == c => {
+                    (n + 1).min(3)
+                }
+                _ => 1,
             };
             remote.app.selection = match cell {
-                Some((row, col)) if double_click => {
-                    word_bounds(&remote.app.display_cache[row], col).map(|(c0, c1)| Selection {
+                Some((row, col)) if clicks == 2 => word_bounds(&remote.app.display_cache[row], col)
+                    .map(|(c0, c1)| Selection {
                         anchor: (row, c0),
                         end: (row, c1),
                         sticky: true,
-                    })
-                }
+                        whole_line: false,
+                    }),
+                Some((row, _)) if clicks == 3 => Some(Selection {
+                    anchor: (row, 0),
+                    end: (row, line_width(&remote.app.display_cache[row])),
+                    sticky: true,
+                    whole_line: true,
+                }),
                 Some(cell) => Some(Selection {
                     anchor: cell,
                     end: cell,
                     sticky: false,
+                    whole_line: false,
                 }),
                 None => None,
             };
-            remote.last_click = cell.map(|c| (Instant::now(), c));
+            remote.last_click = cell.map(|c| (Instant::now(), c, clicks));
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(sel) = remote.app.selection.as_mut() {
@@ -478,18 +489,31 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                     remote.app.display_cache.len(),
                     &m,
                 ) {
-                    sel.end = cell;
+                    if sel.whole_line {
+                        // Line selects extend by whole rows; the anchor row
+                        // (the press point) stays put, xterm-style.
+                        sel.end = (cell.0, line_width(&remote.app.display_cache[cell.0]));
+                    } else {
+                        sel.end = cell;
+                    }
                 }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            // Sticky selections (double-click word picks) stay highlighted
-            // after release until the next press; drag selections clear.
+            // Sticky selections (double-click word picks, triple-click line
+            // picks) stay highlighted after release until the next press;
+            // drag selections clear.
             let sticky = remote.app.selection.is_some_and(|s| s.sticky);
             if let Some(sel) = remote.app.selection {
                 if !sel.is_empty() {
-                    let ((r0, c0), (r1, c1)) = sel.norm();
-                    let text = selection_text(&remote.app.display_cache, (r0, c0), (r1, c1));
+                    let text = if sel.whole_line {
+                        let r0 = sel.anchor.0.min(sel.end.0);
+                        let r1 = sel.anchor.0.max(sel.end.0);
+                        line_selection_text(&remote.app.display_cache, r0, r1)
+                    } else {
+                        let ((r0, c0), (r1, c1)) = sel.norm();
+                        selection_text(&remote.app.display_cache, (r0, c0), (r1, c1))
+                    };
                     remote.app.copy_selection(&text);
                 }
             }
@@ -1246,7 +1270,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "mouse: drag or double-click to select and copy · wheel scrolls".to_string(),
+                "mouse: drag, double/triple-click to select and copy · wheel scrolls".to_string(),
             );
             push_info(
                 &mut remote.app,

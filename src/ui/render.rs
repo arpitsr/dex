@@ -488,7 +488,8 @@ const SEL_BG: Color = Color::Indexed(24);
 
 /// Paint the mouse selection onto the visible window rows. Fully covered
 /// rows become a solid bar (style patch + padding to the area width); the
-/// anchor/end rows highlight only the selected cell range.
+/// anchor/end rows highlight only the selected cell range. Whole-line
+/// (triple-click) selections paint every covered row as a solid bar.
 fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, width: u16) {
     let ((r0, c0), (r1, c1)) = sel.norm();
     let hl = Style::default().bg(SEL_BG);
@@ -497,7 +498,9 @@ fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, 
         if row < r0 || row > r1 {
             continue;
         }
-        if row > r0 && row < r1 {
+        let inner = row > r0 && row < r1;
+        let line_sel = sel.whole_line && row >= r0 && row <= r1;
+        if inner || line_sel {
             line.style = line.style.patch(hl);
             pad_row(line, width, hl);
             continue;
