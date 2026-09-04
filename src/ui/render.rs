@@ -13,7 +13,9 @@ use super::slash;
 use super::status::{footer_line, truncate_display};
 use super::wrapping::wrap_line;
 use super::TAB_WIDTH;
-use super::{theme, transcript_indent, App, InputField, WrappedBlock, TRANSCRIPT_INDENT};
+use super::{
+    theme, transcript_indent, App, InputField, Selection, WrappedBlock, TRANSCRIPT_INDENT,
+};
 
 pub(super) fn surface_padding() -> Padding {
     Padding {
@@ -371,6 +373,9 @@ fn wrap_block(
 
 impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+        // Remember where the transcript lives so mouse events can be
+        // translated into display rows between frames.
+        app.transcript_area = Some(area);
         // Clear the transcript area first: without this a shorter frame (e.g. after
         // a long wrapped line scrolls out, or after a resize that re-wraps to fewer
         // rows) would leave trailing cells from the previous Paragraph. The top-level
@@ -394,6 +399,9 @@ impl TranscriptView {
         // (reset/resume) drops stale entries; appended blocks start unwrapped.
         if app.wrapped_cache.len() > app.transcript.len() {
             app.wrapped_cache.truncate(app.transcript.len());
+            // Selection rows refer to the old cache; drop them rather than
+            // highlight or copy rows that no longer exist.
+            app.selection = None;
             changed = true;
         }
         while app.wrapped_cache.len() < app.transcript.len() {
@@ -461,15 +469,90 @@ impl TranscriptView {
         // exactly that, so Wrap rendered dark holes inside the box.
         // ponytail: clone only the visible window; a full-transcript clone
         // per frame was the remaining O(N) term once wrapping was cached.
-        let window: Vec<Line<'static>> = app
+        let mut window: Vec<Line<'static>> = app
             .display_cache
             .iter()
             .skip(app.scroll as usize)
             .take(visible)
             .cloned()
             .collect();
+        if let Some(sel) = app.selection {
+            apply_selection(&mut window, app.scroll as usize, sel, area.width);
+        }
         let transcript = Paragraph::new(window).style(Style::default().fg(Color::Gray));
         f.render_widget(transcript, area);
+    }
+}
+
+const SEL_BG: Color = Color::Indexed(24);
+
+/// Paint the mouse selection onto the visible window rows. Fully covered
+/// rows become a solid bar (style patch + padding to the area width); the
+/// anchor/end rows highlight only the selected cell range.
+fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, width: u16) {
+    let ((r0, c0), (r1, c1)) = sel.norm();
+    let hl = Style::default().bg(SEL_BG);
+    for (i, line) in window.iter_mut().enumerate() {
+        let row = scroll + i;
+        if row < r0 || row > r1 {
+            continue;
+        }
+        if row > r0 && row < r1 {
+            line.style = line.style.patch(hl);
+            pad_row(line, width, hl);
+            continue;
+        }
+        let (from, to) = if row == r0 && row == r1 {
+            (c0, c1)
+        } else if row == r0 {
+            (c0, usize::MAX)
+        } else {
+            (0, c1)
+        };
+        style_row_range(line, from, to, hl);
+        if to == usize::MAX || to >= line.width() {
+            line.style = line.style.patch(hl);
+            pad_row(line, width, hl);
+        }
+    }
+}
+
+/// Highlight cell range `[from, to)` of a row, splitting spans as needed.
+fn style_row_range(line: &mut Line<'static>, from: usize, to: usize, hl: Style) {
+    if from >= to || line.spans.is_empty() {
+        return;
+    }
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
+    let mut pos = 0usize;
+    for span in std::mem::take(&mut line.spans) {
+        let graphemes: Vec<(String, Style)> = span
+            .styled_graphemes(Style::default())
+            .map(|g| (g.symbol.to_string(), g.style))
+            .collect();
+        let start = pos;
+        pos += graphemes.len();
+        if pos <= from || start >= to {
+            out.push(span);
+            continue;
+        }
+        for (i, (symbol, style)) in graphemes.into_iter().enumerate() {
+            if start + i >= from && start + i < to {
+                out.push(Span::styled(symbol, style.patch(hl)));
+            } else {
+                out.push(Span::styled(symbol, style));
+            }
+        }
+    }
+    line.spans = out;
+}
+
+/// Pad a row with highlighted spaces so a fully covered row reads as a solid
+/// selection bar out to the right edge.
+fn pad_row(line: &mut Line<'static>, width: u16, hl: Style) {
+    let w = width as usize;
+    let line_w = line.width();
+    if line_w < w {
+        line.spans.push(Span::styled(" ".repeat(w - line_w), hl));
     }
 }
 
@@ -1300,6 +1383,9 @@ mod tests {
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
             display_cache: Vec::new(),
+            transcript_area: None,
+            selection: None,
+            notice: None,
         }
     }
 
