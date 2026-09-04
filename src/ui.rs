@@ -374,11 +374,17 @@ pub(crate) const NOTICE_LIFETIME: Duration = Duration::from_secs(2);
 
 /// Mouse drag selection over the transcript, in `display_cache` (row, col)
 /// cell space. `anchor`/`end` are the raw press/release points; `norm()`
-/// orders them for highlight and copy.
+/// orders them for highlight and copy. `sticky` selections (double-click
+/// word picks, triple-click line picks) survive mouse-up so the highlight
+/// stays visible until the next click. `whole_line` selections cover full
+/// rows: `anchor` is the press point and `end` (moved by dragging) only
+/// contributes its row — copy and highlight take every row between them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Selection {
     pub(crate) anchor: (usize, usize),
     pub(crate) end: (usize, usize),
+    pub(crate) sticky: bool,
+    pub(crate) whole_line: bool,
 }
 
 impl Selection {
@@ -395,6 +401,31 @@ impl Selection {
     pub(crate) fn is_empty(&self) -> bool {
         self.anchor == self.end
     }
+}
+
+/// Expand a click at char index `col` on a display line to the enclosing
+/// word: the maximal run of non-whitespace chars. `None` past the line's
+/// text or when the click lands on whitespace.
+pub(crate) fn word_bounds(line: &Line<'static>, col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// Char count of a display line: the extent a whole-line (triple-click)
+/// selection covers on that row.
+pub(crate) fn line_width(line: &Line<'static>) -> usize {
+    line.spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
 /// OSC 52 clipboard set: `ESC ] 52 ; c ; <base64> ST`. Honored by xterm,
@@ -496,6 +527,22 @@ pub(crate) fn selection_text(
         out.push(text(l).chars().take(c1).collect());
     }
     out.join("\n")
+}
+
+/// Copy text for whole-line (triple-click) selections: every row from
+/// `r0..=r1` in full, joined by newlines — no column clipping, so all
+/// covered lines are copied whole regardless of length.
+pub(crate) fn line_selection_text(rows: &[Line<'static>], r0: usize, r1: usize) -> String {
+    (r0..=r1.min(rows.len().saturating_sub(1)))
+        .filter_map(|r| rows.get(r))
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn transcript_indent() -> String {
@@ -997,23 +1044,79 @@ mod tests {
         let s = Selection {
             anchor: (5, 2),
             end: (3, 7),
+            sticky: false,
+            whole_line: false,
         };
         assert_eq!(s.norm(), ((3, 7), (5, 2)));
         let s = Selection {
             anchor: (2, 9),
             end: (2, 1),
+            sticky: false,
+            whole_line: false,
         };
         assert_eq!(s.norm(), ((2, 1), (2, 9)));
         assert!(Selection {
             anchor: (1, 1),
-            end: (1, 1)
+            end: (1, 1),
+            sticky: false,
+            whole_line: false,
         }
         .is_empty());
         assert!(!Selection {
             anchor: (1, 1),
-            end: (1, 2)
+            end: (1, 2),
+            sticky: false,
+            whole_line: false,
         }
         .is_empty());
+        // Whole-line selects order by row; cols carry no meaning downstream.
+        let s = Selection {
+            anchor: (5, 0),
+            end: (2, 4),
+            sticky: true,
+            whole_line: true,
+        };
+        assert_eq!(s.norm(), ((2, 4), (5, 0)));
+    }
+
+    #[test]
+    fn line_width_counts_chars_across_spans() {
+        let spans = Line::from(vec![Span::from("run "), Span::from("cargo")]);
+        assert_eq!(line_width(&spans), 9);
+        assert_eq!(line_width(&Line::default()), 0);
+    }
+
+    #[test]
+    fn line_selection_text_takes_full_rows() {
+        let rows = vec![
+            Line::from("alpha"),
+            Line::default(),
+            Line::from(Span::styled("gamma!", Style::default().fg(Color::Cyan))),
+        ];
+        // Every covered row in full, blank row included.
+        assert_eq!(line_selection_text(&rows, 0, 2), "alpha\n\ngamma!");
+        // Single row.
+        assert_eq!(line_selection_text(&rows, 1, 1), "");
+        // End past the cache is clamped.
+        assert_eq!(line_selection_text(&rows, 2, 9), "gamma!");
+    }
+
+    #[test]
+    fn word_bounds_selects_enclosing_word() {
+        let line = Line::from("run cargo test --all-targets");
+        // Click inside "cargo" → whole word.
+        assert_eq!(word_bounds(&line, 5), Some((4, 9)));
+        assert_eq!(word_bounds(&line, 4), Some((4, 9)));
+        assert_eq!(word_bounds(&line, 8), Some((4, 9)));
+        // Word at line start/end ("--all-targets" spans 15..28).
+        assert_eq!(word_bounds(&line, 1), Some((0, 3)));
+        assert_eq!(word_bounds(&line, 27), Some((15, 28)));
+        // Whitespace click or past end → no selection.
+        assert_eq!(word_bounds(&line, 3), None);
+        assert_eq!(word_bounds(&line, 28), None);
+        // Spans are joined before scanning.
+        let spans = Line::from(vec![Span::from("run "), Span::from("cargo")]);
+        assert_eq!(word_bounds(&spans, 6), Some((4, 9)));
     }
 
     #[test]
