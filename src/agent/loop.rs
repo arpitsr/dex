@@ -13,9 +13,10 @@ use crate::core::format::{
     model_tool_result, short_arg, terminal_preview, tool_preview, tool_preview_body,
     tool_result_summary,
 };
-use crate::core::types::{ChatMessage, LlmToolCall, SinkLine, Usage};
+use crate::core::types::{ChatMessage, LlmToolCall, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
+use crate::llm::stream::Turn;
 use crate::session::Session;
 use crate::tools::{execute_outcome, ToolOutcome};
 
@@ -83,7 +84,7 @@ fn call_client_cancellable(
     messages: &[ChatMessage],
     with_tools: bool,
     console: &Console,
-) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+) -> Result<Turn, Box<dyn std::error::Error>> {
     let client = (*client).clone();
     let messages = messages.to_vec();
     let sink = console.sink().cloned();
@@ -185,14 +186,7 @@ pub(crate) fn process_turn(
                 if let Some(accepted) = &steering_accepted_tx {
                     let _ = accepted.send(steering.clone());
                 }
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(steering),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: Some("steering".to_string()),
-                    ..Default::default()
-                });
+                messages.push(ChatMessage::user_named(steering, "steering"));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
         }
@@ -233,22 +227,40 @@ pub(crate) fn process_turn(
         // Single clone for the provider worker thread happens inside
         // `call_client_cancellable`; no snapshot clone here (messages is
         // not mutated concurrently during the LLM call).
-        let (message, usage) =
-            match call_client_cancellable(client, cancel, messages, true, console) {
-                Ok(result) => result,
-                Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
-                    return Err("cancelled by user".into());
-                }
-                Err(e) => return Err(e),
-            };
-        if let Some(u) = usage {
+        let turn = match call_client_cancellable(client, cancel, messages, true, console) {
+            Ok(result) => result,
+            Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
+                return Err("cancelled by user".into());
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(u) = turn.usage {
             last_usage = Some(u.prompt_tokens);
             record_usage(config, state, console, u);
         }
+        // The provider cut the reply off mid-generation (output-token limit
+        // or a content filter): whatever landed is likely incomplete. Say so
+        // instead of silently keeping a truncated reply as if it were complete.
+        let emit_note = |note: &str| match console.sink() {
+            Some(sink) => {
+                sink.send(SinkLine::System(note.to_string())).ok();
+            }
+            None => with_console(false, || eprintln!("[dex] {note}")),
+        };
+        match turn.stop_reason {
+            Some(StopReason::Length) => {
+                emit_note("model output hit the output-token limit and may be truncated");
+            }
+            Some(StopReason::ContentFilter) => {
+                emit_note("model output was cut off by a content filter and may be incomplete");
+            }
+            _ => {}
+        }
+        let message = turn.message;
 
         if let Some(calls) = message.tool_calls.clone() {
             messages.push(ChatMessage {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: message.content,
                 tool_calls: Some(calls.clone()),
                 tool_call_id: None,
@@ -392,21 +404,17 @@ pub(crate) fn process_turn(
                         );
                     });
                 }
-                messages.push(ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(model_tool_result(&result)),
-                    tool_calls: None,
-                    tool_call_id: Some(call.id.clone()),
-                    name: None,
-                    ..Default::default()
-                });
+                messages.push(ChatMessage::tool_result(
+                    call.id.clone(),
+                    model_tool_result(&result),
+                ));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
             state.save();
         } else {
             let text = message.content.unwrap_or_default();
             messages.push(ChatMessage {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: Some(text.clone()),
                 tool_calls: None,
                 tool_call_id: None,
@@ -421,14 +429,7 @@ pub(crate) fn process_turn(
                         if let Some(accepted) = &steering_accepted_tx {
                             let _ = accepted.send(content.clone());
                         }
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: Some(content),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: Some("steering".to_string()),
-                            ..Default::default()
-                        });
+                        messages.push(ChatMessage::user_named(content, "steering"));
                     }
                     state.last_usage = last_usage;
                     continue;
@@ -459,22 +460,16 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
-            Ok((
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: Some("hello from mock".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    ..Default::default()
-                },
-                Some(Usage {
+        ) -> Result<Turn, Box<dyn std::error::Error>> {
+            Ok(Turn {
+                message: ChatMessage::assistant("hello from mock"),
+                usage: Some(Usage {
                     prompt_tokens: 1,
                     completion_tokens: 0,
                     cached_tokens: None,
                 }),
-            ))
+                stop_reason: None,
+            })
         }
     }
 
@@ -513,14 +508,7 @@ mod tests {
     #[test]
     fn process_turn_completes_with_injected_client() {
         let config = test_config();
-        let mut messages = vec![ChatMessage {
-            role: "system".into(),
-            content: Some("sys".into()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        }];
+        let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
         let result = process_turn(
             &config,
@@ -560,56 +548,39 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+        ) -> Result<Turn, Box<dyn std::error::Error>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let message = if round == 0 {
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: None,
-                    tool_calls: Some(vec![crate::core::types::LlmToolCall {
+                ChatMessage::assistant_calls(
+                    None,
+                    vec![crate::core::types::LlmToolCall {
                         id: "call-1".into(),
                         call_type: "function".into(),
                         function: crate::core::types::FunctionCall {
                             name: "bash".into(),
                             arguments: r#"{"command":"echo line-one; echo line-two; echo line-three; echo line-four"}"#.into(),
                         },
-                    }]),
-                    tool_call_id: None,
-                    name: None,
-                                    ..Default::default()
-                }
+                    }],
+                )
             } else {
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: Some("done".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    ..Default::default()
-                }
+                ChatMessage::assistant("done")
             };
-            Ok((
+            Ok(Turn {
                 message,
-                Some(Usage {
+                usage: Some(Usage {
                     prompt_tokens: 1,
                     completion_tokens: 0,
                     cached_tokens: None,
                 }),
-            ))
+                stop_reason: None,
+            })
         }
     }
 
     #[test]
     fn tool_result_streams_summary_preview_and_success() {
         let config = test_config();
-        let mut messages = vec![ChatMessage {
-            role: "system".into(),
-            content: Some("sys".into()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        }];
+        let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
         let (sink_tx, sink_rx) = mpsc::channel();
         let (approval_tx, _approval_rx) = mpsc::channel();

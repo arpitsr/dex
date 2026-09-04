@@ -9,31 +9,10 @@ use std::time::Duration;
 
 use crate::agent::state::CancellationSource;
 use crate::core::console::with_console;
-use crate::core::types::{ChatMessage, ChatRequest, Provider, SinkLine, StreamOptions, Usage};
-use crate::llm::auth::load_codex_credentials;
+use crate::core::types::{ChatMessage, ChatRequest, SinkLine, StreamOptions};
 use crate::llm::config::LlmConfig;
 use crate::llm::protocol::{responses_input, responses_tools, tools_schema};
-use crate::llm::stream::{read_responses_stream, read_stream};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModelCapabilities {
-    pub streaming: bool,
-    pub tools: bool,
-    pub responses_api: bool,
-}
-
-pub(crate) fn discover_capabilities(config: &LlmConfig) -> ModelCapabilities {
-    // Static per-provider table — no runtime probing.
-    let (streaming, tools) = match config.provider {
-        crate::core::types::Provider::OpenCode => (true, true),
-        crate::core::types::Provider::OpenAiCodex => (true, true),
-    };
-    ModelCapabilities {
-        streaming,
-        tools,
-        responses_api: matches!(config.api, crate::core::types::ApiProtocol::Responses),
-    }
-}
+use crate::llm::stream::{read_responses_stream, read_stream, Turn};
 
 pub(crate) trait ModelClient {
     fn complete(
@@ -42,7 +21,7 @@ pub(crate) trait ModelClient {
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
         cancel: &dyn CancellationSource,
-    ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>>;
+    ) -> Result<Turn, Box<dyn std::error::Error>>;
 }
 
 impl ModelClient for LlmConfig {
@@ -52,8 +31,8 @@ impl ModelClient for LlmConfig {
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
         cancel: &dyn CancellationSource,
-    ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
-        call_llm(self, messages, with_tools, sink, cancel)
+    ) -> Result<Turn, Box<dyn std::error::Error>> {
+        crate::llm::streaming::complete(self, messages, with_tools, sink, cancel)
     }
 }
 
@@ -62,14 +41,11 @@ pub(crate) fn authenticated_request(
     config: &LlmConfig,
 ) -> reqwest::blocking::RequestBuilder {
     let request = request.bearer_auth(&config.api_key);
-    if config.provider == Provider::OpenAiCodex {
-        let request = request.header("originator", "codex_cli_rs");
-        if let Some(account_id) = &config.account_id {
-            return request.header("ChatGPT-Account-ID", account_id);
-        }
-        return request;
-    }
-    request
+    config
+        .provider
+        .auth_headers(config.account_id.as_deref())
+        .into_iter()
+        .fold(request, |req, (name, value)| req.header(name, value))
 }
 
 pub(crate) fn retryable_status(status: reqwest::StatusCode) -> bool {
@@ -132,10 +108,10 @@ fn post_with_retry(
             let status = resp.status();
             let body_text = resp.text()?;
             if status == reqwest::StatusCode::UNAUTHORIZED
-                && active_config.provider == Provider::OpenAiCodex
+                && active_config.provider.credentials_refreshable()
                 && attempt < MAX_RETRIES
             {
-                if let Ok((token, account)) = load_codex_credentials() {
+                if let Ok((token, account)) = active_config.provider.load_credentials(None) {
                     active_config.api_key = token;
                     active_config.account_id = account;
                     continue;
@@ -182,7 +158,7 @@ pub(crate) fn call_chat_completions(
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn CancellationSource,
-) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+) -> Result<Turn, Box<dyn std::error::Error>> {
     let req = ChatRequest {
         model: &config.model,
         messages,
@@ -212,7 +188,7 @@ pub(crate) fn call_responses(
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn CancellationSource,
-) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+) -> Result<Turn, Box<dyn std::error::Error>> {
     let (instructions, input) = responses_input(messages);
     let mut body = json!({
         "model": config.model,
@@ -239,30 +215,17 @@ pub(crate) fn call_responses(
         &body,
         sink.as_ref(),
     )?;
-    // Mark failures after streaming began (dropped connection, bad chunk) so
-    // the protocol-fallback gate won't re-run the turn on chat-completions
-    // and duplicate partially streamed output.
+    // Mid-stream failures (output already flowed) are marked by the stream
+    // driver itself, so the protocol-fallback gate won't re-run a turn whose
+    // partial text is already on the transcript — while a drop before the
+    // first delta stays retryable.
     read_responses_stream(resp, sink, cancel)
-        .map_err(|e| Box::new(crate::llm::streaming::MidStreamError(e.to_string())) as _)
-}
-
-pub(crate) fn call_llm(
-    config: &LlmConfig,
-    messages: &[ChatMessage],
-    with_tools: bool,
-    sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &dyn CancellationSource,
-) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
-    let capabilities = discover_capabilities(config);
-    if with_tools && !capabilities.tools {
-        return Err("configured model does not support tools".into());
-    }
-    crate::llm::streaming::complete(config, messages, with_tools, sink, cancel)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::Usage;
 
     struct MockModel;
 
@@ -273,33 +236,27 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
-            Ok((
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: Some("mock response".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    ..Default::default()
-                },
-                Some(Usage {
+        ) -> Result<Turn, Box<dyn std::error::Error>> {
+            Ok(Turn {
+                message: ChatMessage::assistant("mock response"),
+                usage: Some(Usage {
                     prompt_tokens: 3,
                     completion_tokens: 0,
                     cached_tokens: None,
                 }),
-            ))
+                stop_reason: None,
+            })
         }
     }
 
     #[test]
     fn model_boundary_supports_deterministic_mock() {
-        let (message, usage) = MockModel
+        let turn = MockModel
             .complete(&[], false, None, &crate::agent::state::GlobalCancellation)
             .unwrap();
-        assert_eq!(message.content.as_deref(), Some("mock response"));
+        assert_eq!(turn.message.content.as_deref(), Some("mock response"));
         assert_eq!(
-            usage,
+            turn.usage,
             Some(Usage {
                 prompt_tokens: 3,
                 completion_tokens: 0,

@@ -1,8 +1,9 @@
 //! Shared streaming boundary. The concrete SSE readers remain compatible with
 //! both provider protocols and are called through these typed entry points.
 
-use crate::core::types::{ApiProtocol, ChatMessage, Provider, SinkLine, Usage};
+use crate::core::types::{ApiProtocol, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
+use crate::llm::stream::Turn;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -17,25 +18,16 @@ fn probed_apis() -> &'static Mutex<HashMap<(String, String), ApiProtocol>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A failure raised *after* the provider began streaming the `/responses`
-/// reply (dropped SSE connection, malformed chunk, cancellation). Purely a
-/// type-level marker: `Display` passes the inner message through untouched
-/// so callers matching on `"cancelled"` etc. keep working.
-#[derive(Debug)]
-pub(crate) struct MidStreamError(pub String);
+/// Failure raised after output already streamed; defined in `stream.rs` (the
+/// stream driver knows when output actually flowed), re-exported here where
+/// the protocol-fallback gate consumes it.
+pub(crate) use crate::llm::stream::MidStreamError;
 
-impl std::fmt::Display for MidStreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for MidStreamError {}
-
-/// Only a pre-stream rejection (HTTP status, connect failure) qualifies for
-/// protocol fallback; a mid-stream failure may have already put partial text
-/// on the transcript, and a retried call would duplicate it.
-fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
+/// Only a failure with no streamed output (HTTP status, connect failure,
+/// drop before the first delta) qualifies for protocol fallback; a
+/// mid-stream failure may have already put partial text on the transcript,
+/// and a retried call would duplicate it.
+pub(crate) fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<MidStreamError>().is_some()
 }
 
@@ -67,7 +59,7 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if crate::llm::config::model_api_from_env(&config.model, &config.model).is_some() {
         return false; // explicit per-model table entry
     }
-    if config.provider != Provider::OpenCode {
+    if !config.provider.has_protocol_fallback() {
         return false; // codex backend-api has no /chat/completions
     }
     !err.contains("cancelled")
@@ -79,13 +71,13 @@ pub(crate) fn complete(
     with_tools: bool,
     sink: Option<::std::sync::mpsc::Sender<crate::core::types::SinkLine>>,
     cancel: &dyn crate::agent::state::CancellationSource,
-) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+) -> Result<Turn, Box<dyn std::error::Error>> {
     match effective_api(config) {
         ApiProtocol::ChatCompletions => {
-            crate::llm::chat_completions::complete(config, messages, with_tools, sink, cancel)
+            crate::llm::client::call_chat_completions(config, messages, with_tools, sink, cancel)
         }
         ApiProtocol::Responses => {
-            match crate::llm::responses::complete(
+            match crate::llm::client::call_responses(
                 config,
                 messages,
                 with_tools,
@@ -95,8 +87,13 @@ pub(crate) fn complete(
                 Ok(ok) => Ok(ok),
                 Err(e) if !is_mid_stream(&*e) && try_responses_fallback(config, &e.to_string()) => {
                     // Empirical protocol inference: responses API rejected the
-                    // model — try chat-completions once and remember.
-                    match crate::llm::chat_completions::complete(
+                    // model — try chat-completions once and remember. The gate
+                    // is deliberately broad: any pre-output failure on a 200'd
+                    // /responses call (immediate EOF, connect blip) re-issues
+                    // the whole turn over chat-completions; once anything has
+                    // streamed, MidStreamError blocks the retry so a partial
+                    // transcript is never duplicated.
+                    match crate::llm::client::call_chat_completions(
                         config,
                         messages,
                         with_tools,
@@ -139,6 +136,7 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::Provider;
     use crate::llm::config::tests::test_cfg;
 
     /// Set/restore env around gate tests (local copy of config's EnvRestore).

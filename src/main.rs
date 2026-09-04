@@ -62,25 +62,11 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             }
         }
     };
-    let mut messages = vec![ChatMessage {
-        role: "system".to_string(),
-        content: Some(system_prompt(&skills)),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-        ..Default::default()
-    }];
+    let mut messages = vec![ChatMessage::system(system_prompt(&skills))];
     if let Some(existing) = session.as_ref().and_then(|s| s.path()) {
         messages.extend(load_messages_from_session(existing).unwrap_or_default());
     }
-    let user = ChatMessage {
-        role: "user".into(),
-        content: Some(prompt.into()),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-        ..Default::default()
-    };
+    let user = ChatMessage::user(prompt);
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event("turn_start");
         let _ = session.append_message(user.clone());

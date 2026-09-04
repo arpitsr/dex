@@ -136,6 +136,13 @@ fn branch_pieces(app: &App) -> Vec<Piece> {
 /// identity, LightGreen clean branch, Yellow warnings, LightRed past the
 /// compaction trigger), which terminal themes remap to their own palette.
 pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
+    // Transient notice (copy confirmation) takes over the line until it
+    // expires: unmissable feedback beats the quiet facts for two seconds.
+    if let Some((text, at)) = &app.notice {
+        if at.elapsed() < super::NOTICE_LIFETIME {
+            return vec![(text.clone(), Style::default().fg(Color::Green))];
+        }
+    }
     let cwd = compact_path(&app.cwd);
     let tokens = app
         .tool_state

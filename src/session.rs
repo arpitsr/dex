@@ -7,7 +7,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::types::ChatMessage;
+use crate::core::types::{ChatMessage, Role};
 
 const SESSION_VERSION: u32 = 1;
 
@@ -700,7 +700,7 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
             messages.clear();
         } else if value.get("type").and_then(Value::as_str) == Some("message") {
             match serde_json::from_value::<ChatMessage>(value) {
-                Ok(msg) if msg.role != "system" => messages.push(msg),
+                Ok(msg) if msg.role != Role::System => messages.push(msg),
                 Ok(_) => {}
                 Err(e) => eprintln!(
                     "[session] skipping unparseable message at line {} in {}: {}",
@@ -986,7 +986,7 @@ mod tests {
         let path = unique_path("dex-session-reasoning");
         let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
         let mut msg = serde_json::to_value(ChatMessage {
-            role: "assistant".to_string(),
+            role: Role::Assistant,
             content: Some("done".to_string()),
             tool_calls: None,
             tool_call_id: None,

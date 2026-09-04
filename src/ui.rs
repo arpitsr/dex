@@ -2,14 +2,15 @@
 
 use std::fmt;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::Command;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::agent::state::ToolState;
-use crate::core::types::SinkLine;
+use crate::core::types::{Role, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::session::Session;
 
@@ -227,6 +228,14 @@ pub(crate) struct App {
     /// Concatenated wrapped rows with block-gap separators; sliced to the
     /// visible window each frame so a full-transcript clone never happens.
     pub(crate) display_cache: Vec<Line<'static>>,
+    /// Transcript rect from the last rendered frame; mouse events are
+    /// translated through it into `display_cache` row space.
+    pub(crate) transcript_area: Option<Rect>,
+    /// Live mouse drag selection (raw anchor/end cell in display space).
+    pub(crate) selection: Option<Selection>,
+    /// Transient status-bar notice, e.g. copy confirmation. Expires after
+    /// [`NOTICE_LIFETIME`]; the event loop redraws once on expiry.
+    pub(crate) notice: Option<(String, Instant)>,
 }
 
 impl App {
@@ -270,6 +279,42 @@ impl App {
         self.history_index = None;
         self.history_draft.clear();
     }
+
+    /// Copy mouse-selected transcript text to the system clipboard via
+    /// OSC 52 and flash a status-bar notice. Empty selections are skipped;
+    /// oversized ones are refused rather than truncated.
+    pub(crate) fn copy_selection(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        const MAX_COPY_BYTES: usize = 100_000;
+        let bytes = text.as_bytes();
+        if bytes.len() > MAX_COPY_BYTES {
+            self.notice = Some(("selection too large to copy".into(), Instant::now()));
+            return;
+        }
+        match crossterm::execute!(std::io::stdout(), SetClipboard(b64(bytes))) {
+            Ok(()) => {
+                self.notice = Some((
+                    format!("copied {} chars", text.chars().count()),
+                    Instant::now(),
+                ))
+            }
+            Err(_) => self.notice = Some(("copy failed".into(), Instant::now())),
+        }
+    }
+
+    /// Clear an expired notice, returning true so the caller redraws the
+    /// status line.
+    pub(crate) fn tick_notice(&mut self) -> bool {
+        match &self.notice {
+            Some((_, at)) if at.elapsed() >= NOTICE_LIFETIME => {
+                self.notice = None;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 pub(crate) struct PendingApproval {
@@ -297,22 +342,25 @@ impl Drop for TerminalCleanup {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableAlternateScroll
+            DisableMouseCapture
         );
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
-/// DECSET 1007 (alternate scroll): while in the alternate screen the
-/// terminal turns mouse-wheel events into Up/Down arrow presses. Mouse
-/// capture is deliberately never enabled, so click-drag stays native and
-/// the terminal itself handles text selection for copy.
-pub(crate) struct EnableAlternateScroll;
+/// DECSET 1000 + 1002 + 1006: report mouse events using the SGR encoding, so
+/// wheel scrolling arrives as real `Event::Mouse` input instead of the
+/// terminal synthesizing Up/Down arrow presses (DECSET 1007). 1002 adds
+/// button-event motion tracking: drag events flow only while a button is
+/// held — exactly what transcript drag-select needs — while unpressed
+/// pointer movement stays silent, so no event flood. Left press/drag/release
+/// drives in-app selection with OSC 52 copy; holding Shift (Option in
+/// iTerm2) still bypasses mouse reporting for native selection.
+pub(crate) struct EnableMouseScroll;
 
-impl Command for EnableAlternateScroll {
+impl Command for EnableMouseScroll {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str("\x1b[?1007h")
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
     }
 
     #[cfg(windows)]
@@ -321,17 +369,133 @@ impl Command for EnableAlternateScroll {
     }
 }
 
-pub(crate) struct DisableAlternateScroll;
+/// How long a status-bar notice (e.g. copy confirmation) stays visible.
+pub(crate) const NOTICE_LIFETIME: Duration = Duration::from_secs(2);
 
-impl Command for DisableAlternateScroll {
+/// Mouse drag selection over the transcript, in `display_cache` (row, col)
+/// cell space. `anchor`/`end` are the raw press/release points; `norm()`
+/// orders them for highlight and copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub(crate) anchor: (usize, usize),
+    pub(crate) end: (usize, usize),
+}
+
+impl Selection {
+    /// Anchor/end ordered top-left → bottom-right.
+    pub(crate) fn norm(&self) -> ((usize, usize), (usize, usize)) {
+        if (self.anchor.0, self.anchor.1) <= (self.end.0, self.end.1) {
+            (self.anchor, self.end)
+        } else {
+            (self.end, self.anchor)
+        }
+    }
+
+    /// True when the press never moved: a click clears, it doesn't copy.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.anchor == self.end
+    }
+}
+
+/// OSC 52 clipboard set: `ESC ] 52 ; c ; <base64> ST`. Honored by xterm,
+/// alacritty, kitty, foot, wezterm, Windows Terminal, and tmux (with
+/// `set-clipboard on`); unsupported terminals ignore it silently — the
+/// highlight stays visible, so Shift+drag native selection remains the
+/// fallback.
+pub(crate) struct SetClipboard(pub(crate) String);
+
+impl Command for SetClipboard {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str("\x1b[?1007l")
+        write!(f, "\x1b]52;c;{}\x1b\\", self.0)
     }
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Standard base64 with padding, enough for OSC 52 payloads; no dependency.
+fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Translate a mouse event into `display_cache` (row, col) space: the event
+/// cell must land inside the transcript area on a real row. `None` outside.
+pub(crate) fn mouse_display_cell(
+    scroll: u16,
+    area: Option<Rect>,
+    rows: usize,
+    m: &crossterm::event::MouseEvent,
+) -> Option<(usize, usize)> {
+    let area = area?;
+    if m.column < area.x
+        || m.row < area.y
+        || m.column >= area.x + area.width
+        || m.row >= area.y + area.height
+    {
+        return None;
+    }
+    let row = scroll as usize + (m.row - area.y) as usize;
+    if row >= rows {
+        return None;
+    }
+    Some((row, (m.column - area.x) as usize))
+}
+
+/// Plain text of a normalized selection: full rows join with newlines, the
+/// anchor/end rows are sliced to the selected columns. Copies what's on
+/// screen (pre-wrapped), matching what native terminal selection would hand
+/// over.
+pub(crate) fn selection_text(
+    rows: &[Line<'static>],
+    (r0, c0): (usize, usize),
+    (r1, c1): (usize, usize),
+) -> String {
+    let text =
+        |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+    if r0 == r1 {
+        return rows
+            .get(r0)
+            .map(|l| {
+                text(l)
+                    .chars()
+                    .skip(c0)
+                    .take(c1.saturating_sub(c0))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    let mut out: Vec<String> = Vec::new();
+    if let Some(l) = rows.get(r0) {
+        out.push(text(l).chars().skip(c0).collect());
+    }
+    for line in rows.get(r0 + 1..).into_iter().flatten().take(r1 - r0 - 1) {
+        out.push(text(line));
+    }
+    if let Some(l) = rows.get(r1) {
+        out.push(text(l).chars().take(c1).collect());
+    }
+    out.join("\n")
 }
 
 fn transcript_indent() -> String {
@@ -453,11 +617,14 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // at most once per throttle window instead of once per line. Each
             // sink line is one complete markdown line (stream.rs trims the
             // trailing newline), so rejoin buffered lines with '\n' to keep
-            // paragraph structure across the throttle window.
+            // paragraph structure across the throttle window. Normalize blank
+            // lines around block-level markdown so dense model output still
+            // renders with air between sections.
+            let chunk = render::with_block_gaps(&app.assistant_pending, &s);
             if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
                 app.assistant_pending.push('\n');
             }
-            app.assistant_pending.push_str(&s);
+            app.assistant_pending.push_str(&chunk);
             if app.tick.is_multiple_of(8) {
                 flush_assistant(app);
             }
@@ -694,15 +861,15 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
     app.active_tool = None;
     let msgs = app.messages.clone();
     for msg in msgs.iter().skip(1) {
-        match msg.role.as_str() {
-            "user" => {
+        match msg.role {
+            Role::User => {
                 if let Some(content) = &msg.content {
                     if !content.trim().is_empty() {
                         render_user_prompt(app, content);
                     }
                 }
             }
-            "assistant" => {
+            Role::Assistant => {
                 if let Some(content) = &msg.content {
                     if !content.trim().is_empty() {
                         append_sink_line(
@@ -718,7 +885,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                     }
                 }
             }
-            "tool" => {
+            Role::Tool => {
                 let name = msg.name.clone().unwrap_or_else(|| "tool".to_string());
                 let content = msg.content.clone().unwrap_or_default();
                 let mut lines = content.lines();
@@ -735,12 +902,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                     },
                 );
             }
-            _ if msg.role == "system" => {}
-            _ => {
-                if let Some(content) = &msg.content {
-                    push_info(app, format!("{}: {}", msg.role, content));
-                }
-            }
+            Role::System => {}
         }
     }
     // The last replayed message may be assistant text still sitting in the
@@ -813,7 +975,85 @@ mod tests {
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
             display_cache: Vec::new(),
+            transcript_area: None,
+            selection: None,
+            notice: None,
         }
+    }
+
+    #[test]
+    fn b64_matches_known_vectors() {
+        assert_eq!(b64(b""), "");
+        assert_eq!(b64(b"f"), "Zg==");
+        assert_eq!(b64(b"fo"), "Zm8=");
+        assert_eq!(b64(b"foo"), "Zm9v");
+        assert_eq!(b64(b"foob"), "Zm9vYg==");
+        assert_eq!(b64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn selection_norm_orders_cells() {
+        let s = Selection {
+            anchor: (5, 2),
+            end: (3, 7),
+        };
+        assert_eq!(s.norm(), ((3, 7), (5, 2)));
+        let s = Selection {
+            anchor: (2, 9),
+            end: (2, 1),
+        };
+        assert_eq!(s.norm(), ((2, 1), (2, 9)));
+        assert!(Selection {
+            anchor: (1, 1),
+            end: (1, 1)
+        }
+        .is_empty());
+        assert!(!Selection {
+            anchor: (1, 1),
+            end: (1, 2)
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn selection_text_slices_rows() {
+        let rows = vec![
+            Line::from("alpha"),
+            Line::default(),
+            Line::from(Span::styled("beta", Style::default().fg(Color::Cyan))),
+        ];
+        // Across rows, through the blank separator.
+        assert_eq!(selection_text(&rows, (0, 1), (2, 2)), "lpha\n\nbe");
+        // Single row, single range.
+        assert_eq!(selection_text(&rows, (2, 1), (2, 3)), "et");
+        // Anchor past the end of the line yields nothing.
+        assert_eq!(selection_text(&rows, (0, 90), (0, 95)), "");
+    }
+
+    #[test]
+    fn mouse_cell_maps_through_area() {
+        use crossterm::event::{self, KeyModifiers};
+        let area = Rect::new(0, 5, 40, 10);
+        let m = |col: u16, row: u16| event::MouseEvent {
+            kind: event::MouseEventKind::Down(event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        // Inside: display row = scroll + offset, col = screen col.
+        assert_eq!(
+            mouse_display_cell(7, Some(area), 100, &m(3, 6)),
+            Some((8, 3))
+        );
+        // Above the transcript area: ignored.
+        assert_eq!(mouse_display_cell(7, Some(area), 100, &m(3, 4)), None);
+        // Below the last cached row: ignored.
+        assert_eq!(mouse_display_cell(97, Some(area), 100, &m(3, 9)), None);
+        // Right edge is exclusive.
+        assert_eq!(mouse_display_cell(0, Some(area), 100, &m(40, 5)), None);
+        // No area recorded yet: ignored.
+        assert_eq!(mouse_display_cell(0, None, 100, &m(0, 0)), None);
     }
 
     #[test]
@@ -899,7 +1139,7 @@ mod tests {
             &mut app,
             crate::core::types::SinkLine::Assistant("hello".into()),
         );
-        assert_eq!(app.assistant_pending, "hello");
+        assert_eq!(app.assistant_pending, "hello\n");
         assert!(app.transcript.is_empty(), "nothing renders mid-window");
 
         app.tick = 8;
@@ -931,7 +1171,7 @@ mod tests {
             &mut app,
             crate::core::types::SinkLine::Assistant("tail".into()),
         );
-        assert_eq!(app.assistant_pending, "tail");
+        assert_eq!(app.assistant_pending, "tail\n");
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolInput("bash echo".into()),
@@ -1074,14 +1314,8 @@ mod tests {
     #[test]
     fn reset_session_state_clears_per_session_state() {
         let mut app = test_app();
-        app.messages.push(crate::core::types::ChatMessage {
-            role: "user".into(),
-            content: Some("hi".into()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        });
+        app.messages
+            .push(crate::core::types::ChatMessage::user("hi"));
         app.transcript.push(TranscriptBlock::Info {
             stamp: 0,
             line: Line::from("old"),
