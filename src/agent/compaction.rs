@@ -4,9 +4,9 @@ use std::sync::mpsc;
 use crate::agent::state::CancellationSource;
 use crate::agent::tokens::{message_char_len, PER_MESSAGE_OVERHEAD};
 use crate::core::format::truncate_text;
-use crate::core::types::{ChatMessage, Usage};
-use crate::llm::client::call_llm;
+use crate::core::types::{ChatMessage, Role, Usage};
 use crate::llm::config::LlmConfig;
+use crate::llm::streaming::complete as call_llm;
 
 pub(crate) use super::tokens::{effective_tokens, estimate_tokens};
 
@@ -21,18 +21,13 @@ pub(crate) const MIN_MESSAGES_TO_SUMMARIZE: usize = 8;
 // ---------------------------------------------------------------------------
 
 fn is_cut_point_message(msg: &ChatMessage) -> bool {
-    match msg.role.as_str() {
-        "user" | "assistant" => true,
-        // dex has no bashExecution/custom as separate roles, but keep future-proof:
-        // any non-tool that is context-visible
-        _ => false,
-    }
+    matches!(msg.role, Role::User | Role::Assistant)
 }
 
 fn is_turn_start_message(msg: &ChatMessage) -> bool {
     // In pi: user, bashExecution, custom, branchSummary, compactionSummary are turn starts.
     // In dex: only user starts a turn.
-    msg.role == "user"
+    msg.role == Role::User
 }
 
 fn find_valid_cut_points(messages: &[ChatMessage], start: usize, end: usize) -> Vec<usize> {
@@ -114,7 +109,7 @@ fn find_cut_point(
     }
 
     // Never orphan tool: if cut lands on tool, back up (shouldn't happen via cut_points)
-    while cut_index > start && messages[cut_index].role == "tool" {
+    while cut_index > start && messages[cut_index].role == Role::Tool {
         cut_index -= 1;
     }
 
@@ -132,13 +127,13 @@ fn find_cut_point(
     // then re-answers an old goal with similar output.
     if let Some(last_user) = messages[start..end]
         .iter()
-        .rposition(|m| m.role == "user" && m.name.as_deref() != Some("summary"))
+        .rposition(|m| m.role == Role::User && m.name.as_deref() != Some("summary"))
         .map(|p| p + start)
     {
         if cut_index > last_user {
             // Would evict last user — keep from last_user instead, or abort if too small.
             let mut adjusted = last_user;
-            while adjusted > start && messages[adjusted].role == "tool" {
+            while adjusted > start && messages[adjusted].role == Role::Tool {
                 adjusted -= 1;
             }
             // If adjusting would make summarized span too small, skip compaction.
@@ -178,7 +173,7 @@ fn extract_file_ops_from_message(msg: &ChatMessage, ops: &mut FileOps) {
     let Some(calls) = &msg.tool_calls else {
         return;
     };
-    if msg.role != "assistant" {
+    if msg.role != Role::Assistant {
         return;
     }
     for call in calls {
@@ -247,15 +242,15 @@ fn serialize_conversation(messages: &[ChatMessage]) -> String {
     const TOOL_RESULT_MAX: usize = 2000;
     let mut parts = Vec::new();
     for msg in messages {
-        match msg.role.as_str() {
-            "user" => {
+        match msg.role {
+            Role::User => {
                 if let Some(c) = &msg.content {
                     if !c.trim().is_empty() {
                         parts.push(format!("[User]: {}", c.trim()));
                     }
                 }
             }
-            "assistant" => {
+            Role::Assistant => {
                 if let Some(calls) = &msg.tool_calls {
                     let calls_str: Vec<String> = calls
                         .iter()
@@ -274,7 +269,7 @@ fn serialize_conversation(messages: &[ChatMessage]) -> String {
                     }
                 }
             }
-            "tool" => {
+            Role::Tool => {
                 if let Some(c) = &msg.content {
                     let truncated = if c.len() > TOOL_RESULT_MAX {
                         format!(
@@ -290,7 +285,7 @@ fn serialize_conversation(messages: &[ChatMessage]) -> String {
                     }
                 }
             }
-            _ => {}
+            Role::System => {}
         }
     }
     parts.join("\n\n")
@@ -343,22 +338,8 @@ pub(crate) fn summarize_old_messages(
         )
     };
     let prompt = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: Some("You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary.".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-                    ..Default::default()
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: Some(full_prompt),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-                    ..Default::default()
-        },
+        ChatMessage::system("You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary."),
+        ChatMessage::user(full_prompt),
     ];
     // Dead-drop sink: with sink=None, StreamPrinter prints streamed deltas
     // raw to stdout, which inside the TUI process is the alternate screen —
@@ -414,7 +395,7 @@ fn deterministic_summary(
         if let Some(first) = old
             .iter()
             .chain(turn_prefix.iter())
-            .find(|m| m.role == "user" && m.name.as_deref() != Some("summary"))
+            .find(|m| m.role == Role::User && m.name.as_deref() != Some("summary"))
         {
             if let Some(c) = &first.content {
                 goal = Some(truncate_text(c, 600, 8));
@@ -453,7 +434,7 @@ fn deterministic_summary(
                 verifies.push(truncate_text(c, 600, 8));
             }
         }
-        if msg.role == "assistant" && msg.tool_calls.is_none() {
+        if msg.role == Role::Assistant && msg.tool_calls.is_none() {
             if let Some(c) = &msg.content {
                 if c.len() < 300 && done.len() < 5 {
                     done.push(truncate_text(c, 400, 4));
@@ -662,25 +643,13 @@ pub(crate) fn compact_history(
             // Turn prefix summary with smaller budget prompt
             let prefix_conversation = serialize_conversation(&turn_prefix_messages);
             let prefix_prompt = vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: Some("You are a context summarization assistant. ONLY output the structured summary.".to_string()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                                    ..Default::default()
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(format!(
-                        "<conversation>\n{}\n</conversation>\n\n{}",
-                        prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
-                    )),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                                    ..Default::default()
-                },
+                ChatMessage::system(
+                    "You are a context summarization assistant. ONLY output the structured summary.",
+                ),
+                ChatMessage::user(format!(
+                    "<conversation>\n{}\n</conversation>\n\n{}",
+                    prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
+                )),
             ];
             let (sink, rx) = mpsc::channel();
             drop(rx);
@@ -722,14 +691,7 @@ pub(crate) fn compact_history(
     };
 
     // Pi's `firstKeptEntryId` is the kept boundary; dex splices from boundary_start..first_kept
-    let summary_msg = ChatMessage {
-        role: "user".to_string(),
-        content: Some(summarized.trim().to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        name: Some("summary".to_string()),
-        ..Default::default()
-    };
+    let summary_msg = ChatMessage::user_named(summarized.trim().to_string(), "summary");
     // If boundary_start !=1, we keep system (0) and summary subsumes previous summary,
     // so splice from boundary_start..first_kept, but keep earlier summary? Pi's new summary subsumes previous,
     // so we replace from boundary_start (which is after previous summary) — but previous summary is at boundary_start-1,
@@ -744,25 +706,20 @@ mod tests {
         deterministic_summary, estimate_tokens, extract_file_ops_from_message,
         find_cutoff_by_tokens, ChatMessage, FileOps, KEEP_RECENT_MESSAGES,
     };
-    use crate::core::types::{FunctionCall, LlmToolCall};
+    use crate::core::types::{FunctionCall, LlmToolCall, Role};
 
-    fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage {
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        }
+    fn msg(role: Role, content: &str) -> ChatMessage {
+        let mut m = ChatMessage::user(content);
+        m.role = role;
+        m
     }
 
     #[test]
     fn cutoff_never_lands_on_a_tool_message() {
-        let mut messages = vec![msg("system", "sys")];
+        let mut messages = vec![msg(Role::System, "sys")];
         for i in 0..20 {
-            messages.push(msg("user", &format!("u{i}")));
-            messages.push(msg("assistant", &format!("a{i}")));
+            messages.push(msg(Role::User, &format!("u{i}")));
+            messages.push(msg(Role::Assistant, &format!("a{i}")));
         }
         // Force the naive window to start on a tool message: assistant with
         // calls, then tools, right at total - KEEP_RECENT.
@@ -774,27 +731,14 @@ mod tests {
                 arguments: "{}".into(),
             },
         };
-        messages.push(ChatMessage {
-            role: "assistant".into(),
-            content: None,
-            tool_calls: Some(vec![call]),
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        });
+        messages.push(ChatMessage::assistant_calls(None, vec![call]));
         for i in 0..KEEP_RECENT_MESSAGES - 1 {
-            messages.push(ChatMessage {
-                role: "tool".into(),
-                content: Some(format!("t{i}")),
-                tool_calls: None,
-                tool_call_id: Some(format!("c1-{i}")),
-                name: None,
-                ..Default::default()
-            });
+            messages.push(ChatMessage::tool_result(format!("c1-{i}"), format!("t{i}")));
         }
         let cutoff = find_cutoff_by_tokens(&messages, 20_000).expect("should have a cutoff");
         assert_ne!(
-            messages[cutoff].role, "tool",
+            messages[cutoff].role,
+            Role::Tool,
             "cutoff would orphan tool calls"
         );
         // Everything from cutoff on must be self-contained: first kept
@@ -802,7 +746,7 @@ mod tests {
         // that owns the tool calls that follow it.
         let kept = &messages[cutoff..];
         assert!(
-            kept[0].role != "tool"
+            kept[0].role != Role::Tool
                 && (kept[0].tool_calls.is_some()
                     || kept
                         .iter()
@@ -814,8 +758,8 @@ mod tests {
 
     #[test]
     fn cutoff_is_none_when_history_is_small() {
-        let messages: Vec<ChatMessage> = std::iter::once(msg("system", "sys"))
-            .chain((0..KEEP_RECENT_MESSAGES).map(|i| msg("user", &format!("m{i}"))))
+        let messages: Vec<ChatMessage> = std::iter::once(msg(Role::System, "sys"))
+            .chain((0..KEEP_RECENT_MESSAGES).map(|i| msg(Role::User, &format!("m{i}"))))
             .collect();
         assert!(find_cutoff_by_tokens(&messages, 20_000).is_none());
     }
@@ -831,15 +775,8 @@ mod tests {
             },
         };
         let messages = vec![
-            msg("system", "hello"),
-            ChatMessage {
-                role: "assistant".into(),
-                content: None,
-                tool_calls: Some(vec![call]),
-                tool_call_id: None,
-                name: None,
-                ..Default::default()
-            },
+            msg(Role::System, "hello"),
+            ChatMessage::assistant_calls(None, vec![call]),
         ];
         // 5 content chars + 30 tool-call chars + framing, /4 + overhead.
         let est = estimate_tokens(&messages);
@@ -850,20 +787,15 @@ mod tests {
 
     #[test]
     fn estimator_counts_replayed_reasoning() {
-        let plain = vec![msg("assistant", "hello")];
-        let with_reasoning = vec![ChatMessage {
-            role: "assistant".into(),
-            content: Some("hello".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            reasoning_items: Some(vec![serde_json::json!({
-                "type": "reasoning",
-                "id": "r1",
-                "encrypted_content": "blob1",
-            })]),
-            reasoning_content: Some("step 1".to_string()),
-        }];
+        let plain = vec![msg(Role::Assistant, "hello")];
+        let mut with_reasoning = ChatMessage::assistant("hello");
+        with_reasoning.reasoning_items = Some(vec![serde_json::json!({
+            "type": "reasoning",
+            "id": "r1",
+            "encrypted_content": "blob1",
+        })]);
+        with_reasoning.reasoning_content = Some("step 1".to_string());
+        let with_reasoning = vec![with_reasoning];
         assert!(
             estimate_tokens(&with_reasoning) > estimate_tokens(&plain),
             "replayed reasoning must count toward the window"
@@ -873,13 +805,13 @@ mod tests {
     #[test]
     fn cutoff_preserves_last_user_prompt() {
         // Pi-like: compaction inside a turn with many tool calls must not evict the prompt.
-        let mut messages = vec![msg("system", "sys")];
-        messages.push(msg("user", "first goal: build foo"));
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "first goal: build foo"));
         for i in 0..5 {
-            messages.push(msg("assistant", &format!("a{i}")));
-            messages.push(msg("tool", &format!("t{i}")));
+            messages.push(msg(Role::Assistant, &format!("a{i}")));
+            messages.push(msg(Role::Tool, &format!("t{i}")));
         }
-        messages.push(msg("user", "second prompt that must stay"));
+        messages.push(msg(Role::User, "second prompt that must stay"));
         // Add many tool messages to push the second prompt out of keep_recent window
         let call = LlmToolCall {
             id: "c1".into(),
@@ -889,29 +821,18 @@ mod tests {
                 arguments: "{}".into(),
             },
         };
-        messages.push(ChatMessage {
-            role: "assistant".into(),
-            content: None,
-            tool_calls: Some(vec![call]),
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        });
+        messages.push(ChatMessage::assistant_calls(None, vec![call]));
         for i in 0..KEEP_RECENT_MESSAGES {
-            messages.push(ChatMessage {
-                role: "tool".into(),
-                content: Some(format!("tool result {i}")),
-                tool_calls: None,
-                tool_call_id: Some(format!("c1-{i}")),
-                name: None,
-                ..Default::default()
-            });
+            messages.push(ChatMessage::tool_result(
+                format!("c1-{i}"),
+                format!("tool result {i}"),
+            ));
         }
         let cutoff = find_cutoff_by_tokens(&messages, 20_000).expect("should have cutoff");
         // Last user is at index where second prompt lives; cutoff must not be after it
         let last_user = messages
             .iter()
-            .rposition(|m| m.role == "user" && m.name.as_deref() != Some("summary"))
+            .rposition(|m| m.role == Role::User && m.name.as_deref() != Some("summary"))
             .unwrap();
         assert!(
             cutoff <= last_user,
@@ -919,14 +840,14 @@ mod tests {
             cutoff,
             last_user
         );
-        assert_ne!(messages[cutoff].role, "tool");
+        assert_ne!(messages[cutoff].role, Role::Tool);
     }
 
     #[test]
     fn deterministic_summary_is_pi_structured() {
         let mut old = vec![
-            msg("user", "Goal: fix compaction"),
-            msg("assistant", "did read src/foo.rs"),
+            msg(Role::User, "Goal: fix compaction"),
+            msg(Role::Assistant, "did read src/foo.rs"),
         ];
         old[0].name = None;
         // Simulate a read tool call to test file ops
@@ -938,7 +859,7 @@ mod tests {
                 arguments: r#"{"path":"src/foo.rs"}"#.into(),
             },
         };
-        let mut ass = msg("assistant", "");
+        let mut ass = msg(Role::Assistant, "");
         ass.tool_calls = Some(vec![call]);
         old.push(ass);
         let mut ops = FileOps::default();

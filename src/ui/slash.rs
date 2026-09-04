@@ -356,14 +356,10 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             let name = line["/skill:".len()..].trim();
             if let Some(skill) = app.skills.iter().find(|s| s.name == name) {
                 let content = fs::read_to_string(&skill.path).unwrap_or_default();
-                app.messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(format!("--- Skill: {} ---\n{}", skill.name, content)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: Some("skill".to_string()),
-                    ..Default::default()
-                });
+                app.messages.push(ChatMessage::user_named(
+                    format!("--- Skill: {} ---\n{}", skill.name, content),
+                    "skill",
+                ));
                 let _ = app
                     .session
                     .append_message(app.messages.last().cloned().unwrap());
@@ -402,14 +398,10 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             if reason.is_empty() {
                 push_info(app, "usage: /waive <reason>".to_string());
             } else {
-                app.messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(format!("[verify waived] {reason}")),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: Some("waive".to_string()),
-                    ..Default::default()
-                });
+                app.messages.push(ChatMessage::user_named(
+                    format!("[verify waived] {reason}"),
+                    "waive",
+                ));
                 let _ = app
                     .session
                     .append_message(app.messages.last().cloned().unwrap());

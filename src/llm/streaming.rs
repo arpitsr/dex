@@ -1,7 +1,7 @@
 //! Shared streaming boundary. The concrete SSE readers remain compatible with
 //! both provider protocols and are called through these typed entry points.
 
-use crate::core::types::{ApiProtocol, ChatMessage, Provider, SinkLine};
+use crate::core::types::{ApiProtocol, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::llm::stream::Turn;
 use std::collections::HashMap;
@@ -59,7 +59,7 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if crate::llm::config::model_api_from_env(&config.model, &config.model).is_some() {
         return false; // explicit per-model table entry
     }
-    if config.provider != Provider::OpenCode {
+    if !config.provider.has_protocol_fallback() {
         return false; // codex backend-api has no /chat/completions
     }
     !err.contains("cancelled")
@@ -74,10 +74,10 @@ pub(crate) fn complete(
 ) -> Result<Turn, Box<dyn std::error::Error>> {
     match effective_api(config) {
         ApiProtocol::ChatCompletions => {
-            crate::llm::chat_completions::complete(config, messages, with_tools, sink, cancel)
+            crate::llm::client::call_chat_completions(config, messages, with_tools, sink, cancel)
         }
         ApiProtocol::Responses => {
-            match crate::llm::responses::complete(
+            match crate::llm::client::call_responses(
                 config,
                 messages,
                 with_tools,
@@ -88,7 +88,7 @@ pub(crate) fn complete(
                 Err(e) if !is_mid_stream(&*e) && try_responses_fallback(config, &e.to_string()) => {
                     // Empirical protocol inference: responses API rejected the
                     // model — try chat-completions once and remember.
-                    match crate::llm::chat_completions::complete(
+                    match crate::llm::client::call_chat_completions(
                         config,
                         messages,
                         with_tools,
@@ -131,6 +131,7 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::Provider;
     use crate::llm::config::tests::test_cfg;
 
     /// Set/restore env around gate tests (local copy of config's EnvRestore).

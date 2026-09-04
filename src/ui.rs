@@ -9,7 +9,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::agent::state::ToolState;
-use crate::core::types::SinkLine;
+use crate::core::types::{Role, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::session::Session;
 
@@ -694,15 +694,15 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
     app.active_tool = None;
     let msgs = app.messages.clone();
     for msg in msgs.iter().skip(1) {
-        match msg.role.as_str() {
-            "user" => {
+        match msg.role {
+            Role::User => {
                 if let Some(content) = &msg.content {
                     if !content.trim().is_empty() {
                         render_user_prompt(app, content);
                     }
                 }
             }
-            "assistant" => {
+            Role::Assistant => {
                 if let Some(content) = &msg.content {
                     if !content.trim().is_empty() {
                         append_sink_line(
@@ -718,7 +718,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                     }
                 }
             }
-            "tool" => {
+            Role::Tool => {
                 let name = msg.name.clone().unwrap_or_else(|| "tool".to_string());
                 let content = msg.content.clone().unwrap_or_default();
                 let mut lines = content.lines();
@@ -735,12 +735,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                     },
                 );
             }
-            _ if msg.role == "system" => {}
-            _ => {
-                if let Some(content) = &msg.content {
-                    push_info(app, format!("{}: {}", msg.role, content));
-                }
-            }
+            Role::System => {}
         }
     }
     // The last replayed message may be assistant text still sitting in the
@@ -1074,14 +1069,8 @@ mod tests {
     #[test]
     fn reset_session_state_clears_per_session_state() {
         let mut app = test_app();
-        app.messages.push(crate::core::types::ChatMessage {
-            role: "user".into(),
-            content: Some("hi".into()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        });
+        app.messages
+            .push(crate::core::types::ChatMessage::user("hi"));
         app.transcript.push(TranscriptBlock::Info {
             stamp: 0,
             line: Line::from("old"),

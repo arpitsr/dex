@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use crate::core::console::with_console;
 use crate::core::highlight::{print_code_block, print_markdown_text};
 use crate::core::types::{
-    ChatMessage, LlmToolCall, SinkLine, StopReason, StreamChunk, StreamDelta, Usage,
+    ChatMessage, LlmToolCall, Role, SinkLine, StopReason, StreamChunk, StreamDelta, Usage,
 };
 use crate::llm::protocol::{merge_chat_tool_call, response_call_index, response_tool_call};
 
@@ -257,7 +257,7 @@ fn run_sse<P: StreamParser>(
     let parsed = parser.finish();
     Ok(Turn {
         message: ChatMessage {
-            role: "assistant".to_string(),
+            role: Role::Assistant,
             content: (!content.is_empty()).then_some(content),
             tool_calls: (!parsed.tool_calls.is_empty()).then_some(parsed.tool_calls),
             tool_call_id: None,
