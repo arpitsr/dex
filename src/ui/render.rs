@@ -786,7 +786,7 @@ impl ApprovalOverlay {
         let sub = Line::from(Span::styled(
             summary.clone(),
             Style::default()
-                .fg(Color::White)
+                .fg(theme::surface_fg())
                 .add_modifier(Modifier::BOLD),
         ));
         f.render_widget(
