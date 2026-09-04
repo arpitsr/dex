@@ -187,17 +187,10 @@ async fn load_skill(
             Session::new(entry.cwd.clone(), entry.name.clone())
                 .map_err(|e| format!("create session: {e}"))?
         };
-        let msg = ChatMessage {
-            role: "user".to_string(),
-            content: Some(format!(
-                "--- Skill: {} ---\n{}",
-                skill_for_msg.name, content_for_msg
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-            name: Some("skill".to_string()),
-            ..Default::default()
-        };
+        let msg = ChatMessage::user_named(
+            format!("--- Skill: {} ---\n{}", skill_for_msg.name, content_for_msg),
+            "skill",
+        );
         session
             .append_message(msg)
             .map_err(|e| format!("append: {e}"))?;
@@ -759,25 +752,11 @@ fn run_turn_inner(
 
     // Rebuild the conversation: system prompt + persisted history + prompt.
     let mut messages: Vec<ChatMessage> = Vec::new();
-    messages.push(ChatMessage {
-        role: "system".into(),
-        content: Some(system_prompt(&skills)),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-        ..Default::default()
-    });
+    messages.push(ChatMessage::system(system_prompt(&skills)));
     if let Some(path) = session.path() {
         messages.extend(session::load_messages_from_session(path).unwrap_or_default());
     }
-    let user_message = ChatMessage {
-        role: "user".into(),
-        content: Some(req.prompt.clone()),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-        ..Default::default()
-    };
+    let user_message = ChatMessage::user(req.prompt.clone());
     // Durable journal (P8): a turn only exists once turn_start is recorded,
     // and an io::Error here fails the turn instead of being swallowed.
     session
@@ -1012,14 +991,7 @@ fn run_turn_inner(
                     if let Some(tx) = followup_accepted_tx {
                         let _ = tx.send(content.clone());
                     }
-                    let msg = ChatMessage {
-                        role: "user".into(),
-                        content: Some(content.clone()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: Some("follow-up".into()),
-                        ..Default::default()
-                    };
+                    let msg = ChatMessage::user_named(content.clone(), "follow-up");
                     session
                         .append_message(msg.clone())
                         .map_err(|e| format!("failed to persist followup: {e}"))?;
@@ -1368,14 +1340,10 @@ async fn session_waive(
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
         // A waive is a recorded, user-authored message the model sees next.
-        session.append_message(ChatMessage {
-            role: "user".into(),
-            content: Some(format!("[verify waived] {reason}")),
-            tool_calls: None,
-            tool_call_id: None,
-            name: Some("waive".into()),
-            ..Default::default()
-        })?;
+        session.append_message(ChatMessage::user_named(
+            format!("[verify waived] {reason}"),
+            "waive",
+        ))?;
         session.set_state(
             "verify",
             &serde_json::json!({

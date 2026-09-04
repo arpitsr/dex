@@ -13,7 +13,7 @@ use crate::core::format::{
     model_tool_result, short_arg, terminal_preview, tool_preview, tool_preview_body,
     tool_result_summary,
 };
-use crate::core::types::{ChatMessage, LlmToolCall, SinkLine, StopReason, Usage};
+use crate::core::types::{ChatMessage, LlmToolCall, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::stream::Turn;
@@ -186,14 +186,7 @@ pub(crate) fn process_turn(
                 if let Some(accepted) = &steering_accepted_tx {
                     let _ = accepted.send(steering.clone());
                 }
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(steering),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: Some("steering".to_string()),
-                    ..Default::default()
-                });
+                messages.push(ChatMessage::user_named(steering, "steering"));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
         }
@@ -261,7 +254,7 @@ pub(crate) fn process_turn(
 
         if let Some(calls) = message.tool_calls.clone() {
             messages.push(ChatMessage {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: message.content,
                 tool_calls: Some(calls.clone()),
                 tool_call_id: None,
@@ -405,21 +398,17 @@ pub(crate) fn process_turn(
                         );
                     });
                 }
-                messages.push(ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(model_tool_result(&result)),
-                    tool_calls: None,
-                    tool_call_id: Some(call.id.clone()),
-                    name: None,
-                    ..Default::default()
-                });
+                messages.push(ChatMessage::tool_result(
+                    call.id.clone(),
+                    model_tool_result(&result),
+                ));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
             state.save();
         } else {
             let text = message.content.unwrap_or_default();
             messages.push(ChatMessage {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: Some(text.clone()),
                 tool_calls: None,
                 tool_call_id: None,
@@ -434,14 +423,7 @@ pub(crate) fn process_turn(
                         if let Some(accepted) = &steering_accepted_tx {
                             let _ = accepted.send(content.clone());
                         }
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: Some(content),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: Some("steering".to_string()),
-                            ..Default::default()
-                        });
+                        messages.push(ChatMessage::user_named(content, "steering"));
                     }
                     state.last_usage = last_usage;
                     continue;
@@ -474,14 +456,7 @@ mod tests {
             _cancel: &dyn CancellationSource,
         ) -> Result<Turn, Box<dyn std::error::Error>> {
             Ok(Turn {
-                message: ChatMessage {
-                    role: "assistant".into(),
-                    content: Some("hello from mock".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    ..Default::default()
-                },
+                message: ChatMessage::assistant("hello from mock"),
                 usage: Some(Usage {
                     prompt_tokens: 1,
                     completion_tokens: 0,
@@ -527,14 +502,7 @@ mod tests {
     #[test]
     fn process_turn_completes_with_injected_client() {
         let config = test_config();
-        let mut messages = vec![ChatMessage {
-            role: "system".into(),
-            content: Some("sys".into()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        }];
+        let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
         let result = process_turn(
             &config,
@@ -577,30 +545,19 @@ mod tests {
         ) -> Result<Turn, Box<dyn std::error::Error>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let message = if round == 0 {
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: None,
-                    tool_calls: Some(vec![crate::core::types::LlmToolCall {
+                ChatMessage::assistant_calls(
+                    None,
+                    vec![crate::core::types::LlmToolCall {
                         id: "call-1".into(),
                         call_type: "function".into(),
                         function: crate::core::types::FunctionCall {
                             name: "bash".into(),
                             arguments: r#"{"command":"echo line-one; echo line-two; echo line-three; echo line-four"}"#.into(),
                         },
-                    }]),
-                    tool_call_id: None,
-                    name: None,
-                                    ..Default::default()
-                }
+                    }],
+                )
             } else {
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: Some("done".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    ..Default::default()
-                }
+                ChatMessage::assistant("done")
             };
             Ok(Turn {
                 message,
@@ -617,14 +574,7 @@ mod tests {
     #[test]
     fn tool_result_streams_summary_preview_and_success() {
         let config = test_config();
-        let mut messages = vec![ChatMessage {
-            role: "system".into(),
-            content: Some("sys".into()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        }];
+        let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
         let (sink_tx, sink_rx) = mpsc::channel();
         let (approval_tx, _approval_rx) = mpsc::channel();

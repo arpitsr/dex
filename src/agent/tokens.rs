@@ -44,7 +44,7 @@ pub(crate) fn message_char_len(message: &ChatMessage) -> usize {
             .as_ref()
             .map_or(0, |items| items.iter().map(|v| v.to_string().len()).sum());
     // Role and name framing
-    len += message.role.len();
+    len += message.role.as_str().len();
     if let Some(name) = &message.name {
         len += name.len();
     }

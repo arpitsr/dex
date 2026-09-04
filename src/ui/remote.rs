@@ -72,7 +72,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         // Mirror the daemon's endpoint table so `/model endpoint/id`
         // strips and displays exactly what the daemon will route.
         // (The display copy never talks to a provider itself.)
-        endpoints: crate::llm::config::provider_endpoints(provider),
+        endpoints: provider.endpoints(),
         api: ApiProtocol::parse(&info.api).unwrap_or(ApiProtocol::Responses),
         account_id: None,
         thinking_effort: None,
@@ -1494,14 +1494,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                             if let Ok(loaded) = crate::session::load_messages_from_session(p) {
                                 if !loaded.is_empty() {
                                     let system = remote.app.messages.first().cloned().unwrap_or(
-                                        crate::core::types::ChatMessage {
-                                            role: "system".into(),
-                                            content: Some(String::new()),
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                            name: None,
-                                            ..Default::default()
-                                        },
+                                        crate::core::types::ChatMessage::system(String::new()),
                                     );
                                     remote.app.messages.clear();
                                     remote.app.messages.push(system);
