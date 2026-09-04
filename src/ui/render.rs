@@ -268,10 +268,11 @@ pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
         )));
     }
     if app.tool_state.total_output > 0 {
-        base.push_str(&format!(
-            " · {} out",
+        pieces.push(sep());
+        pieces.push(quiet(format!(
+            "{} out",
             format_tokens(app.tool_state.total_output)
-        ));
+        )));
     }
     // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
     // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
