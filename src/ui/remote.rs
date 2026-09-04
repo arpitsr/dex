@@ -1533,11 +1533,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             // prefixes (`go/…`) against its own endpoint table, so it must
             // see the un-stripped selection — the client's `config.model` is
             // already resolved to the bare id.
-            let raw_model = if line.starts_with("/model ") {
-                Some(line["/model ".len()..].trim().to_string())
-            } else {
-                None
-            };
+            let raw_model = line.strip_prefix("/model ").map(|s| s.trim().to_string());
             let quit = handle_slash(&mut remote.app, line);
             if remote.app.config.model != had_model {
                 remote.options.model = Some(match raw_model {

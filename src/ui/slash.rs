@@ -47,7 +47,7 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
                 lower.starts_with(&query)
                     || lower
                         .split('/')
-                        .last()
+                        .next_back()
                         .is_some_and(|tail| tail.starts_with(&query))
             })
             .map(|model| {

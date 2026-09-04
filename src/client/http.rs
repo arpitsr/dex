@@ -1,7 +1,11 @@
 use std::io::{self, BufRead};
 use std::time::{Duration, Instant};
 
-use crate::protocol::*;
+use crate::protocol::{
+    ApprovalDecision, ApprovalResponse, ChatRequest, CreateSessionRequest, CreateSessionResponse,
+    DaemonInfo, EventsResponse, FollowupRequest, LoadSkillRequest, LoadSkillResponse,
+    ReattachResponse, SessionInfo, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
+};
 
 /// Per-request overrides forwarded to the daemon with a chat turn.
 #[derive(Debug, Clone, Default)]

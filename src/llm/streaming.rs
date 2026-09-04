@@ -203,7 +203,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&pin_dir);
             std::fs::create_dir_all(&pin_dir).unwrap();
             std::fs::write(pin_dir.join("config.yaml"), "api: openai-responses\n").unwrap();
-            std::env::set_var("DEX_CONFIG", &pin_dir.join("config.yaml"));
+            std::env::set_var("DEX_CONFIG", pin_dir.join("config.yaml"));
             assert!(!try_responses_fallback(&cfg, "500 boom"));
             std::env::set_var("DEX_CONFIG", &absent);
             let _ = std::fs::remove_dir_all(&pin_dir);

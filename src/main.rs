@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports, unused_mut, clippy::all)]
 mod agent;
 mod cli;
 mod client;
@@ -11,15 +10,15 @@ mod skills;
 mod tools;
 mod ui;
 
-use cli::*;
-use session::*;
-use tools::*;
+use crate::cli::{Args, Mode};
+use crate::session::{load_messages_from_session, Session};
+use crate::tools::execute;
 
 use crate::agent::r#loop::process_turn;
 use crate::agent::state::{GlobalCancellation, ToolState};
 use crate::core::console::install_sigint_handler;
-use crate::core::types::{ChatMessage, PermissionMode};
-use crate::llm::config::{permission_from_env, LlmConfig};
+use crate::core::types::ChatMessage;
+use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::skills::{discover_skills, skill_dirs};
 
@@ -116,8 +115,6 @@ fn run_interactive() {
     eprintln!("tools: read, ls, bash, write, edit, grep, find (aliases ffgrep/fffind), git");
     eprintln!("send JSON lines like: {{\"name\":\"read\",\"args\":{{\"path\":\"Cargo.toml\"}}}}");
     eprintln!("empty line quits");
-
-    let permission = permission_from_env().unwrap_or(PermissionMode::ReadOnly);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
