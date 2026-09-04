@@ -133,14 +133,23 @@ pub enum StreamEvent {
     #[serde(rename = "turn_failed")]
     TurnFailed { error: String },
 
-    /// Prompt tokens reported by the provider after each LLM call within a
-    /// turn, letting the client render live context usage in its status bar.
-    /// `cached` is the provider-reported cached-token subset, when reported.
+    /// Prompt and completion tokens reported by the provider after each LLM
+    /// call within a turn, letting the client render live context usage in
+    /// its status bar. `cached` is the provider-reported cached-token
+    /// subset; `cost` is the daemon-priced USD cost of this call (catalog
+    /// or `DEX_COST_PER_1K` fallback), accumulated client-side so both
+    /// processes always agree on spend; `output` is the completion-token
+    /// count for the same call, accumulated for the status bar's output
+    /// figure.
     #[serde(rename = "usage")]
     Usage {
         tokens: u64,
         #[serde(default)]
         cached: Option<u64>,
+        #[serde(default)]
+        cost: f64,
+        #[serde(default)]
+        output: u64,
     },
 
     /// A system message (e.g. compaction notice).
@@ -274,6 +283,8 @@ mod tests {
             StreamEvent::Usage {
                 tokens: 10,
                 cached: Some(2),
+                cost: 0.0003,
+                output: 4,
             },
             StreamEvent::SteeringAccepted {
                 content: "steer".into(),

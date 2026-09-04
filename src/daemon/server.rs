@@ -843,9 +843,17 @@ fn run_turn_inner(
                             },
                             SinkLine::System(text) => StreamEvent::System(text),
                             SinkLine::Error(text) => StreamEvent::Error(text),
-                            SinkLine::Usage { tokens, cached } => {
-                                StreamEvent::Usage { tokens, cached }
-                            }
+                            SinkLine::Usage {
+                                tokens,
+                                cached,
+                                cost,
+                                output,
+                            } => StreamEvent::Usage {
+                                tokens,
+                                cached,
+                                cost,
+                                output,
+                            },
                             SinkLine::Plan(plan) => StreamEvent::Plan {
                                 goal: plan.goal,
                                 steps: plan.steps,

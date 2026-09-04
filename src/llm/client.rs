@@ -285,6 +285,7 @@ mod tests {
                 },
                 Some(Usage {
                     prompt_tokens: 3,
+                    completion_tokens: 0,
                     cached_tokens: None,
                 }),
             ))
@@ -301,6 +302,7 @@ mod tests {
             usage,
             Some(Usage {
                 prompt_tokens: 3,
+                completion_tokens: 0,
                 cached_tokens: None
             })
         );
