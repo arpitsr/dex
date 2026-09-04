@@ -401,7 +401,7 @@ pub(crate) fn summarize_old_messages(
     config: &LlmConfig,
     old: &[ChatMessage],
     cancel: &dyn CancellationSource,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Option<Usage>), Box<dyn std::error::Error>> {
     // Pi-like: serialize via `serialize_conversation` (via convertToLlm -> serialize),
     // handle previousSummary iterative, file ops via prompt, and custom instructions.
     // Preserve orientation anchors verbatim so compaction never erases the task.
@@ -461,8 +461,25 @@ pub(crate) fn summarize_old_messages(
     // repaint. A dropped receiver makes every send fail silently instead.
     let (sink, rx) = mpsc::channel();
     drop(rx);
-    let (summary, _) = call_llm(config, &prompt, false, Some(sink), cancel)?;
-    Ok(summary.content.unwrap_or_default())
+    let (summary, usage) = call_llm(config, &prompt, false, Some(sink), cancel)?;
+    Ok((summary.content.unwrap_or_default(), usage))
+}
+
+/// Fold one call's usage into an accumulator (summing prompt, completion,
+/// and cached counts; cache detail is dropped when any call omits it).
+fn merge_usage(acc: &mut Option<Usage>, u: Option<Usage>) {
+    let Some(u) = u else { return };
+    *acc = Some(match acc.take() {
+        None => u,
+        Some(a) => Usage {
+            prompt_tokens: a.prompt_tokens + u.prompt_tokens,
+            completion_tokens: a.completion_tokens + u.completion_tokens,
+            cached_tokens: match (a.cached_tokens, u.cached_tokens) {
+                (Some(x), Some(y)) => Some(x + y),
+                _ => None,
+            },
+        },
+    });
 }
 
 /// Deterministic fallback when the LLM summarizer fails or is cancelled.
@@ -653,10 +670,10 @@ pub(crate) fn compact_history(
     _config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
     _cancel: &dyn CancellationSource,
-) -> Result<bool, String> {
+) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
-        return Ok(false);
+        return Ok((false, None));
     }
     let boundary_start = messages
         .iter()
@@ -670,14 +687,14 @@ pub(crate) fn compact_history(
         _config.keep_recent_tokens(),
     ) {
         Some(c) => c,
-        None => return Ok(false),
+        None => return Ok((false, None)),
     };
     let first_kept = cp.first_kept_index;
     if first_kept <= boundary_start + MIN_MESSAGES_TO_SUMMARIZE {
-        return Ok(false);
+        return Ok((false, None));
     }
     if first_kept >= total {
-        return Ok(false);
+        return Ok((false, None));
     }
 
     // Pi's prepareCompaction: messagesToSummarize = boundary_start..historyEnd, turnPrefix = turnStart..firstKept if split
@@ -694,7 +711,7 @@ pub(crate) fn compact_history(
         Vec::new()
     };
     if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
-        return Ok(false);
+        return Ok((false, None));
     }
 
     // File ops cumulative — pi extracts from previous compaction + messages
@@ -714,17 +731,24 @@ pub(crate) fn compact_history(
     }
 
     // Generate summary — pi's `compact()` merges two summaries for split turns
+    let mut usage_total: Option<Usage> = None;
     let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
         // Use LLM path: if split, generate history + turn prefix separately then merge
         let history_summary = if !messages_to_summarize.is_empty() {
             match summarize_old_messages(_config, &messages_to_summarize, _cancel) {
-                Ok(s) if !s.trim().is_empty() => s,
-                Ok(_) => deterministic_summary(
-                    &messages_to_summarize,
-                    &[],
-                    previous_summary.as_deref(),
-                    &file_ops,
-                ),
+                Ok((s, u)) if !s.trim().is_empty() => {
+                    merge_usage(&mut usage_total, u);
+                    s
+                }
+                Ok((_, u)) => {
+                    merge_usage(&mut usage_total, u);
+                    deterministic_summary(
+                        &messages_to_summarize,
+                        &[],
+                        previous_summary.as_deref(),
+                        &file_ops,
+                    )
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("cancelled") || msg.contains("cancellation") {
@@ -769,7 +793,10 @@ pub(crate) fn compact_history(
             drop(rx);
             let prefix_summary = match call_llm(_config, &prefix_prompt, false, Some(sink), _cancel)
             {
-                Ok((msg, _)) => msg.content.unwrap_or_default(),
+                Ok((msg, u)) => {
+                    merge_usage(&mut usage_total, u);
+                    msg.content.unwrap_or_default()
+                }
                 Err(_) => {
                     deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())
                 }
@@ -817,7 +844,7 @@ pub(crate) fn compact_history(
     // Use 1..first_kept to keep behavior simple and pass existing tests.
     let splice_start = if boundary_start == 1 { 1 } else { 1 };
     messages.splice(splice_start..first_kept, std::iter::once(summary_msg));
-    Ok(true)
+    Ok((true, usage_total))
 }
 
 #[cfg(test)]

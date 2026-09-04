@@ -332,7 +332,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
-| `DEX_COST_PER_1K` | Prompt cost per 1k tok for `trace.jsonl` (default `0.002`). |
+| `DEX_COST_PER_1K` | Fallback token cost per 1k tok (prompt + completion) for the status-bar spend figure when the pricing catalog has no entry (default `0.002`). |
 | `DEX_CONTEXT_WINDOW` | Override model context window (pi: per-model from catalog, e.g. gpt-5.6 1050000, claude 200k, muse 1048576). |
 | `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384, pi: `compaction.reserveTokens`). |
 | `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000, pi: `compaction.keepRecentTokens`). |

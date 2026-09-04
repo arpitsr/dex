@@ -110,6 +110,7 @@ pub(crate) fn read_stream(
     let mut tool_calls: Vec<LlmToolCall> = Vec::new();
     let mut usage_tokens: Option<u64> = None;
     let mut usage_cached: Option<u64> = None;
+    let mut usage_completion: u64 = 0;
     let mut reasoning = String::new();
 
     loop {
@@ -139,6 +140,7 @@ pub(crate) fn read_stream(
         };
         if let Some(usage) = &chunk.usage {
             usage_tokens = Some(usage.prompt_tokens);
+            usage_completion = usage.completion_tokens;
             usage_cached = usage.prompt_details.as_ref().map(|d| d.cached_tokens);
         }
         for choice in chunk.choices {
@@ -199,6 +201,7 @@ pub(crate) fn read_stream(
         },
         usage_tokens.map(|tokens| Usage {
             prompt_tokens: tokens,
+            completion_tokens: usage_completion,
             cached_tokens: usage_cached,
         }),
     ))
@@ -220,6 +223,7 @@ pub(crate) fn read_responses_stream(
     let mut reasoning_items: Vec<Value> = Vec::new();
     let mut usage_tokens = None;
     let mut usage_cached: Option<u64> = None;
+    let mut usage_completion: u64 = 0;
 
     loop {
         if cancel.take_cancelled() {
@@ -350,6 +354,10 @@ pub(crate) fn read_responses_stream(
             "response.completed" | "response.done" => {
                 if let Some(usage) = event.pointer("/response/usage") {
                     usage_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+                    usage_completion = usage
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     usage_cached = usage
                         .pointer("/input_tokens_details/cached_tokens")
                         .and_then(Value::as_u64);
@@ -382,6 +390,7 @@ pub(crate) fn read_responses_stream(
         },
         usage_tokens.map(|tokens| Usage {
             prompt_tokens: tokens,
+            completion_tokens: usage_completion,
             cached_tokens: usage_cached,
         }),
     ))
@@ -435,14 +444,17 @@ mod tests {
     #[test]
     fn stream_usage_parses_cached_tokens_with_and_without_detail() {
         let usage: StreamUsage = serde_json::from_str(
-            r#"{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":42}}"#,
+            r#"{"prompt_tokens":100,"completion_tokens":17,"prompt_tokens_details":{"cached_tokens":42}}"#,
         )
         .unwrap();
         assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 17);
         assert_eq!(usage.prompt_details.map(|d| d.cached_tokens), Some(42));
 
         let usage: StreamUsage = serde_json::from_str(r#"{"prompt_tokens":100}"#).unwrap();
         assert!(usage.prompt_details.is_none());
+        // Providers that omit completion_tokens parse as 0, not fail.
+        assert_eq!(usage.completion_tokens, 0);
     }
 
     // ---- SSE parser tests: real reqwest::blocking::Response built from an
@@ -525,7 +537,7 @@ mod tests {
             r#"data: {"choices":[{"delta":{"content":"second line"}}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"pa"}}]}}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]}}]}"#,
-            r#"data: {"choices":[],"usage":{"prompt_tokens":123,"prompt_tokens_details":{"cached_tokens":7}}}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":7}}}"#,
             "data: [DONE]",
         ]);
         let (msg, usage) = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
@@ -539,6 +551,7 @@ mod tests {
             usage,
             Some(Usage {
                 prompt_tokens: 123,
+                completion_tokens: 45,
                 cached_tokens: Some(7)
             })
         );
@@ -599,7 +612,7 @@ mod tests {
             r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item_2","call_id":"call_2","name":"bash","arguments":""}}"#,
             r#"data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"LATER"}"#,
             r#"data: {"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","name":"ghost"}}"#,
-            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"input_tokens_details":{"cached_tokens":5}}}}"#,
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"output_tokens":9,"input_tokens_details":{"cached_tokens":5}}}}"#,
             "data: [DONE]",
         ]);
         let (msg, usage) =
@@ -619,6 +632,7 @@ mod tests {
             usage,
             Some(Usage {
                 prompt_tokens: 50,
+                completion_tokens: 9,
                 cached_tokens: Some(5)
             })
         );

@@ -40,6 +40,37 @@ pub(crate) fn persist_pending(
     Ok(())
 }
 
+/// Shared per-call accounting: live context usage in `state`, the sink
+/// event the TUI accumulates spend from (carrying the daemon-priced USD
+/// cost, so the remote client never re-prices locally), and the
+/// session-cumulative USD cost. Also used for compaction summarizer calls,
+/// which are billed too.
+fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u: Usage) {
+    state.last_usage = Some(u.prompt_tokens);
+    state.last_cached = u.cached_tokens;
+    let cost = crate::llm::config::usage_cost(&config.model, config.provider, &config.base_url, &u)
+        .unwrap_or_else(|| {
+            #[allow(clippy::cast_precision_loss)]
+            let rate_per_1k = std::env::var("DEX_COST_PER_1K")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.002);
+            #[allow(clippy::cast_precision_loss)]
+            {
+                (u.prompt_tokens + u.completion_tokens) as f64 * rate_per_1k / 1000.0
+            }
+        });
+    if let Some(sink) = console.sink() {
+        let _ = sink.send(SinkLine::Usage {
+            tokens: u.prompt_tokens,
+            cached: u.cached_tokens,
+            cost,
+            output: u.completion_tokens,
+        });
+    }
+    state.total_cost += cost;
+}
+
 fn call_client_cancellable(
     client: &(impl ModelClient + Sync + Send + Clone + 'static),
     cancel: &(impl CancellationSource + Clone + Send + Sync + 'static),
@@ -171,8 +202,13 @@ pub(crate) fn process_turn(
                 break;
             }
             match compact_history(config, messages, cancel) {
-                Ok(true) => {
+                Ok((true, compacted)) => {
                     compaction_attempts += 1;
+                    // Summarizer calls are billed like any other; account
+                    // them so the status-bar spend includes compaction.
+                    if let Some(u) = compacted {
+                        record_usage(config, state, console, u);
+                    }
                     if let Some(session) = session.as_deref_mut() {
                         session.clear_messages()?;
                         for message in messages.iter().skip(1) {
@@ -182,7 +218,7 @@ pub(crate) fn process_turn(
                     persisted_cursor = messages.len();
                     continue;
                 }
-                Ok(false) => break,
+                Ok((false, _)) => break,
                 Err(e) if e.contains("cancelled") => return Err(e.into()),
                 Err(e) => return Err(e.into()),
             }
@@ -200,31 +236,7 @@ pub(crate) fn process_turn(
             };
         if let Some(u) = usage {
             last_usage = Some(u.prompt_tokens);
-            state.last_usage = last_usage;
-            state.last_cached = u.cached_tokens;
-            if let Some(sink) = console.sink() {
-                let _ = sink.send(SinkLine::Usage {
-                    tokens: u.prompt_tokens,
-                    cached: u.cached_tokens,
-                });
-            }
-            let cost = crate::llm::config::cost_for_prompt(
-                &config.model,
-                u.prompt_tokens,
-                u.cached_tokens,
-            )
-            .unwrap_or_else(|| {
-                #[allow(clippy::cast_precision_loss)]
-                let rate_per_1k = std::env::var("DEX_COST_PER_1K")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.002);
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    u.prompt_tokens as f64 * rate_per_1k / 1000.0
-                }
-            });
-            state.total_cost += cost;
+            record_usage(config, state, console, u);
         }
 
         if let Some(calls) = message.tool_calls.clone() {
@@ -449,6 +461,7 @@ mod tests {
                 },
                 Some(Usage {
                     prompt_tokens: 1,
+                    completion_tokens: 0,
                     cached_tokens: None,
                 }),
             ))
@@ -569,6 +582,7 @@ mod tests {
                 message,
                 Some(Usage {
                     prompt_tokens: 1,
+                    completion_tokens: 0,
                     cached_tokens: None,
                 }),
             ))

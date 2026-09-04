@@ -223,46 +223,84 @@ fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u6
     None
 }
 
-/// Cost for one prompt, using models.dev pricing when available.
-/// `input`/`cache_read` are per 1M tokens in the catalog; output tiers
-/// and context-tier pricing are omitted for now (ponytail: add when a
-/// model actually bills them differently enough to matter).
-pub(crate) fn cost_for_prompt(
-    model: &str,
-    prompt_tokens: u64,
-    cached_tokens: Option<u64>,
-) -> Option<f64> {
-    let catalog = load_dex_catalog()?;
-    let needle = model.to_ascii_lowercase();
-    let mut cost_val: Option<&serde_json::Value> = None;
-    if let Some(providers) = catalog.as_object() {
-        for (_prov, entry) in providers {
-            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                if let Some(m) = models.get(needle.as_str()).or_else(|| {
-                    models
-                        .iter()
-                        .find(|(k, _)| k.to_ascii_lowercase() == needle)
-                        .map(|(_, v)| v)
-                }) {
-                    if let Some(c) = m.get("cost") {
-                        cost_val = Some(c);
-                        break;
-                    }
+/// Catalog provider keys that can serve a dex provider, mirroring the
+/// qualified-id table in `load_dex_models_cache`.
+fn catalog_provider_keys(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::OpenCode => &["opencode", "opencode-go", "openai"],
+        Provider::OpenAiCodex => &["openai-codex", "codex"],
+    }
+}
+
+/// First `cost` object for `needle` among catalog providers accepted by
+/// `pick`, in the catalog's provider order.
+fn catalog_cost<'a>(
+    catalog: &'a serde_json::Value,
+    needle: &str,
+    pick: impl Fn(&str, &serde_json::Value) -> bool,
+) -> Option<&'a serde_json::Value> {
+    let providers = catalog.as_object()?;
+    for (key, entry) in providers {
+        if !pick(key, entry) {
+            continue;
+        }
+        if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+            if let Some(m) = models.get(needle).or_else(|| {
+                models
+                    .iter()
+                    .find(|(k, _)| k.to_ascii_lowercase() == needle)
+                    .map(|(_, v)| v)
+            }) {
+                if let Some(c) = m.get("cost") {
+                    return Some(c);
                 }
             }
         }
     }
-    let cost = cost_val?;
-    let input_rate = cost.get("input").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cache_read_rate = cost
+    None
+}
+
+/// Cost for one LLM call, using models.dev pricing when available. The same
+/// model id is listed by many resellers at different prices, so the entry
+/// whose `api` matches the configured endpoint wins, then any catalog entry
+/// of the configured provider, then any provider. `input`/`cache_read`/
+/// `output` are USD per 1M tokens in the catalog; cache-write tokens are not
+/// reported by the OpenAI-compatible endpoints dex speaks, so there is no
+/// cache-write term. Cache hits and a missing output rate both fall back to
+/// the full input price.
+pub(crate) fn usage_cost(
+    model: &str,
+    provider: Provider,
+    base_url: &str,
+    usage: &crate::core::types::Usage,
+) -> Option<f64> {
+    let catalog = load_dex_catalog()?;
+    let needle = model.to_ascii_lowercase();
+    let keys = catalog_provider_keys(provider);
+    let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
+        entry.get("api").and_then(|v| v.as_str()) == Some(base_url)
+    })
+    .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.contains(&key)))
+    .or_else(|| catalog_cost(&catalog, &needle, |_, _| true))?;
+    let input_rate = cost_val
+        .get("input")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let cache_read_rate = cost_val
         .get("cache_read")
-        .or_else(|| cost.get("cacheRead"))
+        .or_else(|| cost_val.get("cacheRead"))
         .and_then(|v| v.as_f64())
         .unwrap_or(input_rate);
-    let cached = cached_tokens.unwrap_or(0).min(prompt_tokens);
-    let fresh = prompt_tokens.saturating_sub(cached);
-    let total =
-        fresh as f64 * input_rate / 1_000_000.0 + cached as f64 * cache_read_rate / 1_000_000.0;
+    let output_rate = cost_val
+        .get("output")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(input_rate);
+    let cached = usage.cached_tokens.unwrap_or(0).min(usage.prompt_tokens);
+    let fresh = usage.prompt_tokens.saturating_sub(cached);
+    #[allow(clippy::cast_precision_loss)]
+    let total = fresh as f64 * input_rate / 1_000_000.0
+        + cached as f64 * cache_read_rate / 1_000_000.0
+        + usage.completion_tokens as f64 * output_rate / 1_000_000.0;
     Some(total)
 }
 
@@ -865,6 +903,114 @@ pub(crate) mod tests {
         // Unknown prefix is a plain model id.
         assert_eq!(cfg.apply_model("unknown/m", false), None);
         assert_eq!(cfg.model, "unknown/m");
+    }
+
+    /// Synthetic models.dev catalog: the same id priced differently per
+    /// provider, with the endpoint-exact entry NOT first alphabetically.
+    fn write_cost_catalog(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("dex/models.dev.json"),
+            serde_json::json!({
+                "aaa-reseller": {
+                    "api": "https://aaa.example/v1",
+                    "models": {
+                        "m-1": { "cost": { "input": 2.0 } },
+                        "m-2": { "cost": { "input": 4.0 } }
+                    }
+                },
+                "opencode": {
+                    "api": "https://zen.example/v1",
+                    "models": { "m-1": { "cost": { "input": 0.5 } } }
+                },
+                "opencode-go": {
+                    "api": "https://go.example/v1",
+                    "models": {
+                        "m-1": { "cost": { "input": 0.25, "cache_read": 0.0625, "output": 2.0 } }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn usage_cost_prefers_endpoint_then_provider_pricing() {
+        // Serializes process-env redirection against other tests.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dex-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_cost_catalog(&dir);
+        let prev_cache = env::var_os("XDG_CACHE_HOME");
+        env::set_var("XDG_CACHE_HOME", &dir);
+        let usage = |prompt: u64, completion: u64, cached: Option<u64>| Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: cached,
+        };
+
+        // Endpoint-exact match wins even though "aaa-reseller" sorts first.
+        assert_eq!(
+            usage_cost(
+                "m-1",
+                Provider::OpenCode,
+                "https://go.example/v1",
+                &usage(1_000_000, 0, None)
+            ),
+            Some(0.25)
+        );
+        // Fresh + cached + output are each billed at their own rate:
+        // 0.6*0.25 + 0.4*0.0625 + 100k*2.0/1M.
+        assert_eq!(
+            usage_cost(
+                "m-1",
+                Provider::OpenCode,
+                "https://go.example/v1",
+                &usage(1_000_000, 100_000, Some(400_000))
+            ),
+            Some(0.375)
+        );
+        // No endpoint match: the configured provider's catalog keys win over
+        // the global scan (0.5, not aaa-reseller's 2.0).
+        assert_eq!(
+            usage_cost(
+                "m-1",
+                Provider::OpenCode,
+                "https://unrelated.example/v1",
+                &usage(1_000_000, 0, None)
+            ),
+            Some(0.5)
+        );
+        // A catalog entry without an output rate bills output at the input
+        // rate: 1M*0.5 + 1M*0.5.
+        assert_eq!(
+            usage_cost(
+                "m-1",
+                Provider::OpenCode,
+                "https://unrelated.example/v1",
+                &usage(1_000_000, 1_000_000, None)
+            ),
+            Some(1.0)
+        );
+        // Model only listed by another provider: global fallback still prices it.
+        assert_eq!(
+            usage_cost(
+                "m-2",
+                Provider::OpenAiCodex,
+                "https://x.example/v1",
+                &usage(1_000_000, 0, None)
+            ),
+            Some(4.0)
+        );
+
+        match prev_cache {
+            Some(v) => env::set_var("XDG_CACHE_HOME", v),
+            None => env::remove_var("XDG_CACHE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     pub(crate) fn test_cfg() -> LlmConfig {
