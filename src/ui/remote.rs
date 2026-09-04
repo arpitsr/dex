@@ -24,9 +24,9 @@ use crate::session::Session;
 
 use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
 use super::{
-    append_sink_line, push_info, push_info_line, render_user_prompt, resolve_approval,
-    scroll_transcript, view, App, DisableAlternateScroll, EnableAlternateScroll, PendingApproval,
-    TerminalCleanup,
+    append_sink_line, close_thinking, push_info, push_info_line, render_user_prompt,
+    resolve_approval, scroll_transcript, view, App, DisableAlternateScroll, EnableAlternateScroll,
+    PendingApproval, TerminalCleanup,
 };
 
 /// Messages flowing from the per-turn worker thread into the UI loop.
@@ -228,6 +228,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         connection: Some(connection_label(daemon_url)),
         assistant_open: false,
         show_thinking: false,
+        thinking_open: false,
         transcript_version: 0,
         display_cache: Vec::new(),
         display_cache_width: 0,
@@ -539,6 +540,9 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     app.busy = false;
     app.cancel_requested = false;
     app.active_tool = None;
+    // A turn can end right after thinking (cancel, failure before any text);
+    // settle the indicator instead of leaving the dots animating forever.
+    close_thinking(app);
     remote.cancel_flag.store(false, Ordering::SeqCst);
     if let Some(started) = app.turn_started.take() {
         let tokens = app

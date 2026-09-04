@@ -137,6 +137,10 @@ pub(crate) struct App {
     /// Whether streamed thinking blocks render in full (Ctrl+T) or as a
     /// one-line preview.
     pub(crate) show_thinking: bool,
+    /// Whether the tail `Thinking` block is still streaming deltas. Drives
+    /// the collapsed indicator's dot animation; it closes (settles) as soon
+    /// as any non-thinking line arrives or the turn ends.
+    pub(crate) thinking_open: bool,
     pub(crate) plan: crate::core::types::Plan,
     pub(crate) transcript_version: u64,
     pub(crate) display_cache: Vec<Line<'static>>,
@@ -259,6 +263,7 @@ fn indent_transcript_line(mut line: Line<'static>) -> Line<'static> {
 }
 
 pub(super) fn push_info_line(app: &mut App, line: Line<'static>) {
+    close_thinking(app);
     app.assistant_open = false;
     app.transcript
         .push(TranscriptBlock::Info(indent_transcript_line(line)));
@@ -278,6 +283,12 @@ pub(super) fn push_info(app: &mut App, text: String) {
 /// tail `Assistant` block while streaming). No empty gap `Line`s are stored;
 /// `TranscriptView` inserts a single blank `Line` between any two blocks.
 pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
+    // Anything other than a thinking delta closes the open thinking block;
+    // the forced version bump settles the collapsed indicator even when the
+    // tail delta's throttled bump didn't fire.
+    if !matches!(sl, SinkLine::Thinking(_)) {
+        close_thinking(app);
+    }
     match sl {
         SinkLine::Assistant(s) => {
             if s.trim().is_empty() {
@@ -324,6 +335,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 app.transcript.push(TranscriptBlock::Thinking(s));
                 app.transcript_version = app.transcript_version.wrapping_add(1);
             }
+            app.thinking_open = true;
         }
         SinkLine::ToolInput(s) => {
             dim_intermediate_assistant_block(app);
@@ -455,6 +467,17 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
     // during streaming stays put instead of snapping back each chunk.
 }
 
+/// Close the streaming thinking block, if any: stops the collapsed
+/// indicator's dot animation and forces a re-render so it settles at its
+/// static "Thinking ..." frame even when the last delta's throttled
+/// version bump didn't fire.
+pub(super) fn close_thinking(app: &mut App) {
+    if app.thinking_open {
+        app.thinking_open = false;
+        app.transcript_version = app.transcript_version.wrapping_add(1);
+    }
+}
+
 fn dim_intermediate_assistant_block(app: &mut App) {
     if let Some(TranscriptBlock::Assistant(lines)) = app.transcript.last_mut() {
         for line in lines.iter_mut() {
@@ -482,6 +505,7 @@ pub(super) fn scroll_transcript(app: &mut App, delta: i32) {
 /// Render the user's submitted prompt with the shared transcript grid.
 /// No empty gap `Line`s are stored; gutter is inserted by `TranscriptView`.
 pub(super) fn render_user_prompt(app: &mut App, line: &str) {
+    close_thinking(app);
     app.assistant_open = false;
     let user_bg = Style::default()
         .fg(theme::surface_fg())
@@ -506,6 +530,7 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
 pub(crate) fn rebuild_transcript(app: &mut App) {
     app.transcript.clear();
     app.assistant_open = false;
+    app.thinking_open = false;
     app.active_tool = None;
     app.transcript_version = app.transcript_version.wrapping_add(1);
     let msgs = app.messages.clone();
@@ -620,6 +645,7 @@ mod tests {
             connection: None,
             assistant_open: false,
             show_thinking: false,
+            thinking_open: false,
             plan: crate::core::types::Plan::default(),
             transcript_version: 0,
             display_cache: Vec::new(),
@@ -638,9 +664,14 @@ mod tests {
                 crate::core::types::SinkLine::Thinking(chunk.into()),
             );
         }
+        assert!(app.thinking_open, "streaming deltas keep the block open");
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("done".into()),
+        );
+        assert!(
+            !app.thinking_open,
+            "assistant text closes the thinking block"
         );
         assert_eq!(app.transcript.len(), 2);
         assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "Let me think."));
@@ -659,6 +690,17 @@ mod tests {
         }
         assert_eq!(app.transcript.len(), 1);
         assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking(t) if t == "abc"));
+        assert!(app.thinking_open);
+    }
+
+    #[test]
+    fn thinking_closes_on_user_prompt() {
+        // Steering-style interleave: a user prompt lands mid-turn.
+        let mut app = test_app();
+        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("h".into()));
+        assert!(app.thinking_open);
+        render_user_prompt(&mut app, "steer");
+        assert!(!app.thinking_open);
     }
 
     #[test]
