@@ -243,7 +243,7 @@ Any other arguments are treated as a one-shot prompt.
 - **Ctrl+T** — expand/collapse the full thinking block.
 - **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the transcript.
 - **Paste** — pasted text is inserted at the cursor.
-- **Mouse drag** — selects text natively for copying; the TUI does not capture the mouse.
+- **Mouse wheel** — scrolls the transcript. **Drag** — selects transcript text with a visible highlight and copies it to the clipboard on release (OSC 52; a click just clears). **Shift+drag** (Option+drag in iTerm2) still bypasses mouse reporting for native selection; tmux users may need `set -g set-clipboard on`.
 
 ### Steering and follow-ups
 

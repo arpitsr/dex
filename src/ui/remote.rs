@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, DisableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -24,9 +27,10 @@ use crate::session::Session;
 
 use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
 use super::{
-    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, push_banner,
-    push_info, push_info_line, render_user_prompt, resolve_approval, scroll_transcript, view, App,
-    DisableAlternateScroll, EnableAlternateScroll, PendingApproval, TerminalCleanup,
+    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, mouse_display_cell,
+    push_banner, push_info, push_info_line, render_user_prompt, resolve_approval,
+    scroll_transcript, selection_text, view, App, EnableMouseScroll, PendingApproval, Selection,
+    TerminalCleanup,
 };
 
 /// Messages flowing from the per-turn worker thread into the UI loop.
@@ -233,6 +237,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
         display_cache: Vec::new(),
+        transcript_area: None,
+        selection: None,
+        notice: None,
     };
 
     let mut remote = RemoteApp {
@@ -298,22 +305,23 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // loop below.
     let _cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
-    // No mouse capture: capturing the mouse makes the terminal hand over
-    // click-drag events and stops its own text selection entirely. Instead
-    // alternate scroll (DECSET 1007) keeps wheel scrolling working by
-    // delivering it as Up/Down arrows, and selection/copy stay native.
+    // Wheel reporting (DECSET 1000 + SGR 1006): scroll events arrive as real
+    // `Event::Mouse` input instead of the terminal synthesizing Up/Down arrow
+    // presses (DECSET 1007), so the wheel always scrolls the transcript and
+    // plain Up/Down always edit the composer. Clicks are ignored; hold Shift
+    // (Option in iTerm2) for native drag-select/copy.
     execute!(
         stdout,
         DisableMouseCapture,
         EnterAlternateScreen,
-        EnableAlternateScroll
+        EnableMouseScroll
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut run = || -> std::io::Result<()> {
-        // Events consumed while classifying arrow bursts, replayed on the
-        // next iterations of the loop.
+        // Events consumed by the OSC-report lookahead, replayed on the next
+        // iterations of the loop.
         let mut pending: VecDeque<Event> = VecDeque::new();
         // ponytail: draw on change, not on a 60 fps heartbeat — every frame
         // rebuilds the whole view (O(transcript)), which showed up as the top
@@ -350,6 +358,10 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             }
 
             let busy = remote.app.busy;
+            // An expired status notice needs one more frame to disappear.
+            if remote.app.tick_notice() {
+                dirty = true;
+            }
             if dirty || streamed || busy {
                 // Advance the animation frame so the spinner + status update.
                 remote.app.tick = remote.app.tick.wrapping_add(1);
@@ -373,8 +385,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
 
             match next {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key_event(&mut remote, key, &mut pending)?;
+                    handle_key(&mut remote, key);
                 }
+                Event::Mouse(mouse) => handle_mouse(&mut remote, mouse),
                 Event::Paste(s) => {
                     // Tabs would render as tab stops and desync the frame;
                     // expand them and drop other control characters.
@@ -406,13 +419,55 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let res = run();
     // Always restore the terminal, even if the loop returned early via `?`.
     disable_raw_mode().ok();
-    let _ = execute!(
-        io::stdout(),
-        DisableAlternateScroll,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    );
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     res
+}
+
+/// Mouse routing: wheel scrolls the transcript; left press/drag/release
+/// selects transcript text with a visible highlight and copies it to the
+/// system clipboard (OSC 52) on release. A click clears; Shift+drag still
+/// bypasses mouse reporting for native selection.
+fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
+    match m.kind {
+        MouseEventKind::ScrollUp => scroll_transcript(&mut remote.app, -3),
+        MouseEventKind::ScrollDown => scroll_transcript(&mut remote.app, 3),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Pressing outside the transcript (composer, activity line)
+            // clears any live selection instead of starting a new one.
+            remote.app.selection = mouse_display_cell(
+                remote.app.scroll,
+                remote.app.transcript_area,
+                remote.app.display_cache.len(),
+                &m,
+            )
+            .map(|cell| Selection {
+                anchor: cell,
+                end: cell,
+            });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(sel) = remote.app.selection.as_mut() {
+                if let Some(cell) = mouse_display_cell(
+                    remote.app.scroll,
+                    remote.app.transcript_area,
+                    remote.app.display_cache.len(),
+                    &m,
+                ) {
+                    sel.end = cell;
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(sel) = remote.app.selection.take() {
+                if !sel.is_empty() {
+                    let ((r0, c0), (r1, c1)) = sel.norm();
+                    let text = selection_text(&remote.app.display_cache, (r0, c0), (r1, c1));
+                    remote.app.copy_selection(&text);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
@@ -575,62 +630,6 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
             started.elapsed().as_secs_f64(),
             super::format_tokens(tokens)
         ));
-    }
-}
-
-/// How long to watch for a follow-up arrow before deciding a plain Up/Down
-/// was a real keypress rather than the tail of a mouse-wheel burst.
-const ARROW_LOOKAHEAD: Duration = Duration::from_millis(25);
-
-/// Route a key press, telling real arrow presses from mouse-wheel scrolls.
-/// Without mouse capture the wheel reaches the app through alternate scroll
-/// (DECSET 1007): one wheel notch arrives as a burst of plain Up/Down
-/// presses queued back-to-back, while real presses — and key auto-repeat —
-/// are spaced tens of milliseconds apart. So a plain arrow is only treated
-/// as a wheel scroll when a second plain arrow shows up within the
-/// lookahead window; anything else read meanwhile is replayed from
-/// `pending` so no input is dropped.
-fn handle_key_event(
-    remote: &mut RemoteApp,
-    key: crossterm::event::KeyEvent,
-    pending: &mut VecDeque<Event>,
-) -> std::io::Result<()> {
-    if key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down) {
-        let mut delta = arrow_delta(key.code);
-        let mut wheel = false;
-        // ponytail: poll(0) drain — alternate-scroll bursts are already queued,
-        // no 25ms wait. Keeps wheel instant and stops the "keeps moving" lag.
-        while event::poll(Duration::from_millis(0))? {
-            match event::read()? {
-                Event::Key(k)
-                    if k.kind == KeyEventKind::Press
-                        && k.modifiers.is_empty()
-                        && matches!(k.code, KeyCode::Up | KeyCode::Down) =>
-                {
-                    wheel = true;
-                    delta += arrow_delta(k.code);
-                }
-                other => {
-                    pending.push_back(other);
-                    break;
-                }
-            }
-        }
-        if wheel {
-            // 3 Up per notch -> 9 rows per notch feels responsive without page jump
-            scroll_transcript(&mut remote.app, delta * 3);
-            return Ok(());
-        }
-    }
-    handle_key(remote, key);
-    Ok(())
-}
-
-fn arrow_delta(code: KeyCode) -> i32 {
-    if code == KeyCode::Up {
-        -1
-    } else {
-        1
     }
 }
 

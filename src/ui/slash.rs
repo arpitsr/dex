@@ -434,7 +434,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "mouse: drag to select text and copy · wheel scrolls".to_string(),
+                "mouse: drag selects + copies · wheel scrolls transcript".to_string(),
             );
             push_info(app, "while working: Enter queues steer · Alt+Enter queues follow-up · Esc/Ctrl+C cancels and restores queued input".to_string());
         }
