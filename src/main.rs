@@ -185,12 +185,39 @@ fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
     Ok(addr)
 }
 
+fn print_help() {
+    println!(
+        "dex {version}\n\
+        \n\
+        Usage: dex [OPTIONS] [COMMAND|PROMPT]\n\
+        \n\
+        Commands:\n  \
+        serve [bind]              daemon on 127.0.0.1:8420\n  \
+        connect <url> [prompt]    TUI or one-shot against a daemon\n  \
+        run <tool> k=v...         one-shot tool (read, bash, write, edit, ffgrep, fffind)\n  \
+        update --models           refresh model catalog\n  \
+        --tool                    raw JSON tool mode (stdin)\n\
+        \n\
+        Options:\n  \
+        --model <name>            --base-url <url>  --permission <mode>\n  \
+        -s/--session <path>  --no-session  -n/--new  --name <name>  --skill <dir>\n  \
+        -h/--help  -V/--version",
+        version = env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn main() {
     install_sigint_handler();
     let args = cli::parse_args();
     let mode = cli::resolve_mode(&args);
 
     match mode {
+        Mode::Help => {
+            print_help();
+        }
+        Mode::Version => {
+            println!("dex {}", env!("CARGO_PKG_VERSION"));
+        }
         Mode::Serve { bind } => {
             let addr: std::net::SocketAddr = if bind.contains(':') {
                 bind.parse().unwrap_or_else(|_| {
