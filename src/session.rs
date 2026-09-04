@@ -170,11 +170,26 @@ impl Session {
             .append(true)
             .open(&path)?;
         writeln!(file, "{}", line)?;
-        Ok(Self {
+        let mut session = Self {
             header,
             path: Some(path),
             counter: 0,
-        })
+        };
+        let skills = crate::skills::discover_skills(&crate::skills::skill_dirs());
+        session.record_skills(&skills);
+        Ok(session)
+    }
+
+    /// Record the skills loaded when the session starts as a `session_state`
+    /// entry (key `skills`), so the JSONL documents which skills the system
+    /// prompt advertised at session start. Failures are swallowed: a bad
+    /// skills record must not fail session creation.
+    fn record_skills(&mut self, skills: &[crate::core::types::Skill]) {
+        if skills.is_empty() {
+            return;
+        }
+        let value = skills_state_value(skills);
+        let _ = self.set_state("skills", &value);
     }
 
     pub(crate) fn from_path(path: &Path) -> io::Result<Self> {
@@ -552,6 +567,22 @@ fn uuid4() -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15])
+}
+
+/// Serialize discovered skills for the session-start `skills` state entry:
+/// a JSON array of `{name, description, path}` objects.
+fn skills_state_value(skills: &[crate::core::types::Skill]) -> String {
+    let entries: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "path": s.path.display().to_string(),
+            })
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_default()
 }
 
 pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
@@ -941,5 +972,24 @@ mod tests {
         if let Some(p) = s.path() {
             let _ = fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn record_skills_writes_session_state_entry() {
+        let skills = vec![crate::core::types::Skill {
+            name: "demo".into(),
+            description: "does demo things".into(),
+            path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
+        }];
+        let mut s = Session::new("/tmp/dex-skills-test".into(), None).unwrap();
+        s.record_skills(&skills);
+        let path = s.path().unwrap().to_path_buf();
+        let state = load_session_state(&path).unwrap();
+        let recorded: serde_json::Value =
+            serde_json::from_str(state.get("skills").unwrap()).unwrap();
+        assert_eq!(recorded[0]["name"], "demo");
+        assert_eq!(recorded[0]["description"], "does demo things");
+        assert_eq!(recorded[0]["path"], "/tmp/demo/SKILL.md");
+        let _ = fs::remove_file(path);
     }
 }

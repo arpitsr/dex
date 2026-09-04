@@ -82,6 +82,27 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
     }
 }
 
+/// Show which skills the daemon has loaded. Used at session start and after
+/// `/new`, so the user can see what `/skill:<name>` can load.
+fn push_skills_listing(app: &mut App) {
+    let names: Vec<String> = app.skills.iter().map(|s| s.name.clone()).collect();
+    if names.is_empty() {
+        push_info(
+            app,
+            "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
+                .to_string(),
+        );
+    } else {
+        push_info(
+            app,
+            format!("skills loaded ({}): /skill:<name> loads one", names.len()),
+        );
+        for n in &names {
+            push_info(app, format!("  - {n}"));
+        }
+    }
+}
+
 pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std::io::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(std::io::Error::other(
@@ -239,6 +260,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             format!("reattached to session {session_id}"),
         );
     }
+
+    // Surface the skills the daemon discovered at session start.
+    push_skills_listing(&mut remote.app);
 
     // Detect the terminal background before raw mode / the alternate screen
     // take over; surface colors are resolved from this once.
@@ -1093,6 +1117,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                         remote.options.plan = None;
                         remote.app.session = Session::in_memory(cwd);
                         push_info(&mut remote.app, label.to_string());
+                        push_skills_listing(&mut remote.app);
                     }
                     Err(e) => {
                         push_info(&mut remote.app, format!("could not start new session: {e}"))
