@@ -533,9 +533,9 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 .iter()
                 .map(|line| {
                     let style = if is_diff {
-                        if line.starts_with('+') {
+                        if line.starts_with('+') && !line.starts_with("+++") {
                             Style::default().fg(Color::LightGreen)
-                        } else if line.starts_with('-') {
+                        } else if line.starts_with('-') && !line.starts_with("---") {
                             Style::default().fg(Color::LightRed)
                         } else if line.starts_with("@@") {
                             Style::default().fg(Color::Cyan)

@@ -304,6 +304,9 @@ pub(crate) fn process_turn(
                     cache_fingerprint(&name, &input)
                 );
                 let succeeded = outcome.ok;
+                // Captured before `outcome.text` is moved below: the
+                // pre-mutation unified diff for write/edit results.
+                let diff = outcome.diff.clone();
                 if succeeded {
                     if last_tools.len() >= 6 {
                         last_tools.remove(0);
@@ -363,7 +366,21 @@ pub(crate) fn process_turn(
                         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "chain"
                     );
                     let skip_first = !counts_only || !ok;
-                    let preview = tool_result_preview(&result, 3, skip_first);
+                    // Every tool renders the same transcript shape: outcome
+                    // line, then a capped snippet with a `… +N more` tail.
+                    // write/edit show the review-oriented unified diff and
+                    // read its numbered snippet; other tools share the
+                    // generic informational preview. Failures fall back to
+                    // the error text so the cause stays visible.
+                    let preview = match diff.as_deref() {
+                        Some(diff) if matches!(name.as_str(), "write" | "edit") && ok => {
+                            diff_preview_lines(diff, 30)
+                        }
+                        _ if name == "read" && ok => {
+                            read_preview_lines(&result, TRANSCRIPT_PREVIEW_LINES)
+                        }
+                        _ => tool_result_preview(&result, TRANSCRIPT_PREVIEW_LINES, skip_first),
+                    };
                     let _ = sink.send(SinkLine::ToolOutput {
                         name: name.clone(),
                         summary,
@@ -373,12 +390,17 @@ pub(crate) fn process_turn(
                     });
                 } else {
                     with_console(console.sink().is_some(), || {
+                        // Headless one-shot path: same GitHub-style snippet
+                        // the TUI shows, not just the "edited …" line.
+                        let body = match diff.as_deref() {
+                            Some(d) if matches!(name.as_str(), "write" | "edit") && ok => {
+                                terminal_preview(d)
+                            }
+                            _ => terminal_preview(&result),
+                        };
                         eprintln!(
                             "{}[tool output] {}:\n{}{}",
-                            TOOL_OUTPUT_COLOR,
-                            name,
-                            terminal_preview(&result),
-                            RESET
+                            TOOL_OUTPUT_COLOR, name, body, RESET
                         );
                     });
                 }
