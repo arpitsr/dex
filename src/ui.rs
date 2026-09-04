@@ -80,6 +80,13 @@ pub(crate) enum TranscriptBlock {
         stamp: u64,
         line: Line<'static>,
     },
+    /// Multi-line pre-rendered block (the session-start DEX art). One block,
+    /// so its rows render back-to-back — separate blocks would each get a
+    /// blank gap line from `TranscriptView` and shred the art.
+    Banner {
+        stamp: u64,
+        lines: Vec<Line<'static>>,
+    },
 }
 
 impl TranscriptBlock {
@@ -94,7 +101,8 @@ impl TranscriptBlock {
             | Self::Tool { stamp, .. }
             | Self::System { stamp, .. }
             | Self::Error { stamp, .. }
-            | Self::Info { stamp, .. } => *stamp,
+            | Self::Info { stamp, .. }
+            | Self::Banner { stamp, .. } => *stamp,
         }
     }
 
@@ -106,7 +114,8 @@ impl TranscriptBlock {
             | Self::Tool { stamp, .. }
             | Self::System { stamp, .. }
             | Self::Error { stamp, .. }
-            | Self::Info { stamp, .. } => stamp,
+            | Self::Info { stamp, .. }
+            | Self::Banner { stamp, .. } => stamp,
         };
         *stamp = stamp.wrapping_add(1);
     }
@@ -145,6 +154,7 @@ impl TranscriptBlock {
             TranscriptBlock::System { line, .. } => vec![line],
             TranscriptBlock::Error { line, .. } => vec![line],
             TranscriptBlock::Info { line, .. } => vec![line],
+            TranscriptBlock::Banner { lines, .. } => lines.iter().collect(),
         }
     }
 }
@@ -186,7 +196,7 @@ pub(crate) struct App {
     pub(crate) slash_selected: usize,
     /// How this TUI reached its agent engine, e.g. "[L] 127.0.0.1" (local
     /// loopback) or "[R] daemon.internal" (remote). Pinned to the right edge
-    /// of the status bar; the transcript stays free of startup banners.
+    /// of the status bar; the only other session-start block is the DEX art.
     pub(crate) connection: Option<String>,
     /// Whether the tail `Assistant` block is still open for streaming
     /// coalescence. Tracked so an initial transcript block (e.g. in tests)
@@ -346,6 +356,35 @@ pub(super) fn push_info(app: &mut App, text: String) {
         app,
         Line::from(Span::styled(text, Style::default().fg(Color::Cyan))),
     );
+}
+
+/// Session-start ASCII art ("DEX"), pushed as the transcript's first block.
+const DEX_ART: &str = "\
+██████╗ ███████╗██╗  ██╗
+██╔══██╗██╔════╝╚██╗██╔╝
+██║  ██║█████╗   ╚███╔╝
+██║  ██║██╔══╝   ██╔██╗
+██████╔╝███████╗██╔╝ ██╗
+╚═════╝ ╚══════╝╚═╝  ╚═╝";
+
+/// Push the session-start DEX art. One `Banner` block (not per-row Info
+/// blocks) so `TranscriptView` renders the rows back-to-back without the
+/// blank gap it inserts between blocks.
+pub(super) fn push_banner(app: &mut App) {
+    flush_assistant(app);
+    close_thinking(app);
+    app.assistant_open = false;
+    let lines = DEX_ART
+        .lines()
+        .map(|row| {
+            indent_transcript_line(Line::from(Span::styled(
+                row.trim_end().to_string(),
+                Style::default().fg(Color::Cyan),
+            )))
+        })
+        .collect();
+    app.transcript
+        .push(TranscriptBlock::Banner { stamp: 0, lines });
 }
 
 /// Drain the buffered assistant deltas into the tail `Assistant` block,
@@ -773,6 +812,34 @@ mod tests {
             wrapped_width: 0,
             display_cache: Vec::new(),
         }
+    }
+
+    #[test]
+    fn banner_is_one_block_of_six_art_rows() {
+        // One Banner block, not per-row Info blocks: TranscriptView inserts a
+        // blank gap line between blocks, which would shred the art apart.
+        let mut app = test_app();
+        push_banner(&mut app);
+        assert_eq!(app.transcript.len(), 1);
+        let lines = app.transcript[0].lines();
+        assert_eq!(lines.len(), 6);
+        let art = [
+            "██████╗ ███████╗██╗  ██╗",
+            "██╔══██╗██╔════╝╚██╗██╔╝",
+            "██║  ██║█████╗   ╚███╔╝",
+            "██║  ██║██╔══╝   ██╔██╗",
+            "██████╔╝███████╗██╔╝ ██╗",
+            "╚═════╝ ╚══════╝╚═╝  ╚═╝",
+        ];
+        for (line, row) in lines.iter().zip(art) {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, format!(" {row}"), "indent + art row, in order");
+        }
+        // Art rows carry the info color (the indent span is unstyled).
+        assert!(lines.iter().all(|l| l
+            .spans
+            .last()
+            .is_some_and(|s| s.style.fg == Some(Color::Cyan))));
     }
 
     #[test]

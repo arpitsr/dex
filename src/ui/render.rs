@@ -1734,6 +1734,43 @@ mod tests {
     }
 
     #[test]
+    fn session_banner_renders_without_inter_row_gaps() {
+        // The DEX art is one Banner block: its six rows must be contiguous in
+        // the display cache (a blank gap is only inserted between blocks, so
+        // separate per-row blocks would shred the art).
+        let mut app = test_app();
+        super::super::push_banner(&mut app);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+
+        let text =
+            |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let art = [
+            " ██████╗ ███████╗██╗  ██╗",
+            " ██╔══██╗██╔════╝╚██╗██╔╝",
+            " ██║  ██║█████╗   ╚███╔╝",
+            " ██║  ██║██╔══╝   ██╔██╗",
+            " ██████╔╝███████╗██╔╝ ██╗",
+            " ╚═════╝ ╚══════╝╚═╝  ╚═╝",
+        ];
+        let rows: Vec<String> = app.display_cache.iter().map(|l| text(l)).collect();
+        let start = rows
+            .iter()
+            .position(|r| r.starts_with(" ██████╗"))
+            .expect("banner top row present in display");
+        for (i, expected) in art.iter().enumerate() {
+            assert_eq!(
+                rows[start + i].as_str(),
+                *expected,
+                "six art rows contiguous and in order — no block gap inside the banner"
+            );
+        }
+    }
+
+    #[test]
     fn ui_status_shows_cumulative_token_total() {
         let mut app = test_app();
         // No LLM calls yet: no total suffix.
