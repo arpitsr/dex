@@ -513,8 +513,16 @@ pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
 }
 
 /// Render a streamed thinking block: collapsed = a single dim italic
-/// "Thinking…" indicator; expanded (Ctrl+T) = the full text, dim italic.
-fn thinking_display_lines(text: &str, expanded: bool, width: u16) -> Vec<Line<'static>> {
+/// "Thinking" indicator whose dots animate while the block streams and
+/// settle at "Thinking ..." once it closes; expanded (Ctrl+T) = the full
+/// text, dim italic.
+fn thinking_display_lines(
+    text: &str,
+    expanded: bool,
+    thinking_open: bool,
+    tick: u16,
+    width: u16,
+) -> Vec<Line<'static>> {
     let style = Style::default()
         .fg(theme::muted_fg())
         .add_modifier(Modifier::ITALIC);
@@ -526,7 +534,31 @@ fn thinking_display_lines(text: &str, expanded: bool, width: u16) -> Vec<Line<'s
             .flat_map(|l| wrap_line_display(&line(l), width))
             .collect();
     }
-    vec![line(&truncate_display("Thinking…", width))]
+    vec![thinking_indicator_line(thinking_open, tick, width)]
+}
+
+/// The collapsed indicator's text: while the block streams, the dot count
+/// cycles 1→3 on the same ~8-tick cadence the delta throttle uses; once the
+/// block closes it freezes at "Thinking ...".
+fn thinking_indicator_text(thinking_open: bool, tick: u16) -> String {
+    if !thinking_open {
+        return "Thinking ...".to_string();
+    }
+    let dots = match (tick / 8) % 3 {
+        0 => ".",
+        1 => "..",
+        _ => "...",
+    };
+    format!("Thinking {dots}")
+}
+
+fn thinking_indicator_line(thinking_open: bool, tick: u16, width: u16) -> Line<'static> {
+    super::indent_transcript_line(Line::from(Span::styled(
+        truncate_display(&thinking_indicator_text(thinking_open, tick), width),
+        Style::default()
+            .fg(theme::muted_fg())
+            .add_modifier(Modifier::ITALIC),
+    )))
 }
 
 struct TranscriptView;
@@ -551,7 +583,18 @@ impl TranscriptView {
                     display.push(Line::default());
                 }
                 if let super::TranscriptBlock::Thinking(text) = block {
-                    display.extend(thinking_display_lines(text, app.show_thinking, area.width));
+                    // Only the tail block can be the open one (any other
+                    // sink line closes it); earlier blocks are settled and
+                    // must stay frozen at "Thinking ..." instead of
+                    // re-animating with the live tick.
+                    let open = app.thinking_open && idx + 1 == app.transcript.len();
+                    display.extend(thinking_display_lines(
+                        text,
+                        app.show_thinking,
+                        open,
+                        app.tick,
+                        area.width,
+                    ));
                     continue;
                 }
                 for line in block.lines() {
@@ -561,6 +604,23 @@ impl TranscriptView {
             app.display_cache = display;
             app.display_cache_width = area.width;
             app.display_cache_version = app.transcript_version;
+        }
+        // The open thinking block's collapsed indicator animates in place:
+        // its cached line is rewritten every frame (O(1)) instead of
+        // invalidating the cache, which would re-wrap the whole transcript
+        // at animation rate. The block is the transcript tail while it is
+        // open (any other sink line closes it), so the last cached line is
+        // the indicator.
+        if app.thinking_open
+            && !app.show_thinking
+            && matches!(
+                app.transcript.last(),
+                Some(super::TranscriptBlock::Thinking(_))
+            )
+        {
+            if let Some(last) = app.display_cache.last_mut() {
+                *last = thinking_indicator_line(true, app.tick, area.width);
+            }
         }
         let total = app.display_cache.len();
         let max_scroll = (total.saturating_sub(visible)) as u16;
@@ -1434,6 +1494,7 @@ mod tests {
             connection: None,
             assistant_open: false,
             show_thinking: false,
+            thinking_open: false,
             plan: crate::core::types::Plan::default(),
             transcript_version: 0,
             display_cache: Vec::new(),
@@ -1490,24 +1551,80 @@ mod tests {
     #[test]
     fn thinking_display_collapsed_previews_expanded_shows_all() {
         let text = "first line\n\nsecond line";
-        let collapsed = thinking_display_lines(text, false, 80);
+        let collapsed = thinking_display_lines(text, false, false, 0, 80);
         assert_eq!(collapsed.len(), 1);
         let joined: String = collapsed[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(joined.contains("Thinking…"), "{joined}");
+        assert!(joined.contains("Thinking ..."), "{joined}");
         // Collapsed is a bare indicator: no thought content leaks through.
         assert!(!joined.contains("second line"), "{joined}");
 
-        let expanded = thinking_display_lines(text, true, 80);
+        // While streaming, the collapsed indicator animates its dots.
+        let streaming = thinking_display_lines(text, false, true, 8, 80);
+        let streamed: String = streaming[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(streamed.contains("Thinking .."), "{streamed}");
+
+        let expanded = thinking_display_lines(text, true, false, 0, 80);
         assert!(expanded.len() >= 3, "{}", expanded.len());
         let all: String = expanded
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
             .collect();
         assert!(all.contains("first line") && all.contains("second line"));
+    }
+
+    #[test]
+    fn thinking_indicator_cycles_while_streaming_and_settles() {
+        // Dots grow 1→3 on the 8-tick throttle cadence, then loop.
+        assert_eq!(thinking_indicator_text(true, 0), "Thinking .");
+        assert_eq!(thinking_indicator_text(true, 8), "Thinking ..");
+        assert_eq!(thinking_indicator_text(true, 16), "Thinking ...");
+        assert_eq!(thinking_indicator_text(true, 24), "Thinking .");
+        // Closed: static, never animated again.
+        for tick in [0, 8, 16, 24, 999] {
+            assert_eq!(thinking_indicator_text(false, tick), "Thinking ...");
+        }
+    }
+
+    #[test]
+    fn settled_thinking_stays_frozen_while_a_new_block_streams() {
+        // Regression: every Thinking block was rendered with the live
+        // `thinking_open` flag, so once a new block started streaming the
+        // already-settled ones re-animated in sync with it. Only the tail
+        // block — the open one — may animate.
+        let mut app = test_app();
+        app.transcript = vec![
+            super::super::TranscriptBlock::Thinking("settled thoughts".into()),
+            super::super::TranscriptBlock::Assistant(vec![super::super::indent_transcript_line(
+                Line::from("tool turn in between"),
+            )]),
+            super::super::TranscriptBlock::Thinking("live thoughts".into()),
+        ];
+        app.thinking_open = true;
+        app.tick = 8; // animated frame for this tick is "Thinking .."
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let text =
+            |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let lines: Vec<String> = app
+            .display_cache
+            .iter()
+            .map(|l| text(l).trim().to_string())
+            .collect();
+        // The settled block stays at three dots even though a block is open.
+        assert!(lines.iter().any(|l| l == "Thinking ..."), "{lines:?}");
+        // The open tail block still animates.
+        assert!(lines.iter().any(|l| l == "Thinking .."), "{lines:?}");
     }
 
     #[test]
