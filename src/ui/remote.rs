@@ -625,12 +625,30 @@ const OSC_TOTAL_TIMEOUT: Duration = Duration::from_millis(150);
 /// uptime means something else queried this tty mid-session.
 static OSC_START: OnceLock<Instant> = OnceLock::new();
 
+/// XDG cache directory (`$XDG_CACHE_HOME`, else `$HOME/.cache`); the macOS
+/// layout matches the `dirs` crate. Replaces the `dirs` dep (one call site).
+pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Caches"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })
+    }
+}
+
 /// Best-effort diagnostic journal of OSC runs caught by `strip_osc_report`,
 /// appended to `~/.cache/dex/osc.log`. The reply carries no sender identity,
 /// so the log records when + how late + what; failures are ignored.
 fn log_osc(kind: &str, body: &str) {
     use std::io::Write;
-    let Some(dir) = dirs::cache_dir() else { return };
+    let Some(dir) = cache_dir() else { return };
     let path = dir.join("dex/osc.log");
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let Ok(mut f) = std::fs::OpenOptions::new()

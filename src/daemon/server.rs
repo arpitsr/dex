@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::stream::Stream;
+use futures_core::Stream;
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -433,18 +433,36 @@ async fn chat(
 
     // Convert the receiver into an SSE stream. Each event is serialized
     // exactly once: axum adds the `data:` prefix, so hand it raw JSON.
-    let event_stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            let data = serde_json::to_string(&event).unwrap_or_default();
-            yield Ok(Event::default().data(data));
-        }
-    };
+    // A 15-line `poll_recv` wrapper instead of the `async-stream` macro.
+    let event_stream = ReceiverStream { rx };
 
     Ok(Sse::new(event_stream).keep_alive(
         axum::response::sse::KeepAlive::default()
             .interval(Duration::from_secs(15))
             .text("ping"),
     ))
+}
+
+/// Bridge a tokio mpsc receiver into a `Stream` for axum's SSE body.
+struct ReceiverStream {
+    rx: mpsc::Receiver<StreamEnvelope>,
+}
+
+impl Stream for ReceiverStream {
+    type Item = Result<Event, Infallible>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.get_mut().rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(event)) => {
+                let data = serde_json::to_string(&event).unwrap_or_default();
+                std::task::Poll::Ready(Some(Ok(Event::default().data(data))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Fully

@@ -134,6 +134,88 @@ pub(crate) fn print_ansi_highlighted_code(lang: &str, body: &str) {
     }
 }
 
+/// Render one line of assistant markdown prose to the terminal. Replaces the
+/// `termimad` dependency: covers the constructs streamed prose actually uses
+/// (headings, bullets, bold, italic, inline code, links) in ~60 lines.
+pub(crate) fn print_markdown_text(line: &str) {
+    println!("{}", render_markdown_line(line));
+}
+
+pub(crate) fn render_markdown_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return format!("\x1b[1m{}\x1b[0m", render_inline(trimmed));
+    }
+    let (marker, body) = match trimmed.strip_prefix("- ").or(trimmed.strip_prefix("* ")) {
+        Some(rest) => ("\x1b[2m•\x1b[0m ", rest),
+        None => ("", trimmed),
+    };
+    format!("{marker}{}", render_inline(body))
+}
+
+/// Inline styling: `` `code` ``, `**bold**`, `*italic*`, `[text](url)`.
+fn render_inline(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '`' {
+            let end = (i + 1..chars.len())
+                .find(|&j| chars[j] == '`')
+                .unwrap_or(chars.len());
+            out.push_str("\x1b[0;36m");
+            out.extend(&chars[i + 1..end]);
+            out.push_str("\x1b[0m");
+            i = end + 1;
+        } else if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if let Some(end) = find_from(&chars, i + 2, "**") {
+                out.push_str("\x1b[1m");
+                out.extend(&chars[i + 2..end]);
+                out.push_str("\x1b[0m");
+                i = end + 2;
+            } else {
+                out.push_str("**");
+                i += 2;
+            }
+        } else if c == '[' {
+            // [text](url) -> text (url dimmed); unmatched brackets stay literal.
+            if let Some(close) = (i + 1..chars.len()).find(|&j| chars[j] == ']') {
+                if chars.get(close + 1) == Some(&'(') {
+                    if let Some(end) = (close + 2..chars.len()).find(|&j| chars[j] == ')') {
+                        out.extend(&chars[i + 1..close]);
+                        out.push_str("\x1b[2m(");
+                        out.extend(&chars[close + 2..end]);
+                        out.push_str(")\x1b[0m");
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+            out.push('[');
+            i += 1;
+        } else if c == '*' {
+            if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '*') {
+                out.push_str("\x1b[3m");
+                out.extend(&chars[i + 1..end]);
+                out.push_str("\x1b[0m");
+                i = end + 1;
+            } else {
+                out.push('*');
+                i += 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn find_from(chars: &[char], from: usize, pat: &str) -> Option<usize> {
+    (from..chars.len()).find(|&i| chars[i..].starts_with(&pat.chars().collect::<Vec<_>>()))
+}
+
 pub(crate) fn which(bin: &str) -> Result<PathBuf, io::Error> {
     let path_var = env::var("PATH").unwrap_or_default();
     for dir in env::split_paths(&path_var) {
@@ -173,5 +255,34 @@ mod tests {
         // hash-comments branch for python, plain for rust
         print_ansi_highlighted_code("python", "# comment\nx = 1");
         print_ansi_highlighted_code("rust", "# not a comment in rust\nlet x = 1;");
+    }
+
+    #[test]
+    fn markdown_render_headings_bullets() {
+        assert_eq!(render_markdown_line("# Title"), "\x1b[1m# Title\x1b[0m");
+        assert_eq!(render_markdown_line("- item"), "\x1b[2m•\x1b[0m item");
+        assert_eq!(
+            render_markdown_line("  - indented"),
+            "\x1b[2m•\x1b[0m indented"
+        );
+        assert_eq!(render_markdown_line("plain text"), "plain text");
+    }
+
+    #[test]
+    fn markdown_render_inline_styles() {
+        assert_eq!(render_inline("a `code` b"), "a \x1b[0;36mcode\x1b[0m b");
+        assert_eq!(render_inline("**bold** tail"), "\x1b[1mbold\x1b[0m tail");
+        assert_eq!(render_inline("*it* ok"), "\x1b[3mit\x1b[0m ok");
+        assert_eq!(
+            render_inline("[text](http://x)"),
+            "text\x1b[2m(http://x)\x1b[0m"
+        );
+        // Unclosed delimiters stay literal.
+        assert_eq!(render_inline("**unclosed"), "**unclosed");
+        assert_eq!(render_inline("[just](bracket"), "[just](bracket");
+        assert_eq!(
+            render_inline("`unclosed code"),
+            "\x1b[0;36munclosed code\x1b[0m"
+        );
     }
 }
