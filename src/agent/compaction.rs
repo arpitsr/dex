@@ -13,36 +13,10 @@ const PER_MESSAGE_OVERHEAD: u64 = 12;
 const TOOL_SCHEMA_TOKENS: u64 = 3200;
 
 pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
-    let chars: usize = messages
-        .iter()
-        .map(|message| {
-            // Content + tool call payload + name/role + replayed reasoning
-            // (reasoning_items blobs and reasoning_content are re-sent
-            // verbatim next request, so they count toward the window).
-            let mut len = message.content.as_deref().map_or(0, str::len)
-                + message.tool_calls.as_ref().map_or(0, |calls| {
-                    calls
-                        .iter()
-                        .map(|call| {
-                            call.function.arguments.len() + call.function.name.len() + call.id.len()
-                        })
-                        .sum()
-                })
-                + message.reasoning_content.as_deref().map_or(0, str::len)
-                + message.reasoning_items.as_ref().map_or(0, |items| {
-                    items.iter().map(|item| item.to_string().len()).sum()
-                });
-            // Role and name framing
-            len += message.role.len();
-            if let Some(name) = &message.name {
-                len += name.len();
-            }
-            if let Some(tid) = &message.tool_call_id {
-                len += tid.len();
-            }
-            len
-        })
-        .sum();
+    // Content + tool call payload + name/role + replayed reasoning
+    // (reasoning_items blobs and reasoning_content are re-sent verbatim next
+    // request, so they count toward the window).
+    let chars: usize = messages.iter().map(message_char_len).sum();
     // ~4 chars per token plus per-message overhead, and tool schema when
     // the caller will inject it ( caller adds TOOL_SCHEMA_TOKENS separately;
     // we keep estimator honest for history alone ).
@@ -58,6 +32,34 @@ pub(crate) fn estimate_ephemeral_tokens(parts: &[Option<String>]) -> u64 {
         .map(|s| s.len())
         .sum();
     (chars as u64) / 4 + (parts.len() as u64 * PER_MESSAGE_OVERHEAD)
+}
+
+/// Byte length of a message's replayed payload (content, tool calls,
+/// reasoning, framing) — the shared body of the token estimator, used by
+/// `estimate_tokens` and the pi-style cut-point walk.
+fn message_char_len(message: &ChatMessage) -> usize {
+    let mut len = message.content.as_deref().map_or(0, str::len)
+        + message.tool_calls.as_ref().map_or(0, |calls| {
+            calls
+                .iter()
+                .map(|call| {
+                    call.function.arguments.len() + call.function.name.len() + call.id.len()
+                })
+                .sum()
+        })
+        + message.reasoning_content.as_deref().map_or(0, str::len)
+        + message.reasoning_items.as_ref().map_or(0, |items| {
+            items.iter().map(|item| item.to_string().len()).sum()
+        });
+    // Role and name framing
+    len += message.role.len();
+    if let Some(name) = &message.name {
+        len += name.len();
+    }
+    if let Some(tid) = &message.tool_call_id {
+        len += tid.len();
+    }
+    len
 }
 
 /// Effective prompt size = persistent history + ephemeral preamble + tool schema.
@@ -147,21 +149,7 @@ fn find_cut_point(
     let mut hit_budget = false;
     for i in (start..end).rev() {
         // pi estimates per message via chars/4; dex adds overhead — keep dex estimator for parity
-        let m = &messages[i];
-        let len = m.content.as_deref().map_or(0, str::len)
-            + m.tool_calls.as_ref().map_or(0, |calls| {
-                calls
-                    .iter()
-                    .map(|c| c.function.arguments.len() + c.function.name.len() + c.id.len())
-                    .sum()
-            })
-            + m.reasoning_content.as_deref().map_or(0, str::len)
-            + m.reasoning_items.as_ref().map_or(0, |items| {
-                items.iter().map(|item| item.to_string().len()).sum()
-            })
-            + m.role.len()
-            + m.name.as_deref().map_or(0, str::len)
-            + m.tool_call_id.as_deref().map_or(0, str::len);
+        let len = message_char_len(&messages[i]);
         let est = (len as u64) / 4 + PER_MESSAGE_OVERHEAD;
         if est == 0 {
             continue;
@@ -383,12 +371,12 @@ fn serialize_conversation(messages: &[ChatMessage]) -> String {
 
 /// Render a message as a compact transcript line for summarization.
 pub(crate) fn message_to_transcript(msg: &ChatMessage) -> String {
-    let body = msg.content.clone().unwrap_or_default();
     let role = match msg.role.as_str() {
         "assistant" if msg.tool_calls.is_some() => "assistant (tool calls)",
         other => other,
     };
-    format!("{}: {}", role, truncate_text(&body, 2_000, 50))
+    let body = msg.content.as_deref().unwrap_or_default();
+    format!("{}: {}", role, truncate_text(body, 2_000, 50))
 }
 
 const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";

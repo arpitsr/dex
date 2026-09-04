@@ -184,8 +184,8 @@ pub(crate) fn call_chat_completions(
     cancel: &dyn CancellationSource,
 ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
     let req = ChatRequest {
-        model: config.model.clone(),
-        messages: messages.to_vec(),
+        model: &config.model,
+        messages,
         tools: if with_tools {
             tools_schema()
         } else {
@@ -195,7 +195,7 @@ pub(crate) fn call_chat_completions(
         stream_options: StreamOptions {
             include_usage: true,
         },
-        reasoning_effort: config.thinking_effort.clone(),
+        reasoning_effort: &config.thinking_effort,
     };
     let resp = post_with_retry(
         config,

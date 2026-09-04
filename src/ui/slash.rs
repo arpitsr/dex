@@ -101,10 +101,7 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
                     return false;
                 }
                 // Skip sessions with no persisted messages (only header).
-                match crate::session::load_messages_from_session(path) {
-                    Ok(msgs) => !msgs.is_empty(),
-                    Err(_) => false,
-                }
+                crate::session::has_messages(path)
             })
             .collect();
         return filtered
@@ -205,11 +202,11 @@ pub(super) fn reset_session_state(app: &mut App) {
     app.tool_state.verify_dirty = false;
     app.plan = crate::core::types::Plan::default();
     app.transcript.clear();
+    app.assistant_pending.clear();
     app.assistant_open = false;
     app.thinking_open = false;
     app.autoscroll = true;
     app.scroll = 0;
-    app.transcript_version = app.transcript_version.wrapping_add(1);
 }
 
 pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
@@ -268,10 +265,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     if header.id() == app.session.id() {
                         return false;
                     }
-                    matches!(
-                        crate::session::load_messages_from_session(path),
-                        Ok(msgs) if !msgs.is_empty()
-                    )
+                    crate::session::has_messages(path)
                 })
                 .collect();
             if filtered.is_empty() {
@@ -293,10 +287,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     if header.id() == app.session.id() {
                         return false;
                     }
-                    matches!(
-                        crate::session::load_messages_from_session(path),
-                        Ok(msgs) if !msgs.is_empty()
-                    )
+                    crate::session::has_messages(path)
                 })
                 .collect();
             let path_opt = if let Ok(idx) = selector.parse::<usize>() {

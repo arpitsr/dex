@@ -1,4 +1,6 @@
 /target/
+parca-profiles/
+heaptrack.*.zst
 ak-tool-cache.json
 *.log
 .ak/sessions/

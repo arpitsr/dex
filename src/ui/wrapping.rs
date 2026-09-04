@@ -10,21 +10,15 @@ const TAB_WIDTH: usize = 8;
 pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u16, u16) {
     let width = width.max(1);
     let col = col.min(line.len());
-    let bounds: Vec<usize> = line
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(line.len()))
-        .collect();
-
     let mut segments = Vec::new();
     let mut start = 0;
     let mut row_width = 0;
     let mut last_space_end = None;
 
-    for index in 0..bounds.len().saturating_sub(1) {
-        let begin = bounds[index];
-        let end = bounds[index + 1];
-        let ch = line[begin..end].chars().next().unwrap();
+    // Walk char-boundary pairs directly; no materialized bounds vector.
+    let mut chars = line.char_indices().peekable();
+    while let Some((begin, ch)) = chars.next() {
+        let end = chars.peek().map_or(line.len(), |&(index, _)| index);
         let char_width = if ch == '\t' {
             TAB_WIDTH - (row_width % TAB_WIDTH)
         } else if ch.is_control() {
