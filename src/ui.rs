@@ -258,13 +258,18 @@ fn indent_transcript_line(mut line: Line<'static>) -> Line<'static> {
     line
 }
 
-pub(super) fn push_info(app: &mut App, text: String) {
+pub(super) fn push_info_line(app: &mut App, line: Line<'static>) {
     app.assistant_open = false;
     app.transcript
-        .push(TranscriptBlock::Info(indent_transcript_line(Line::from(
-            Span::styled(text, Style::default().fg(Color::Cyan)),
-        ))));
+        .push(TranscriptBlock::Info(indent_transcript_line(line)));
     app.transcript_version = app.transcript_version.wrapping_add(1);
+}
+
+pub(super) fn push_info(app: &mut App, text: String) {
+    push_info_line(
+        app,
+        Line::from(Span::styled(text, Style::default().fg(Color::Cyan))),
+    );
 }
 
 /// Route a streamed console line into the transcript with the same styling

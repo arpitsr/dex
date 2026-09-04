@@ -10,6 +10,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 
 use crate::cli::Args;
@@ -22,8 +24,9 @@ use crate::session::Session;
 
 use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
 use super::{
-    append_sink_line, push_info, render_user_prompt, resolve_approval, scroll_transcript, view,
-    App, DisableAlternateScroll, EnableAlternateScroll, PendingApproval, TerminalCleanup,
+    append_sink_line, push_info, push_info_line, render_user_prompt, resolve_approval,
+    scroll_transcript, view, App, DisableAlternateScroll, EnableAlternateScroll, PendingApproval,
+    TerminalCleanup,
 };
 
 /// Messages flowing from the per-turn worker thread into the UI loop.
@@ -85,22 +88,38 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
 /// Show which skills the daemon has loaded. Used at session start and after
 /// `/new`, so the user can see what `/skill:<name>` can load.
 fn push_skills_listing(app: &mut App) {
-    let names: Vec<String> = app.skills.iter().map(|s| s.name.clone()).collect();
-    if names.is_empty() {
-        push_info(
+    match skills_listing_line(&app.skills) {
+        Some(line) => push_info_line(app, line),
+        None => push_info(
             app,
             "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
                 .to_string(),
-        );
-    } else {
-        push_info(
-            app,
-            format!("skills loaded ({}): /skill:<name> loads one", names.len()),
-        );
-        for n in &names {
-            push_info(app, format!("  - {n}"));
-        }
+        ),
     }
+}
+
+/// The session-start skills line: names comma-separated on a single row, in
+/// the terminal's own foreground (`theme::surface_fg`, resolved from the real
+/// palette so it follows the active theme) with the count header and hint
+/// quiet. `None` when no skills are loaded.
+fn skills_listing_line(skills: &[crate::core::types::Skill]) -> Option<Line<'static>> {
+    let (first, rest) = skills.split_first()?;
+    let mut names = first.name.clone();
+    for skill in rest {
+        names.push_str(", ");
+        names.push_str(&skill.name);
+    }
+    Some(Line::from(vec![
+        Span::styled(
+            format!("skills loaded ({}): ", skills.len()),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(names, Style::default().fg(super::theme::surface_fg())),
+        Span::styled(
+            " · /skill:<name> loads one",
+            Style::default().fg(super::theme::muted_fg()),
+        ),
+    ]))
 }
 
 pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std::io::Result<()> {
@@ -261,12 +280,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         );
     }
 
+    // Detect the terminal background before raw mode / the alternate screen
+    // take over; surface colors (including the skills listing below) are
+    // resolved from this once.
+    super::theme::detect_background();
+
     // Surface the skills the daemon discovered at session start.
     push_skills_listing(&mut remote.app);
 
-    // Detect the terminal background before raw mode / the alternate screen
-    // take over; surface colors are resolved from this once.
-    super::theme::detect_background();
     enable_raw_mode()?;
     // No startup drain here: a blind deadline cuts OSC reply bursts in half
     // and leaks the tail (sans lead-in) into the composer. Late replies —
@@ -1534,5 +1555,88 @@ mod tests {
         assert!(!is_osc_report("12;rgb:0505/1818/2e2e"));
         assert!(!is_osc_report("11;rgb:zzzz/1818/2e2e"));
         assert!(!is_osc_report("10;rgb:0505/1818"));
+    }
+
+    fn skill(name: &str) -> crate::core::types::Skill {
+        crate::core::types::Skill {
+            name: name.to_string(),
+            description: String::new(),
+            path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn skills_listing_is_one_comma_separated_line() {
+        let line = skills_listing_line(&[skill("a"), skill("b"), skill("c")])
+            .expect("non-empty skills produce a line");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "skills loaded (3): a, b, c · /skill:<name> loads one");
+        // Skill names use the terminal's theme foreground (Reset when the
+        // theme is unknown), never a fixed ANSI slot the theme may remap.
+        let fg = line.spans[1].style.fg.expect("names span carries a fg");
+        assert!(
+            matches!(fg, Color::Reset | Color::Rgb(..)),
+            "names must follow the theme, got {fg:?}"
+        );
+        assert!(skills_listing_line(&[]).is_none());
+    }
+
+    fn row_width(line: &ratatui::text::Line<'_>) -> usize {
+        use unicode_width::UnicodeWidthStr;
+        line.spans.iter().map(|s| s.content.width()).sum()
+    }
+
+    #[test]
+    fn skills_listing_wraps_within_terminal_width() {
+        let skills: Vec<_> = (0..8)
+            .map(|i| skill(&format!("very-long-skill-name-{i:02}")))
+            .collect();
+        let line = skills_listing_line(&skills).expect("non-empty skills produce a line");
+        let width = 40u16;
+        let rows = crate::ui::render::wrap_line_display(&line, width);
+        assert!(rows.len() > 1, "long listing must wrap into multiple rows");
+        for row in &rows {
+            assert!(
+                row_width(row) <= width as usize,
+                "row width {} exceeds {width}",
+                row_width(row)
+            );
+        }
+        // Wrapping splits at grapheme level; only the whitespace at each
+        // break point is consumed (standard word-wrap), so the rows rejoin
+        // to the original line modulo whitespace — nothing dropped or
+        // duplicated.
+        let strip_ws = |text: &str| {
+            text.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+        let joined: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        let original: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(strip_ws(&joined), strip_ws(&original));
+        // Theme fg survives onto continuation rows.
+        let fg = line.spans[1].style.fg.expect("names span carries a fg");
+        assert!(
+            rows.iter()
+                .skip(1)
+                .flat_map(|r| r.spans.iter())
+                .any(|s| s.style.fg == Some(fg) && s.content != " "),
+            "continuation rows must keep the names' theme fg"
+        );
+    }
+
+    #[test]
+    fn skills_listing_hard_breaks_overlong_single_name() {
+        // One unbroken word (no whitespace) wider than the terminal must be
+        // hard-split rather than overflow.
+        let line = skills_listing_line(&[skill(&"x".repeat(120))]).expect("one skill");
+        let rows = crate::ui::render::wrap_line_display(&line, 40);
+        assert!(rows.len() > 1, "overlong single name must hard-break");
+        for row in &rows {
+            assert!(row_width(row) <= 40, "row overflow: {}", row_width(row));
+        }
     }
 }
