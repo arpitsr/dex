@@ -662,7 +662,11 @@ impl ComposerView {
             .block(block);
         f.render_widget(paragraph, area);
 
-        if !app.busy && app.pending_approval.is_none() {
+        // The composer owns keyboard focus whenever no modal is up —
+        // including while the agent works, since typing + Enter queues a
+        // steering message. The dim busy style signals the state; only the
+        // approval modal (which consumes keys) hides the cursor.
+        if app.pending_approval.is_none() {
             let cur_y = cursor.2.saturating_sub(scroll);
             f.set_cursor_position((inner.x + cursor.1, inner.y + cur_y));
         }
@@ -1974,6 +1978,29 @@ mod tests {
             "expected a blank gap line before assistant text in rendered display, got {:?}",
             display[assistant_display_idx - 1]
         );
+    }
+
+    #[test]
+    fn composer_shows_cursor_while_busy() {
+        // Steering is typed in the composer while the agent works; the busy
+        // style dims the text but must not hide the cursor (only the
+        // approval modal consumes keys and steals focus).
+        let area = Rect::new(0, 0, 80, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut app = test_app();
+        app.busy = true;
+        app.input = InputField::from_text("steer left");
+        terminal.draw(|f| view(f, &mut app)).expect("frame");
+        let input_rows = render_input(&app.input, input_content_width(area.width))
+            .0
+            .len() as u16;
+        let layout = compute_layout(area, input_rows, 1, false).unwrap();
+        let inner = input_block().inner(layout.input);
+        let (_, cursor) = render_input(&app.input, inner.width);
+        terminal
+            .backend_mut()
+            .assert_cursor_position((inner.x + cursor.1, inner.y + cursor.2));
     }
 
     #[test]
