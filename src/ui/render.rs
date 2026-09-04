@@ -214,12 +214,6 @@ pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
     };
     let mut pieces = Vec::new();
     pieces.push((cwd, Style::default().fg(Color::Cyan)));
-    pieces.push(sep());
-    pieces.push(quiet(format!(
-        "{} / {}",
-        app.config.provider.name(),
-        app.config.model
-    )));
     if let Some(branch) = app.git_branch.as_ref() {
         pieces.push(sep());
         pieces.push((branch.clone(), Style::default().fg(Color::LightGreen)));
@@ -227,6 +221,12 @@ pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
             pieces.push(("*".to_string(), Style::default().fg(Color::Yellow)));
         }
     }
+    pieces.push(sep());
+    pieces.push(quiet(format!(
+        "{} / {}",
+        app.config.provider.name(),
+        app.config.model
+    )));
     pieces.push(sep());
     pieces.push((
         format!(
@@ -278,9 +278,9 @@ pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
     }
     // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
     // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
-    if app.tool_state.total_cost > 0.0005 {
+    if let Some(cost) = cost_piece(app) {
         pieces.push(sep());
-        pieces.push(quiet(format!("${:.3}", app.tool_state.total_cost)));
+        pieces.push(cost);
     }
     if let Some(plan) = plan_status(app) {
         pieces.push(sep());
@@ -296,12 +296,36 @@ pub(super) fn ui_status(app: &App) -> String {
         .collect()
 }
 
+/// Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
+/// else `DEX_COST_PER_1K` fallback. `Some` once any prompt has been billed.
+/// Shared by the full and narrowed status lines so spend stays visible when
+/// the full line no longer fits beside the connection badge.
+fn cost_piece(app: &App) -> Option<Piece> {
+    if app.tool_state.total_cost > 0.0005 {
+        Some(quiet(format!("${:.3}", app.tool_state.total_cost)))
+    } else {
+        None
+    }
+}
+
 fn compact_pieces(app: &App) -> Vec<Piece> {
-    vec![
+    let mut pieces = vec![
         (compact_path(&app.cwd), Style::default().fg(Color::Cyan)),
         sep(),
-        quiet(app.config.model.clone()),
-    ]
+    ];
+    if let Some(branch) = app.git_branch.as_ref() {
+        pieces.push((branch.clone(), Style::default().fg(Color::LightGreen)));
+        if app.git_dirty {
+            pieces.push(("*".to_string(), Style::default().fg(Color::Yellow)));
+        }
+        pieces.push(sep());
+    }
+    pieces.push(quiet(app.config.model.clone()));
+    if let Some(cost) = cost_piece(app) {
+        pieces.push(sep());
+        pieces.push(cost);
+    }
+    pieces
 }
 
 /// How this TUI reached its engine. Remote is the exceptional state worth
@@ -381,11 +405,12 @@ pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
     let hint = hint_pieces(app);
     let conn = conn_piece(app);
     let conn_w = pieces_width(std::slice::from_ref(&conn));
-    let candidates = [
-        status_pieces(app),
-        compact_pieces(app),
-        vec![quiet(app.config.model.clone())],
-    ];
+    let mut bare_model = vec![quiet(app.config.model.clone())];
+    if let Some(cost) = cost_piece(app) {
+        bare_model.push(sep());
+        bare_model.push(cost);
+    }
+    let candidates = [status_pieces(app), compact_pieces(app), bare_model];
     let mut left_only: Option<Vec<Piece>> = None;
     for candidate in candidates {
         let mut left = hint.clone();
@@ -1835,6 +1860,20 @@ mod tests {
         let text = footer_text(&app, 30);
         assert!(text.ends_with("[R] daemon.internal"), "{text}");
         assert!(text.starts_with("test-model"), "{text}");
+    }
+
+    #[test]
+    fn footer_keeps_cost_when_full_status_does_not_fit() {
+        // Regression: spend pieces sit at the end of the full status line, so
+        // once totals/output/cached outgrew a typical width the footer fell
+        // back to `cwd · model` and the $ cost vanished entirely.
+        let mut app = test_app();
+        app.connection = Some("[L] 127.0.0.1".into());
+        app.tool_state.total_cost = 0.042;
+        for width in [60, 40, 30] {
+            let text = footer_text(&app, width);
+            assert!(text.contains("$0.042"), "cost visible at {width}: {text}");
+        }
     }
 
     #[test]
