@@ -1100,11 +1100,19 @@ pub(crate) fn execute_outcome(
     args: &Map<String, Value>,
     cancel: &dyn CancellationSource,
 ) -> ToolOutcome {
+    // Capture the unified diff BEFORE `execute` mutates the file; the
+    // before-image is gone afterwards. Display-only: it never reaches the
+    // model, only the transcript preview via `ToolOutcome::diff`.
+    let pending_diff = if matches!(name, "write" | "edit") {
+        change_diff(name, args)
+    } else {
+        None
+    };
     match execute(name, args, cancel) {
         Ok(out) => ToolOutcome {
             text: out,
             ok: true,
-            diff: None,
+            diff: pending_diff,
         },
         Err(e) => ToolOutcome {
             text: format!("Error: {}", e),
@@ -1291,6 +1299,24 @@ mod tests {
         assert!(diff.contains("--- /dev/null"), "{diff}");
         assert!(diff.contains("+++ b/target/dex-preview-new.txt"), "{diff}");
         assert!(diff.contains("+hello"), "{diff}");
+    }
+
+    #[test]
+    fn execute_outcome_carries_diff_for_edit() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-outcome-diff-test.txt";
+        fs::write(cwd.join(rel), "a\nb\nc\n").unwrap();
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("oldText".into(), Value::String("b\n".into()));
+        args.insert("newText".into(), Value::String("B\n".into()));
+        let outcome = execute_outcome("edit", &args, &GlobalCancellation);
+        assert!(outcome.ok, "{}", outcome.text);
+        let diff = outcome.diff.expect("edit outcome carries a diff");
+        assert!(diff.contains("-b"), "{diff}");
+        assert!(diff.contains("+B"), "{diff}");
+        let _ = fs::remove_file(cwd.join(rel));
     }
 
     #[test]

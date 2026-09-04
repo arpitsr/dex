@@ -38,6 +38,10 @@ pub(crate) enum Mode {
     RunTool { name: String, args: Vec<String> },
     /// Refresh model catalog (`dex update --models`) — like `pi update --models`.
     Update { models: bool },
+    /// Print usage (`dex --help`/`-h`) without touching config, network, or LLM.
+    Help,
+    /// Print version (`dex --version`/`-V`).
+    Version,
 }
 
 pub(crate) fn parse_args() -> Args {
@@ -89,6 +93,13 @@ pub(crate) fn parse_args() -> Args {
 
 /// Determine the invocation mode from parsed args.
 pub(crate) fn resolve_mode(args: &Args) -> Mode {
+    // Help/version win before anything else so `--help` never falls through
+    // to a OneShot LLM turn (previously `dex --help` burned a network call).
+    match args.rest.first().map(|s| s.as_str()) {
+        Some("-h" | "--help" | "help") => return Mode::Help,
+        Some("-V" | "--version" | "version") => return Mode::Version,
+        _ => {}
+    }
     match args.rest.first().map(|s| s.as_str()) {
         Some("update") => {
             let models = args.rest.iter().any(|a| a == "--models" || a == "--all");
@@ -187,5 +198,35 @@ mod tests {
 
         assert!(parse_tool_args(&["path".to_string()]).is_err());
         assert!(parse_tool_args(&["{broken".to_string()]).is_err());
+    }
+
+    fn args_with_rest(rest: &[&str]) -> Args {
+        Args {
+            base_url: None,
+            model: None,
+            session_path: None,
+            no_session: false,
+            new_session: false,
+            session_name: None,
+            skill_dirs: Vec::new(),
+            permission: None,
+            reattach: None,
+            rest: rest.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn help_and_version_win_over_oneshot() {
+        for flag in ["-h", "--help", "help"] {
+            assert_eq!(resolve_mode(&args_with_rest(&[flag])), Mode::Help);
+        }
+        for flag in ["-V", "--version", "version"] {
+            assert_eq!(resolve_mode(&args_with_rest(&[flag])), Mode::Version);
+        }
+        // A prompt mentioning --help mid-sentence stays a prompt.
+        assert!(matches!(
+            resolve_mode(&args_with_rest(&["explain", "--help"])),
+            Mode::OneShot { .. }
+        ));
     }
 }

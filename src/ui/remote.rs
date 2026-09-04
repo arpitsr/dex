@@ -24,8 +24,8 @@ use crate::session::Session;
 
 use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
 use super::{
-    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, push_info,
-    push_info_line, render_user_prompt, resolve_approval, scroll_transcript, view, App,
+    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, push_banner,
+    push_info, push_info_line, render_user_prompt, resolve_approval, scroll_transcript, view, App,
     DisableAlternateScroll, EnableAlternateScroll, PendingApproval, TerminalCleanup,
 };
 
@@ -286,7 +286,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // resolved from this once.
     super::theme::detect_background();
 
-    // Surface the skills the daemon discovered at session start.
+    // Session-start view: the DEX art, then the skills the daemon discovered.
+    push_banner(&mut remote.app);
     push_skills_listing(&mut remote.app);
 
     enable_raw_mode()?;
