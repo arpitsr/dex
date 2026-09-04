@@ -81,7 +81,8 @@ cmd_mem() {
   local secs=${1:-60} out="$PROF_DIR/mem-$(date +%Y%m%d-%H%M%S).csv"
   echo "profiling dex RSS for ${secs}s (every 2s) -> $out" >&2
   echo "ts,pid,rss_kib,etime" > "$out"
-  local start=$SECONDS end=$((start + secs)) misses=0 row
+  local start=$SECONDS misses=0 row
+  local end=$((start + secs))
   while [ "$SECONDS" -lt "$end" ]; do
     # -C dex catches both the TUI client and the daemon it spawns
     row=$(ps -C dex -o pid=,rss=,etime= 2>/dev/null \
