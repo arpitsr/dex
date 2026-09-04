@@ -140,12 +140,6 @@ pub(crate) enum PermissionRequirement {
     Shell,
 }
 
-pub(crate) fn is_mutating(name: &str) -> bool {
-    metadata(name)
-        .map(|metadata| metadata.mutating)
-        .unwrap_or(true)
-}
-
 pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
     Some(match name {
         "read" => ToolMetadata {

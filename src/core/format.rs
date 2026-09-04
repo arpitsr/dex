@@ -333,6 +333,39 @@ pub(crate) fn diff_preview_lines(diff: &str, max: usize) -> Vec<String> {
     clipped
 }
 
+/// Canonical tool-output preview dispatch shared by the TUI transcript and
+/// the headless console path: write/edit show the unified diff on success,
+/// read shows its numbered snippet, everything else (and every failure)
+/// shares the generic preview so the error stays visible.
+pub(crate) fn tool_preview(
+    name: &str,
+    ok: bool,
+    diff: Option<&str>,
+    result: &str,
+    skip_first: bool,
+) -> Vec<String> {
+    if let Some(diff) = diff {
+        if matches!(name, "write" | "edit") && ok {
+            return diff_preview_lines(diff, 30);
+        }
+    }
+    if name == "read" && ok {
+        return read_preview_lines(result, TRANSCRIPT_PREVIEW_LINES);
+    }
+    tool_result_preview(result, TRANSCRIPT_PREVIEW_LINES, skip_first)
+}
+
+/// Headless one-shot body for the same dispatch: GitHub-style diff snippet
+/// for write/edit, terminal-clamped output otherwise.
+pub(crate) fn tool_preview_body(name: &str, ok: bool, diff: Option<&str>, result: &str) -> String {
+    if let Some(diff) = diff {
+        if matches!(name, "write" | "edit") && ok {
+            return terminal_preview(diff);
+        }
+    }
+    terminal_preview(result)
+}
+
 /// Outcome-first, human-sized result for the TUI transcript: the ✓/✗ glyph
 /// and its color already carry success/failure, so the summary leads with
 /// Read outcome in opencode/pi style: `lines A-B · M lines (+N more)` for a

@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::mpsc;
 
-use crate::core::console::*;
-use crate::core::highlight::*;
-use crate::core::types::*;
-use crate::llm::protocol::*;
+use crate::core::console::with_console;
+use crate::core::highlight::{print_code_block, print_markdown_text};
+use crate::core::types::{ChatMessage, LlmToolCall, SinkLine, StreamChunk, StreamDelta, Usage};
+use crate::llm::protocol::{merge_chat_tool_call, response_call_index, response_tool_call};
 
 /// Incremental markdown printer: prose is flushed as soon as a full line
 /// arrives; code fences are buffered until closed so they can be highlighted
@@ -359,7 +359,7 @@ pub(crate) fn read_responses_stream(
                     // request; summary-only items (no encrypted_content)
                     // can't be replayed and would corrupt the thread.
                     let item = event.get("item").unwrap_or(&Value::Null);
-                    if item.get("encrypted_content").map_or(false, |v| {
+                    if item.get("encrypted_content").is_some_and(|v| {
                         !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(true)
                     }) {
                         reasoning_items.push(item.clone());
@@ -413,7 +413,13 @@ pub(crate) fn read_responses_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        delta_thought, read_responses_stream, read_stream, SinkLine, StreamDelta, StreamPrinter,
+        Usage,
+    };
+    use crate::core::console::CancellationToken;
+    use crate::core::types::StreamUsage;
+    use std::sync::mpsc;
 
     /// The compaction summarizer (and any in-process caller) must be able to
     /// pass a sink and have ALL streamed output routed into the channel —

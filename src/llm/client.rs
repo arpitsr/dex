@@ -8,12 +8,12 @@ use std::thread;
 use std::time::Duration;
 
 use crate::agent::state::CancellationSource;
-use crate::core::console::*;
-use crate::core::types::*;
-use crate::llm::auth::*;
-use crate::llm::config::*;
-use crate::llm::protocol::*;
-use crate::llm::stream::*;
+use crate::core::console::with_console;
+use crate::core::types::{ChatMessage, ChatRequest, Provider, SinkLine, StreamOptions, Usage};
+use crate::llm::auth::load_codex_credentials;
+use crate::llm::config::LlmConfig;
+use crate::llm::protocol::{responses_input, responses_tools, tools_schema};
+use crate::llm::stream::{read_responses_stream, read_stream};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelCapabilities {
@@ -253,7 +253,7 @@ pub(crate) fn call_llm(
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &dyn CancellationSource,
 ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
-    let capabilities = crate::llm::discover_capabilities(config);
+    let capabilities = discover_capabilities(config);
     if with_tools && !capabilities.tools {
         return Err("configured model does not support tools".into());
     }

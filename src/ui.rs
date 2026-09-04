@@ -17,6 +17,7 @@ mod input;
 mod remote;
 mod render;
 mod slash;
+mod status;
 mod theme;
 mod wrapping;
 
@@ -34,6 +35,7 @@ const STATUS_CONTENT_ROWS: u16 = 1;
 const INPUT_MIN_ROWS: u16 = 3;
 const INPUT_STATUS_GUTTER: u16 = 0;
 const APPROVAL_HEIGHT: u16 = 11;
+pub(super) const TAB_WIDTH: usize = 8;
 
 /// Raised-surface colors are resolved in `ui/theme.rs` from the terminal's
 /// own palette / detected background, so they follow the terminal theme.

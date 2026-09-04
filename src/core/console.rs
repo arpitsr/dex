@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::agent::state::CancellationSource;
 
-use crate::core::types::*;
+use crate::core::types::{ApprovalRequest, SinkLine};
 
 pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 

@@ -1,85 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
-use crate::core::format::*;
-use crate::core::types::*;
-use crate::llm::client::*;
-use crate::llm::config::*;
+use crate::agent::tokens::{message_char_len, PER_MESSAGE_OVERHEAD};
+use crate::core::format::truncate_text;
+use crate::core::types::{ChatMessage, Usage};
+use crate::llm::client::call_llm;
+use crate::llm::config::LlmConfig;
 
-/// Token overhead per message (role, formatting, turn boundary).
-const PER_MESSAGE_OVERHEAD: u64 = 12;
-/// Rough cost of the tool definitions sent with every request.
-const TOOL_SCHEMA_TOKENS: u64 = 3200;
-
-pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
-    // Content + tool call payload + name/role + replayed reasoning
-    // (reasoning_items blobs and reasoning_content are re-sent verbatim next
-    // request, so they count toward the window).
-    let chars: usize = messages.iter().map(message_char_len).sum();
-    // ~4 chars per token plus per-message overhead, and tool schema when
-    // the caller will inject it ( caller adds TOOL_SCHEMA_TOKENS separately;
-    // we keep estimator honest for history alone ).
-    (chars as u64) / 4 + (messages.len() as u64 * PER_MESSAGE_OVERHEAD)
-}
-
-/// Estimate tokens for the ephemeral preamble that is injected at call-time
-/// but not stored in `messages`.
-pub(crate) fn estimate_ephemeral_tokens(parts: &[Option<String>]) -> u64 {
-    let chars: usize = parts
-        .iter()
-        .filter_map(|p| p.as_ref())
-        .map(|s| s.len())
-        .sum();
-    (chars as u64) / 4 + (parts.len() as u64 * PER_MESSAGE_OVERHEAD)
-}
-
-/// Byte length of a message's replayed payload (content, tool calls,
-/// reasoning, framing) — the shared body of the token estimator, used by
-/// `estimate_tokens` and the pi-style cut-point walk.
-fn message_char_len(message: &ChatMessage) -> usize {
-    let mut len = message.content.as_deref().map_or(0, str::len)
-        + message.tool_calls.as_ref().map_or(0, |calls| {
-            calls
-                .iter()
-                .map(|call| {
-                    call.function.arguments.len() + call.function.name.len() + call.id.len()
-                })
-                .sum()
-        })
-        + message.reasoning_content.as_deref().map_or(0, str::len)
-        + message.reasoning_items.as_ref().map_or(0, |items| {
-            items.iter().map(|item| item.to_string().len()).sum()
-        });
-    // Role and name framing
-    len += message.role.len();
-    if let Some(name) = &message.name {
-        len += name.len();
-    }
-    if let Some(tid) = &message.tool_call_id {
-        len += tid.len();
-    }
-    len
-}
-
-/// Effective prompt size = persistent history + ephemeral preamble + tool schema.
-pub(crate) fn effective_tokens(
-    messages: &[ChatMessage],
-    ephemeral: &[Option<String>],
-    with_tools: bool,
-) -> u64 {
-    estimate_tokens(messages)
-        + estimate_ephemeral_tokens(ephemeral)
-        + if with_tools { TOOL_SCHEMA_TOKENS } else { 0 }
-}
+pub(crate) use super::tokens::{effective_tokens, estimate_tokens};
 
 /// Pi-like settings — direct port of `pi`'s `DEFAULT_COMPACTION_SETTINGS`.
 /// `keepRecentTokens=20000` (token-based); dex keeps 12 messages as
 /// fallback when total tokens < keep_recent (dex compat for many short msgs).
 pub(crate) const KEEP_RECENT_MESSAGES: usize = 12;
-#[allow(dead_code)]
-pub(crate) const KEEP_RECENT_TOKENS: u64 = 20_000;
-
 pub(crate) const MIN_MESSAGES_TO_SUMMARIZE: usize = 8;
 
 // ---------------------------------------------------------------------------
@@ -102,13 +36,9 @@ fn is_turn_start_message(msg: &ChatMessage) -> bool {
 }
 
 fn find_valid_cut_points(messages: &[ChatMessage], start: usize, end: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    for i in start..end {
-        if is_cut_point_message(&messages[i]) {
-            out.push(i);
-        }
-    }
-    out
+    (start..end)
+        .filter(|&i| is_cut_point_message(&messages[i]))
+        .collect()
 }
 
 fn find_turn_start_index(
@@ -116,12 +46,9 @@ fn find_turn_start_index(
     entry_index: usize,
     start: usize,
 ) -> Option<usize> {
-    for i in (start..=entry_index).rev() {
-        if is_turn_start_message(&messages[i]) {
-            return Some(i);
-        }
-    }
-    None
+    (start..=entry_index)
+        .rev()
+        .find(|&i| is_turn_start_message(&messages[i]))
 }
 
 #[derive(Debug)]
@@ -369,16 +296,6 @@ fn serialize_conversation(messages: &[ChatMessage]) -> String {
     parts.join("\n\n")
 }
 
-/// Render a message as a compact transcript line for summarization.
-pub(crate) fn message_to_transcript(msg: &ChatMessage) -> String {
-    let role = match msg.role.as_str() {
-        "assistant" if msg.tool_calls.is_some() => "assistant (tool calls)",
-        other => other,
-    };
-    let body = msg.content.as_deref().unwrap_or_default();
-    format!("{}: {}", role, truncate_text(body, 2_000, 50))
-}
-
 const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no longer relevant, you may remove it\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
@@ -529,7 +446,6 @@ fn deterministic_summary(
 
     // Progress Done / In Progress: assistant short decisions
     let mut done: Vec<String> = Vec::new();
-    let mut in_progress: Vec<String> = Vec::new();
     let mut verifies: Vec<String> = Vec::new();
     for msg in old.iter().chain(turn_prefix.iter()) {
         if msg.name.as_deref() == Some("verify") {
@@ -570,13 +486,7 @@ fn deterministic_summary(
         }
     }
     out.push_str("\n### In Progress\n");
-    if in_progress.is_empty() {
-        out.push_str("- [ ] (none)\n");
-    } else {
-        for p in in_progress {
-            out.push_str(&format!("- [ ] {}\n", p));
-        }
-    }
+    out.push_str("- [ ] (none)\n");
     out.push_str("\n### Blocked\n");
     if verifies.is_empty() {
         out.push_str("- (none)\n");
@@ -614,11 +524,7 @@ fn deterministic_summary(
 /// large enough to summarize.
 /// Pi: walk back until keepRecentTokens (20000) is reached; dex falls back
 /// to KEEP_RECENT_MESSAGES (12) when total tokens < keep_recent.
-#[allow(dead_code)]
-pub(crate) fn find_cutoff(messages: &[ChatMessage]) -> Option<usize> {
-    find_cutoff_by_tokens(messages, KEEP_RECENT_TOKENS)
-}
-
+#[cfg(test)]
 pub(crate) fn find_cutoff_by_tokens(
     messages: &[ChatMessage],
     keep_recent_tokens: u64,
@@ -628,8 +534,7 @@ pub(crate) fn find_cutoff_by_tokens(
         return None;
     }
     // Pi-like: find valid cut points and walk backwards
-    let start = 1usize; // after system prompt, like pi's boundaryStart for first compaction
-                        // Check for previous summary to set boundaryStart pi-like
+    // Check for previous summary to set boundaryStart pi-like
     let boundary_start = messages
         .iter()
         .rposition(|m| m.name.as_deref() == Some("summary"))
@@ -829,15 +734,17 @@ pub(crate) fn compact_history(
     // so splice from boundary_start..first_kept, but keep earlier summary? Pi's new summary subsumes previous,
     // so we replace from boundary_start (which is after previous summary) — but previous summary is at boundary_start-1,
     // we need to replace it too. For dex compat, we replace from 1..first_kept to subsume previous summary.
-    // Use 1..first_kept to keep behavior simple and pass existing tests.
-    let splice_start = if boundary_start == 1 { 1 } else { 1 };
-    messages.splice(splice_start..first_kept, std::iter::once(summary_msg));
+    messages.splice(1..first_kept, std::iter::once(summary_msg));
     Ok((true, usage_total))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        deterministic_summary, estimate_tokens, extract_file_ops_from_message,
+        find_cutoff_by_tokens, ChatMessage, FileOps, KEEP_RECENT_MESSAGES,
+    };
+    use crate::core::types::{FunctionCall, LlmToolCall};
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
@@ -885,7 +792,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        let cutoff = find_cutoff(&messages).expect("should have a cutoff");
+        let cutoff = find_cutoff_by_tokens(&messages, 20_000).expect("should have a cutoff");
         assert_ne!(
             messages[cutoff].role, "tool",
             "cutoff would orphan tool calls"
@@ -910,7 +817,7 @@ mod tests {
         let messages: Vec<ChatMessage> = std::iter::once(msg("system", "sys"))
             .chain((0..KEEP_RECENT_MESSAGES).map(|i| msg("user", &format!("m{i}"))))
             .collect();
-        assert!(find_cutoff(&messages).is_none());
+        assert!(find_cutoff_by_tokens(&messages, 20_000).is_none());
     }
 
     #[test]
@@ -1000,7 +907,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        let cutoff = find_cutoff(&messages).expect("should have cutoff");
+        let cutoff = find_cutoff_by_tokens(&messages, 20_000).expect("should have cutoff");
         // Last user is at index where second prompt lives; cutoff must not be after it
         let last_user = messages
             .iter()
