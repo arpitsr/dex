@@ -65,7 +65,7 @@ impl StreamPrinter {
             if let Some(sink) = &self.sink {
                 sink.send(SinkLine::Assistant(line.to_string())).ok();
             } else {
-                termimad::print_text(&format!("{}\n", line));
+                print_markdown_text(line);
             }
         }
     }
