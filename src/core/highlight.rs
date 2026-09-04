@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::core::console::*;
+use crate::core::console::RESET;
 
 /// Render an assistant message to the terminal as markdown, with
 /// fenced code blocks highlighted via `bat` when available.

@@ -16,6 +16,24 @@ const SESSION_VERSION: u32 = 1;
 #[cfg(test)]
 pub(crate) static TEST_SESSIONS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Panic-safe env restore for tests: saved on construction, reverted on drop
+/// even when the test panics, so a failed test can't leak vars into others
+/// running in the same process. Take it while holding TEST_SESSIONS_ENV_LOCK.
+#[cfg(test)]
+pub(crate) struct EnvGuard(pub Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, prev) in self.0.drain(..) {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct SessionHeader {
     #[serde(rename = "type")]

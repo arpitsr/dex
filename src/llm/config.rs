@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
-use crate::core::types::*;
-use crate::llm::auth::*;
+use crate::core::types::{ApiProtocol, PermissionMode, Provider};
+use crate::llm::auth::load_codex_credentials;
 
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
 /// > `~/.config/dex/config.yaml`.
@@ -858,7 +858,12 @@ impl LlmConfig {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
+    use super::{
+        detect_verify_command, model_api_from_env, remember_learned_api, usage_cost, ApiProtocol,
+        LlmConfig, ModelsResponse, PermissionMode, Provider,
+    };
+    use crate::core::types::Usage;
+    use std::env;
 
     #[test]
     fn apply_model_routes_prefixed_selection_to_endpoint() {
