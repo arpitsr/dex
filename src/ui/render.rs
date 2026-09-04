@@ -157,13 +157,47 @@ pub(super) fn plan_status(_app: &App) -> Option<String> {
     None
 }
 
-pub(super) fn ui_status(app: &App) -> String {
+/// One styled run of status-bar text.
+type Piece = (String, Style);
+
+/// Quiet fact (model, token counts, cost, separators): the theme's blended
+/// muted foreground keeps the terminal's hue and stays readable on tinted
+/// backgrounds, unlike fixed ANSI grays.
+fn quiet_style() -> Style {
+    Style::default().fg(theme::muted_fg())
+}
+
+fn sep() -> Piece {
+    (" · ".to_string(), quiet_style())
+}
+
+fn quiet(text: impl Into<String>) -> Piece {
+    (text.into(), quiet_style())
+}
+
+/// Style for the context-usage run, graduating with pressure: quiet while
+/// there is headroom, the app's warning yellow at ≥75% of the compaction
+/// trigger (`context_window - reserve_tokens`), red once past it.
+fn context_style(app: &App, tokens: u64) -> Style {
+    if app.config.context_window == 0 {
+        return quiet_style();
+    }
+    let threshold = app.config.compaction_threshold();
+    if tokens >= threshold {
+        Style::default().fg(Color::LightRed)
+    } else if tokens.saturating_mul(4) >= threshold.saturating_mul(3) {
+        Style::default().fg(Color::Yellow)
+    } else {
+        quiet_style()
+    }
+}
+
+/// The full left-side status as styled runs. Quiet facts use the theme's
+/// muted foreground; accents reuse the app's semantic ANSI colors (Cyan
+/// identity, LightGreen clean branch, Yellow warnings, LightRed past the
+/// compaction trigger), which terminal themes remap to their own palette.
+pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
     let cwd = compact_path(&app.cwd);
-    let git = app
-        .git_branch
-        .as_ref()
-        .map(|branch| format!(" · {}{}", branch, if app.git_dirty { "*" } else { "" }))
-        .unwrap_or_default();
     let tokens = app
         .tool_state
         .last_usage
@@ -176,33 +210,49 @@ pub(super) fn ui_status(app: &App) -> String {
             .checked_div(app.config.context_window)
             .unwrap_or(0)
     };
-    let mut base = format!(
-        "{} · {} / {}{} · {} / {} tokens ({}%)",
-        cwd,
+    let mut pieces = Vec::new();
+    pieces.push((cwd, Style::default().fg(Color::Cyan)));
+    pieces.push(sep());
+    pieces.push(quiet(format!(
+        "{} / {}",
         app.config.provider.name(),
-        app.config.model,
-        git,
-        format_tokens(tokens),
-        format_tokens(app.config.context_window),
-        context_pct
-    );
+        app.config.model
+    )));
+    if let Some(branch) = app.git_branch.as_ref() {
+        pieces.push(sep());
+        pieces.push((branch.clone(), Style::default().fg(Color::LightGreen)));
+        if app.git_dirty {
+            pieces.push(("*".to_string(), Style::default().fg(Color::Yellow)));
+        }
+    }
+    pieces.push(sep());
+    pieces.push((
+        format!(
+            "{} / {} tokens ({}%)",
+            format_tokens(tokens),
+            format_tokens(app.config.context_window),
+            context_pct
+        ),
+        context_style(app, tokens),
+    ));
     // Provider-reported cache-hit subset of the last call's prompt (billed
     // at a fraction of full input price); omitted until a provider reports it.
     if let Some(cached) = app.tool_state.last_cached {
         if cached > 0 {
+            pieces.push(sep());
             if tokens > 0 {
                 let hit_pct = cached
                     .saturating_mul(100)
                     .checked_div(tokens)
                     .unwrap_or(0)
                     .min(100);
-                base.push_str(&format!(
-                    " · {} cached ({}%)",
+                pieces.push(quiet(format!(
+                    "{} cached ({}%)",
                     format_tokens(cached),
                     hit_pct
-                ));
+                )));
             } else {
-                base.push_str(&format!(" · {} cached", format_tokens(cached)));
+                pieces.push(quiet(format!("{} cached", format_tokens(cached))));
             }
         }
     }
@@ -210,65 +260,150 @@ pub(super) fn ui_status(app: &App) -> String {
     // made (per-call counts are conversation-sized, so this is the spend
     // figure that grows across turns; the % above is live context usage).
     if app.tool_state.total_usage > 0 {
-        base.push_str(&format!(
-            " · {} total",
+        pieces.push(sep());
+        pieces.push(quiet(format!(
+            "{} total",
             format_tokens(app.tool_state.total_usage)
-        ));
+        )));
     }
     // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
     // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
     if app.tool_state.total_cost > 0.0005 {
-        base.push_str(&format!(" · ${:.3}", app.tool_state.total_cost));
+        pieces.push(sep());
+        pieces.push(quiet(format!("${:.3}", app.tool_state.total_cost)));
     }
     if let Some(plan) = plan_status(app) {
-        format!("{} · {}", base, plan)
-    } else {
-        base
+        pieces.push(sep());
+        pieces.push(quiet(plan));
     }
+    pieces
 }
 
-pub(super) fn footer_text(app: &App, width: u16) -> String {
-    let hint = if !app.autoscroll {
-        "▲ more above · "
-    } else {
-        ""
-    };
-    let cwd = compact_path(&app.cwd);
-    let compact = format!("{} · {}", cwd, app.config.model);
-    let model = app.config.model.clone();
-    // Prefer full status with plan, but fall back to compact when narrow.
-    let with_plan = plan_status(app).map(|p| format!("{} · {}", compact, p));
-    let mut candidates = vec![ui_status(app)];
-    if let Some(wp) = with_plan {
-        candidates.push(wp);
-    }
-    candidates.push(compact);
-    candidates.push(model.clone());
-    // Connection badge pinned to the right edge. On a remote box knowing
-    // that beats any left-side detail, so it survives narrowing at the
-    // left's expense: first left candidate that leaves room for it wins,
-    // otherwise the widest left that fits alone, else bare model.
+pub(super) fn ui_status(app: &App) -> String {
+    status_pieces(app)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+fn compact_pieces(app: &App) -> Vec<Piece> {
+    vec![
+        (compact_path(&app.cwd), Style::default().fg(Color::Cyan)),
+        sep(),
+        quiet(app.config.model.clone()),
+    ]
+}
+
+/// How this TUI reached its engine. Remote is the exceptional state worth
+/// noticing; a local daemon is a quiet fact.
+fn conn_piece(app: &App) -> Piece {
     let conn = app
         .connection
         .clone()
         .unwrap_or_else(|| "[L] local".to_string());
-    let conn_w = UnicodeWidthStr::width(conn.as_str());
-    let mut left_only = None;
-    for status in candidates {
-        let left = format!("{}{}", hint, status);
-        let lw = UnicodeWidthStr::width(left.as_str());
-        if lw + 1 + conn_w <= width as usize {
-            let pad = " ".repeat(width as usize - lw - conn_w);
-            return format!("{left}{pad}{conn}");
+    let style = if conn.starts_with("[R]") {
+        Style::default().fg(Color::Cyan)
+    } else {
+        quiet_style()
+    };
+    (conn, style)
+}
+
+/// Scroll hint: an attention flag ("you're missing content above"), styled
+/// like the other pending/attention items.
+fn hint_pieces(app: &App) -> Vec<Piece> {
+    if app.autoscroll {
+        Vec::new()
+    } else {
+        vec![
+            (
+                "▲ more above".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            sep(),
+        ]
+    }
+}
+
+fn pieces_width(pieces: &[Piece]) -> usize {
+    pieces
+        .iter()
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+        .sum()
+}
+
+fn to_line(pieces: Vec<Piece>) -> Line<'static> {
+    Line::from(
+        pieces
+            .into_iter()
+            .map(|(text, style)| Span::styled(text, style))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Truncate a styled run sequence to `width` cells, ellipsizing the piece
+/// that crosses the edge.
+fn truncate_pieces(pieces: Vec<Piece>, width: usize) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for (text, style) in pieces {
+        if used >= width {
+            break;
         }
-        if left_only.is_none() && lw <= width as usize {
+        let w = UnicodeWidthStr::width(text.as_str());
+        if w <= width - used {
+            used += w;
+            out.push((text, style));
+        } else {
+            out.push((truncate_display(&text, (width - used) as u16), style));
+            break;
+        }
+    }
+    out
+}
+
+/// Connection badge pinned to the right edge. On a remote box knowing
+/// that beats any left-side detail, so it survives narrowing at the
+/// left's expense: first left candidate that leaves room for it wins,
+/// otherwise the widest left that fits alone, else bare model.
+pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
+    let width = width as usize;
+    let hint = hint_pieces(app);
+    let conn = conn_piece(app);
+    let conn_w = pieces_width(std::slice::from_ref(&conn));
+    let candidates = [
+        status_pieces(app),
+        compact_pieces(app),
+        vec![quiet(app.config.model.clone())],
+    ];
+    let mut left_only: Option<Vec<Piece>> = None;
+    for candidate in candidates {
+        let mut left = hint.clone();
+        left.extend(candidate);
+        let lw = pieces_width(&left);
+        if lw + 1 + conn_w <= width {
+            left.push((" ".repeat(width - lw - conn_w), Style::default()));
+            left.push(conn);
+            return to_line(left);
+        }
+        if left_only.is_none() && lw <= width {
             left_only = Some(left);
         }
     }
     if let Some(left) = left_only {
-        return left;
+        return to_line(left);
     }
-    truncate_display(&format!("{}{}", hint, model), width)
+    let mut left = hint;
+    left.push(quiet(app.config.model.clone()));
+    to_line(truncate_pieces(left, width))
+}
+
+pub(super) fn footer_text(app: &App, width: u16) -> String {
+    footer_line(app, width)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
@@ -560,10 +695,9 @@ struct FooterView;
 impl FooterView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
-        let text = footer_text(app, width);
+        let line = footer_line(app, width);
         f.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(Color::Cyan)))
-                .block(Block::default().padding(surface_padding())),
+            Paragraph::new(line).block(Block::default().padding(surface_padding())),
             area,
         );
     }
@@ -1392,6 +1526,51 @@ mod tests {
         assert!(text.contains("8.0k cached"), "{text}");
         app.tool_state.last_cached = Some(0);
         assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
+    }
+
+    #[test]
+    fn status_bar_colors_are_semantic_per_item() {
+        let mut app = test_app();
+        let muted = theme::muted_fg();
+        let fg_of = |app: &App, needle: &str| {
+            status_pieces(app)
+                .into_iter()
+                .find(|(text, _)| text.contains(needle))
+                .map(|(_, style)| style.fg)
+                .unwrap_or_else(|| panic!("no status piece contains {needle}"))
+        };
+        // Quiet facts: model and token counts use the theme's muted fg.
+        assert_eq!(fg_of(&app, "test-model"), Some(muted));
+        app.tool_state.last_usage = Some(12_000);
+        assert_eq!(fg_of(&app, "tokens"), Some(muted));
+        // Repo state: clean branch reads as ok, the dirty marker warns.
+        app.git_branch = Some("main".into());
+        assert_eq!(fg_of(&app, "main"), Some(Color::LightGreen));
+        app.git_dirty = true;
+        assert_eq!(fg_of(&app, "*"), Some(Color::Yellow));
+        // Context usage graduates with pressure against the compaction
+        // trigger (128k window - 16k reserve = 111_616): quiet, then
+        // warning yellow at >=75% of it, red past it.
+        app.tool_state.last_usage = Some(100_000);
+        assert_eq!(fg_of(&app, "tokens"), Some(Color::Yellow));
+        app.tool_state.last_usage = Some(112_000);
+        assert_eq!(fg_of(&app, "tokens"), Some(Color::LightRed));
+        // The scroll hint is an attention flag; a remote badge is an accent
+        // while a local one stays quiet.
+        app.autoscroll = false;
+        assert_eq!(
+            footer_line(&app, 200).spans[0].style.fg,
+            Some(Color::Yellow)
+        );
+        app.autoscroll = true;
+        app.connection = Some("[L] local".into());
+        let local = footer_line(&app, 200);
+        assert_eq!(local.spans.last().unwrap().style.fg, Some(muted));
+        app.connection = Some("[R] daemon.internal".into());
+        let badge_spans = footer_line(&app, 200).spans;
+        let badge = badge_spans.last().unwrap();
+        assert_eq!(badge.content.as_ref(), "[R] daemon.internal");
+        assert_eq!(badge.style.fg, Some(Color::Cyan));
     }
 
     #[test]
