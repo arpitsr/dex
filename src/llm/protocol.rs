@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 use crate::core::types::{
-    ChatMessage, FunctionCall, FunctionDef, LlmToolCall, StreamToolCall, ToolDefinition,
+    ChatMessage, FunctionCall, FunctionDef, LlmToolCall, Role, StreamToolCall, ToolDefinition,
 };
 
 pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) {
@@ -190,44 +190,45 @@ pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<
     let mut instructions = Vec::new();
     let mut input = Vec::new();
     for message in messages {
-        if message.role == "system" {
-            if let Some(content) = &message.content {
-                instructions.push(content.clone());
-            }
-            continue;
-        }
-        if message.role == "tool" {
-            input.push(json!({
-                "type": "function_call_output",
-                "call_id": message.tool_call_id.clone().unwrap_or_default(),
-                "output": message.content.clone().unwrap_or_default(),
-            }));
-            continue;
-        }
-        if message.role == "assistant" {
-            // Replay the model's own reasoning items first: with store:false
-            // the request is stateless, and the model only keeps its
-            // reasoning thread if we hand it back.
-            input.extend(message.reasoning_items.iter().flatten().cloned());
-            if let Some(content) = &message.content {
-                if !content.is_empty() {
-                    input.push(json!({ "role": "assistant", "content": content }));
+        match message.role {
+            Role::System => {
+                if let Some(content) = &message.content {
+                    instructions.push(content.clone());
                 }
             }
-            for call in message.tool_calls.as_deref().unwrap_or_default() {
+            Role::Tool => {
                 input.push(json!({
-                    "type": "function_call",
-                    "call_id": call.id,
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "output": message.content_str(),
                 }));
             }
-            continue;
+            Role::Assistant => {
+                // Replay the model's own reasoning items first: with store:false
+                // the request is stateless, and the model only keeps its
+                // reasoning thread if we hand it back.
+                input.extend(message.reasoning_items.iter().flatten().cloned());
+                if let Some(content) = &message.content {
+                    if !content.is_empty() {
+                        input.push(json!({ "role": "assistant", "content": content }));
+                    }
+                }
+                for call in message.tool_calls.as_deref().unwrap_or_default() {
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": call.id,
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }));
+                }
+            }
+            Role::User => {
+                input.push(json!({
+                    "role": "user",
+                    "content": message.content_str(),
+                }));
+            }
         }
-        input.push(json!({
-            "role": message.role,
-            "content": message.content.clone().unwrap_or_default(),
-        }));
     }
     (
         if instructions.is_empty() {
@@ -368,38 +369,10 @@ mod tests {
     #[test]
     fn responses_input_splits_system_and_tool_output() {
         let msgs = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: Some("sys1".into()),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                ..Default::default()
-            },
-            ChatMessage {
-                role: "system".into(),
-                content: Some("sys2".into()),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                ..Default::default()
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: Some("hi".into()),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                ..Default::default()
-            },
-            ChatMessage {
-                role: "tool".into(),
-                content: Some("out".into()),
-                tool_calls: None,
-                tool_call_id: Some("call_1".into()),
-                name: None,
-                ..Default::default()
-            },
+            ChatMessage::system("sys1"),
+            ChatMessage::system("sys2"),
+            ChatMessage::user("hi"),
+            ChatMessage::tool_result("call_1", "out"),
         ];
         let (instructions, input) = responses_input(&msgs);
         assert_eq!(instructions.unwrap(), "sys1\n\nsys2");
@@ -410,21 +383,17 @@ mod tests {
 
     #[test]
     fn responses_input_encodes_assistant_tool_calls() {
-        let msgs = vec![ChatMessage {
-            role: "assistant".into(),
-            content: Some("thinking".into()),
-            tool_calls: Some(vec![LlmToolCall {
+        let msgs = vec![ChatMessage::assistant_calls(
+            Some("thinking".into()),
+            vec![LlmToolCall {
                 id: "c1".into(),
                 call_type: "function".into(),
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: "{}".into(),
                 },
-            }]),
-            tool_call_id: None,
-            name: None,
-            ..Default::default()
-        }];
+            }],
+        )];
         let (instructions, input) = responses_input(&msgs);
         assert!(instructions.is_none());
         assert_eq!(input[0]["role"], "assistant");
@@ -437,27 +406,24 @@ mod tests {
     /// thread instead of making it re-reason.
     #[test]
     fn responses_input_replays_reasoning_items_before_content() {
-        let msgs = vec![ChatMessage {
-            role: "assistant".into(),
-            content: Some("narration".into()),
-            tool_calls: Some(vec![LlmToolCall {
+        let mut msg = ChatMessage::assistant_calls(
+            Some("narration".into()),
+            vec![LlmToolCall {
                 id: "c1".into(),
                 call_type: "function".into(),
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: "{}".into(),
                 },
-            }]),
-            tool_call_id: None,
-            name: None,
-            reasoning_items: Some(vec![json!({
-                "type": "reasoning",
-                "id": "r1",
-                "summary": [],
-                "encrypted_content": "blob1"
-            })]),
-            reasoning_content: None,
-        }];
+            }],
+        );
+        msg.reasoning_items = Some(vec![json!({
+            "type": "reasoning",
+            "id": "r1",
+            "summary": [],
+            "encrypted_content": "blob1"
+        })]);
+        let msgs = vec![msg];
         let (_, input) = responses_input(&msgs);
         assert_eq!(input.len(), 3);
         assert_eq!(input[0]["type"], "reasoning");

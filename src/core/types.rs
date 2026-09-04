@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -32,94 +31,17 @@ impl Plan {
             && self.constraints.is_empty()
             && self.acceptance.is_empty()
     }
-    /// Every step done and every acceptance criterion checked (vacuous when
-    /// a list is empty). Never complete without at least one step.
-    pub fn is_complete(&self) -> bool {
-        !self.steps.is_empty()
-            && self.steps.iter().all(|(_, d)| *d)
-            && self.acceptance.iter().all(|(_, d)| *d)
-    }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
     pub fn from_json(s: &str) -> Self {
         serde_json::from_str(s).unwrap_or_default()
     }
-    pub fn summary(&self) -> Option<String> {
-        if self.is_empty() {
-            return None;
-        }
-        let mut out = String::new();
-        if let Some(g) = &self.goal {
-            out.push_str(&format!("Goal: {}\n", g));
-        }
-        if !self.constraints.is_empty() {
-            out.push_str("Constraints:\n");
-            for c in &self.constraints {
-                out.push_str(&format!("- {c}\n"));
-            }
-        }
-        if !self.steps.is_empty() {
-            out.push_str("Plan:\n");
-            for (i, (text, done)) in self.steps.iter().enumerate() {
-                out.push_str(&format!(
-                    "{} {}. {}\n",
-                    if *done { "[x]" } else { "[ ]" },
-                    i + 1,
-                    text
-                ));
-            }
-        }
-        if !self.acceptance.is_empty() {
-            out.push_str("Acceptance:\n");
-            for (i, (text, done)) in self.acceptance.iter().enumerate() {
-                out.push_str(&format!(
-                    "{} {}. {}\n",
-                    if *done { "[x]" } else { "[ ]" },
-                    i + 1,
-                    text
-                ));
-            }
-        }
-        if self.is_complete() {
-            out.push_str(
-                "Task complete: every plan step and acceptance criterion is done — summarize the outcome and stop.\n",
-            );
-        }
-        Some(out.trim_end().to_string())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plan_contract_summary_includes_completion_state() {
-        let plan = Plan {
-            goal: Some("g".into()),
-            constraints: vec!["c".into()],
-            steps: vec![("s".into(), true)],
-            acceptance: vec![("a".into(), true)],
-        };
-        let s = plan.summary().unwrap();
-        assert!(s.contains("Goal: g"));
-        assert!(s.contains("Constraints:\n- c"));
-        assert!(s.contains("[x] 1. s"));
-        assert!(s.contains("[x] 1. a"));
-        assert!(s.contains("Task complete"));
-        assert!(plan.is_complete());
-
-        // One unchecked acceptance criterion keeps it incomplete and drops the stop line.
-        let mut partial = plan.clone();
-        partial.acceptance[0].1 = false;
-        assert!(!partial.is_complete());
-        assert!(!partial.summary().unwrap().contains("Task complete"));
-        // No steps → never complete even with everything else done.
-        let mut no_steps = plan.clone();
-        no_steps.steps.clear();
-        assert!(!no_steps.is_complete());
-    }
 
     #[test]
     fn plan_round_trip_keeps_contract_and_loads_legacy_json() {
@@ -135,6 +57,30 @@ mod tests {
         let parsed = Plan::from_json(legacy);
         assert!(parsed.constraints.is_empty() && parsed.acceptance.is_empty());
         assert_eq!(parsed.steps, vec![("s".to_string(), false)]);
+    }
+
+    #[test]
+    fn chat_message_round_trips_legacy_wire_shape() {
+        // Older session JSONL wrote `role` as a plain string; the typed
+        // enum must deserialize it and serialize back to the same bytes.
+        let legacy = r#"{"role":"assistant","content":"hi","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}],"name":"skill"}"#;
+        let msg: ChatMessage = serde_json::from_str(legacy).expect("legacy line loads");
+        assert_eq!(msg.role, Role::Assistant);
+        assert_eq!(msg.name.as_deref(), Some("skill"));
+        let round: ChatMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap())
+            .expect("own output reloads");
+        assert_eq!(
+            serde_json::to_string(&round).unwrap(),
+            serde_json::to_string(&msg).unwrap()
+        );
+        // Option fields stay omitted when None (compaction/splice compat).
+        assert_eq!(
+            serde_json::to_string(&ChatMessage::user("hey")).unwrap(),
+            r#"{"role":"user","content":"hey"}"#
+        );
+        // A role string outside the four canonical ones is rejected, not
+        // silently remapped.
+        assert!(serde_json::from_str::<ChatMessage>(r#"{"role":"mystery"}"#).is_err());
     }
 }
 
@@ -189,9 +135,32 @@ pub(crate) struct ApprovalRequest {
 
 /// Width of a string as displayed, ignoring ANSI escape sequences.
 /// dividers, truncated to fit the terminal width.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+/// Message role on the wire. Serialized lowercase; only these four exist —
+/// session JSONL from older builds used the same strings.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Role {
+    System,
+    #[default]
+    User,
+    Assistant,
+    Tool,
+}
+
+impl Role {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct ChatMessage {
-    pub(crate) role: String,
+    pub(crate) role: Role,
     pub(crate) content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_calls: Option<Vec<LlmToolCall>>,
@@ -209,6 +178,61 @@ pub(crate) struct ChatMessage {
     /// chat-completions providers that stream `reasoning_content`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    fn new(role: Role, content: Option<String>) -> Self {
+        Self {
+            role,
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_items: None,
+            reasoning_content: None,
+        }
+    }
+
+    pub(crate) fn system(content: impl Into<String>) -> Self {
+        Self::new(Role::System, Some(content.into()))
+    }
+
+    pub(crate) fn user(content: impl Into<String>) -> Self {
+        Self::new(Role::User, Some(content.into()))
+    }
+
+    /// User message carrying a tag in `name` (`summary`, `steering`,
+    /// `skill`, `waive`, `follow-up`) that compaction and the UI key on.
+    pub(crate) fn user_named(content: impl Into<String>, name: impl Into<String>) -> Self {
+        let mut msg = Self::user(content);
+        msg.name = Some(name.into());
+        msg
+    }
+
+    /// Test-only: plain assistant text message. Production assistant
+    /// messages are built by the stream parser, not constructors.
+    #[cfg(test)]
+    pub(crate) fn assistant(content: impl Into<String>) -> Self {
+        Self::new(Role::Assistant, Some(content.into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assistant_calls(content: Option<String>, calls: Vec<LlmToolCall>) -> Self {
+        let mut msg = Self::new(Role::Assistant, content);
+        msg.tool_calls = Some(calls);
+        msg
+    }
+
+    pub(crate) fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        let mut msg = Self::new(Role::Tool, Some(content.into()));
+        msg.tool_call_id = Some(call_id.into());
+        msg
+    }
+
+    /// Message text, empty when the wire shape omitted `content`.
+    pub(crate) fn content_str(&self) -> &str {
+        self.content.as_deref().unwrap_or_default()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -288,13 +312,6 @@ impl Provider {
             Self::OpenAiCodex => "openai-codex",
         }
     }
-
-    pub(crate) fn default_base_url(self) -> &'static str {
-        match self {
-            Self::OpenCode => "https://api.openai.com/v1",
-            Self::OpenAiCodex => "https://chatgpt.com/backend-api/codex",
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -312,6 +329,20 @@ pub(crate) struct Usage {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) cached_tokens: Option<u64>,
+}
+
+/// Normalized terminal condition for a model turn (chat-completions
+/// `finish_reason`; the responses API's `response.completed` / `.incomplete`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    /// Model finished its reply normally.
+    Stop,
+    /// Cut off by the output-token limit — the reply is likely truncated.
+    Length,
+    /// Stopped to execute tool calls.
+    ToolUse,
+    /// Cut off by a provider-side content filter — the reply is partial.
+    ContentFilter,
 }
 
 /// Chat-completions wire shape for usage. Cache detail nests under
@@ -357,6 +388,10 @@ pub(crate) struct StreamChunk {
 pub(crate) struct StreamChoice {
     #[serde(default)]
     pub(crate) delta: StreamDelta,
+    /// Terminal condition for this choice, sent on the final chunk only
+    /// (e.g. "stop", "length", "tool_calls").
+    #[serde(default)]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

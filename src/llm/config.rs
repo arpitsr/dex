@@ -4,7 +4,7 @@ use std::env;
 use std::time::Duration;
 
 use crate::core::types::{ApiProtocol, PermissionMode, Provider};
-use crate::llm::auth::load_codex_credentials;
+use crate::llm::provider::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL};
 
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
 /// > `~/.config/dex/config.yaml`.
@@ -128,30 +128,6 @@ fn persist_selection(selection: &str, provider: Provider, base_url: &str) {
     }
 }
 
-pub(crate) fn provider_default_context_window(provider: Provider) -> u64 {
-    match provider {
-        Provider::OpenCode => 128_000,
-        Provider::OpenAiCodex => 128_000,
-    }
-}
-
-pub(crate) fn provider_endpoints(provider: Provider) -> BTreeMap<String, String> {
-    if provider == Provider::OpenCode {
-        // ponytail: static table, add dynamic registry if more than 3 providers/endpoints
-        [
-            ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-            (
-                "go".to_string(),
-                "https://opencode.ai/zen/go/v1".to_string(),
-            ),
-        ]
-        .into_iter()
-        .collect()
-    } else {
-        BTreeMap::new()
-    }
-}
-
 pub(crate) fn dex_models_cache_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
         return Some(std::path::PathBuf::from(dir).join("dex/models.json"));
@@ -223,15 +199,6 @@ fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u6
     None
 }
 
-/// Catalog provider keys that can serve a dex provider, mirroring the
-/// qualified-id table in `load_dex_models_cache`.
-fn catalog_provider_keys(provider: Provider) -> &'static [&'static str] {
-    match provider {
-        Provider::OpenCode => &["opencode", "opencode-go", "openai"],
-        Provider::OpenAiCodex => &["openai-codex", "codex"],
-    }
-}
-
 /// First `cost` object for `needle` among catalog providers accepted by
 /// `pick`, in the catalog's provider order.
 fn catalog_cost<'a>(
@@ -276,7 +243,7 @@ pub(crate) fn usage_cost(
 ) -> Option<f64> {
     let catalog = load_dex_catalog()?;
     let needle = model.to_ascii_lowercase();
-    let keys = catalog_provider_keys(provider);
+    let keys = provider.catalog_keys();
     let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
         entry.get("api").and_then(|v| v.as_str()) == Some(base_url)
     })
@@ -420,15 +387,7 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .ok_or("models.dev unavailable and OPENAI_API_KEY not set for fallback")?;
     let endpoints: BTreeMap<String, String> = if base_url.starts_with("https://opencode.ai/") {
-        [
-            ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-            (
-                "go".to_string(),
-                "https://opencode.ai/zen/go/v1".to_string(),
-            ),
-        ]
-        .into_iter()
-        .collect()
+        provider.endpoints()
     } else {
         BTreeMap::new()
     };
@@ -508,8 +467,7 @@ fn fetch_provider_models(
     base_url: &str,
     api_key: &str,
 ) -> Vec<String> {
-    // ponytail: only OpenCode-style endpoints expose /models; codex backend-api doesn't
-    if provider != Provider::OpenCode {
+    if !provider.has_model_listing() {
         return Vec::new();
     }
     let url = format!("{}/models", base_url.trim_end_matches('/'));
@@ -601,10 +559,7 @@ impl LlmConfig {
         let model = model_override
             .or_else(|| env::var("OPENAI_MODEL").ok())
             .or_else(|| load_config_str(&file, "model"))
-            .unwrap_or_else(|| match provider {
-                Provider::OpenCode => "gpt-5.6-luna".to_string(),
-                Provider::OpenAiCodex => "gpt-5.6-luna".to_string(),
-            });
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let mut available_models = env::var("DEX_MODELS")
             .ok()
             .map(|value| {
@@ -644,21 +599,13 @@ impl LlmConfig {
         } else {
             model_api_from_env(&model, &model).unwrap_or(api)
         };
-        let (api_key, account_id) = match provider {
-            Provider::OpenCode => (
-                env::var("OPENAI_API_KEY")
-                    .ok()
-                    .or_else(|| load_config_str(&file, "api_key"))
-                    .ok_or("OPENAI_API_KEY not set (export it or add it to your shell profile)")?,
-                None,
-            ),
-            Provider::OpenAiCodex => load_codex_credentials()?,
-        };
+        let (api_key, account_id) =
+            provider.load_credentials(load_config_str(&file, "api_key").as_deref())?;
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
             .or_else(|| load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)))
-            .unwrap_or_else(|| provider_default_context_window(provider));
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         // Pi: reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env::var("DEX_RESERVE_TOKENS")
             .ok()
@@ -689,7 +636,7 @@ impl LlmConfig {
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
         // Always expose zen/go for OpenCode so /model can set base_url without env
-        let endpoints: BTreeMap<String, String> = provider_endpoints(provider);
+        let endpoints: BTreeMap<String, String> = provider.endpoints();
         // Dex own cache (no pi dependency) — bootstraps with just current model if missing.
         if available_models.is_empty() {
             if let Some(cached) = load_dex_models_cache() {
@@ -742,11 +689,7 @@ impl LlmConfig {
             if let Ok(new_provider) = Provider::parse(prefix) {
                 if new_provider != self.provider {
                     // Best-effort credential switch; failure surfaces at next LLM call
-                    let creds = match new_provider {
-                        Provider::OpenCode => env::var("OPENAI_API_KEY").ok().map(|k| (k, None)),
-                        Provider::OpenAiCodex => load_codex_credentials().ok(),
-                    };
-                    if let Some((k, acct)) = creds {
+                    if let Ok((k, acct)) = new_provider.load_credentials(None) {
                         self.api_key = k;
                         self.account_id = acct;
                     }
@@ -754,7 +697,7 @@ impl LlmConfig {
                     // auth failure surfaces at the next LLM call.
                     self.provider = new_provider;
                     self.base_url = new_provider.default_base_url().to_string();
-                    self.endpoints = provider_endpoints(new_provider);
+                    self.endpoints = new_provider.endpoints();
                 }
                 sel = rest;
             }
@@ -790,10 +733,10 @@ impl LlmConfig {
                 if let Some(ctx) = catalog_context_window(&self.model, &catalog) {
                     self.context_window = ctx;
                 } else {
-                    self.context_window = provider_default_context_window(self.provider);
+                    self.context_window = DEFAULT_CONTEXT_WINDOW;
                 }
             } else {
-                self.context_window = provider_default_context_window(self.provider);
+                self.context_window = DEFAULT_CONTEXT_WINDOW;
             }
         }
         result
@@ -821,22 +764,14 @@ impl LlmConfig {
         persist: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
-        let (api_key, account_id) = match provider {
-            Provider::OpenCode => (
-                env::var("OPENAI_API_KEY")
-                    .ok()
-                    .ok_or("OPENAI_API_KEY not set (export it or add it to your shell profile)")?,
-                None,
-            ),
-            Provider::OpenAiCodex => load_codex_credentials()?,
-        };
+        let (api_key, account_id) = provider.load_credentials(None)?;
         self.provider = provider;
         self.api_key = api_key;
         self.account_id = account_id;
         self.base_url = env_base_url
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| provider.default_base_url().to_string());
-        self.endpoints = provider_endpoints(provider);
+        self.endpoints = provider.endpoints();
         let api_name = env::var("OPENAI_API").ok();
         self.api = api_name
             .as_deref()

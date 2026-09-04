@@ -13,7 +13,9 @@ use super::slash;
 use super::status::{footer_line, truncate_display};
 use super::wrapping::wrap_line;
 use super::TAB_WIDTH;
-use super::{theme, transcript_indent, App, InputField, WrappedBlock, TRANSCRIPT_INDENT};
+use super::{
+    theme, transcript_indent, App, InputField, Selection, WrappedBlock, TRANSCRIPT_INDENT,
+};
 
 pub(super) fn surface_padding() -> Padding {
     Padding {
@@ -207,6 +209,81 @@ fn is_block_start(t: &str) -> bool {
         || t.starts_with("- [x] ")
 }
 
+fn is_heading(t: &str) -> bool {
+    t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ")
+}
+
+/// Ordered-list marker (`1. `, `12) `) — models often butt these against
+/// prose without a blank line.
+fn is_ordered_item(t: &str) -> bool {
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if !(1..=3).contains(&digits) {
+        return false;
+    }
+    let rest = &t[digits..];
+    rest.starts_with(". ") || rest.starts_with(") ")
+}
+
+/// List continuity class: consecutive items of the same class stay tight.
+fn list_kind(t: &str) -> u8 {
+    if t.starts_with("- ") || t.starts_with("* ") {
+        1
+    } else if is_ordered_item(t) {
+        2
+    } else {
+        0
+    }
+}
+
+/// Insert blank lines where the model butts block-level markdown (headings,
+/// lists, fences, rules) against surrounding text, so the transcript doesn't
+/// render wall-to-wall. `pending` is the assistant text already buffered for
+/// the streaming seam (or empty for whole-message replay). Never inserts
+/// inside code fences; consecutive list items stay tight; existing blank
+/// lines are never doubled.
+pub(super) fn with_block_gaps(pending: &str, s: &str) -> String {
+    let trimmed = pending.strip_suffix('\n').unwrap_or(pending);
+    let mut prev = trimmed.rsplit('\n').next().unwrap_or("").trim_start();
+    let mut air = is_heading(prev);
+    let mut fenced = trimmed
+        .lines()
+        .filter(|l| l.trim_start().starts_with("```"))
+        .count()
+        % 2
+        == 1;
+    let mut out = String::new();
+    for line in s.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            if !fenced && !prev.is_empty() {
+                out.push('\n');
+            }
+            fenced = !fenced;
+            if !fenced {
+                // closing fence gets air after it too
+                air = true;
+                prev = t;
+            }
+        } else {
+            if !fenced && !prev.is_empty() && !t.is_empty() {
+                let starts_block = is_block_start(t) || is_ordered_item(t);
+                let kt = list_kind(t);
+                let kp = list_kind(prev);
+                if air || (starts_block && !(kt > 0 && kt == kp)) {
+                    out.push('\n');
+                }
+            }
+            if !fenced {
+                prev = t;
+                air = is_heading(t);
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
     static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
     let highlighter = HIGHLIGHTER
@@ -296,6 +373,9 @@ fn wrap_block(
 
 impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+        // Remember where the transcript lives so mouse events can be
+        // translated into display rows between frames.
+        app.transcript_area = Some(area);
         // Clear the transcript area first: without this a shorter frame (e.g. after
         // a long wrapped line scrolls out, or after a resize that re-wraps to fewer
         // rows) would leave trailing cells from the previous Paragraph. The top-level
@@ -319,6 +399,9 @@ impl TranscriptView {
         // (reset/resume) drops stale entries; appended blocks start unwrapped.
         if app.wrapped_cache.len() > app.transcript.len() {
             app.wrapped_cache.truncate(app.transcript.len());
+            // Selection rows refer to the old cache; drop them rather than
+            // highlight or copy rows that no longer exist.
+            app.selection = None;
             changed = true;
         }
         while app.wrapped_cache.len() < app.transcript.len() {
@@ -386,15 +469,90 @@ impl TranscriptView {
         // exactly that, so Wrap rendered dark holes inside the box.
         // ponytail: clone only the visible window; a full-transcript clone
         // per frame was the remaining O(N) term once wrapping was cached.
-        let window: Vec<Line<'static>> = app
+        let mut window: Vec<Line<'static>> = app
             .display_cache
             .iter()
             .skip(app.scroll as usize)
             .take(visible)
             .cloned()
             .collect();
+        if let Some(sel) = app.selection {
+            apply_selection(&mut window, app.scroll as usize, sel, area.width);
+        }
         let transcript = Paragraph::new(window).style(Style::default().fg(Color::Gray));
         f.render_widget(transcript, area);
+    }
+}
+
+const SEL_BG: Color = Color::Indexed(24);
+
+/// Paint the mouse selection onto the visible window rows. Fully covered
+/// rows become a solid bar (style patch + padding to the area width); the
+/// anchor/end rows highlight only the selected cell range.
+fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, width: u16) {
+    let ((r0, c0), (r1, c1)) = sel.norm();
+    let hl = Style::default().bg(SEL_BG);
+    for (i, line) in window.iter_mut().enumerate() {
+        let row = scroll + i;
+        if row < r0 || row > r1 {
+            continue;
+        }
+        if row > r0 && row < r1 {
+            line.style = line.style.patch(hl);
+            pad_row(line, width, hl);
+            continue;
+        }
+        let (from, to) = if row == r0 && row == r1 {
+            (c0, c1)
+        } else if row == r0 {
+            (c0, usize::MAX)
+        } else {
+            (0, c1)
+        };
+        style_row_range(line, from, to, hl);
+        if to == usize::MAX || to >= line.width() {
+            line.style = line.style.patch(hl);
+            pad_row(line, width, hl);
+        }
+    }
+}
+
+/// Highlight cell range `[from, to)` of a row, splitting spans as needed.
+fn style_row_range(line: &mut Line<'static>, from: usize, to: usize, hl: Style) {
+    if from >= to || line.spans.is_empty() {
+        return;
+    }
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
+    let mut pos = 0usize;
+    for span in std::mem::take(&mut line.spans) {
+        let graphemes: Vec<(String, Style)> = span
+            .styled_graphemes(Style::default())
+            .map(|g| (g.symbol.to_string(), g.style))
+            .collect();
+        let start = pos;
+        pos += graphemes.len();
+        if pos <= from || start >= to {
+            out.push(span);
+            continue;
+        }
+        for (i, (symbol, style)) in graphemes.into_iter().enumerate() {
+            if start + i >= from && start + i < to {
+                out.push(Span::styled(symbol, style.patch(hl)));
+            } else {
+                out.push(Span::styled(symbol, style));
+            }
+        }
+    }
+    line.spans = out;
+}
+
+/// Pad a row with highlighted spaces so a fully covered row reads as a solid
+/// selection bar out to the right edge.
+fn pad_row(line: &mut Line<'static>, width: u16, hl: Style) {
+    let w = width as usize;
+    let line_w = line.width();
+    if line_w < w {
+        line.spans.push(Span::styled(" ".repeat(w - line_w), hl));
     }
 }
 
@@ -1225,6 +1383,9 @@ mod tests {
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
             display_cache: Vec::new(),
+            transcript_area: None,
+            selection: None,
+            notice: None,
         }
     }
 
@@ -2166,6 +2327,48 @@ mod tests {
             tool_row,
             text_row + 3,
             "box must occupy exactly text_row-1..text_row+1; a phantom row from Paragraph::wrap shifts the tool block down"
+        );
+    }
+
+    #[test]
+    fn block_gaps_around_headings_and_lists() {
+        let out = with_block_gaps("", "text\n## Changes\n- a\n- b\n1. run tests");
+        assert_eq!(out, "text\n\n## Changes\n\n- a\n- b\n\n1. run tests\n");
+    }
+
+    #[test]
+    fn block_gaps_respect_code_fence() {
+        let out = with_block_gaps("", "```rust\n# not a heading\n- not a list\n```\ntext");
+        assert_eq!(out, "```rust\n# not a heading\n- not a list\n```\n\ntext\n");
+    }
+
+    #[test]
+    fn block_gaps_streaming_seam_after_heading() {
+        // Heading landed at the end of the previous throttle window.
+        let out = with_block_gaps("## Changes\n", "- first item");
+        assert_eq!(out, "\n- first item\n");
+    }
+
+    #[test]
+    fn block_gaps_never_double_existing_blanks() {
+        let out = with_block_gaps("", "## H\n\n- a\n\ntail");
+        assert_eq!(out, "## H\n\n- a\n\ntail\n");
+    }
+
+    #[test]
+    fn block_gaps_open_fence_from_previous_window() {
+        // Fence opened in a previous flush; its content must stay untouched.
+        let out = with_block_gaps("```rust\nlet x = 1;\n", "# done");
+        assert_eq!(out, "# done\n");
+    }
+
+    #[test]
+    fn block_gaps_whole_message_replay() {
+        let msg = "Here's what I did:\n## Changes\n- Refactored the loop\n- Added a cache\n### Verification\ncargo test passed.\n1. run tests\n2. commit\nAll good.";
+        let out = with_block_gaps("", msg);
+        assert_eq!(
+            out,
+            "Here's what I did:\n\n## Changes\n\n- Refactored the loop\n- Added a cache\n\n### Verification\n\ncargo test passed.\n\n1. run tests\n2. commit\nAll good.\n"
         );
     }
 }
