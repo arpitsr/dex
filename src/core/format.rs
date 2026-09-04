@@ -73,6 +73,12 @@ pub(crate) fn terminal_preview(text: &str) -> String {
     truncate_text(text, 10 * 1024, 100)
 }
 
+/// Rows of informational snippet under a tool outcome line in the REPL
+/// transcript. Every tool shares this cap (write/edit's review-oriented diff
+/// is the documented exception); overflow folds into a `… +N more lines`
+/// tail, so no tool can flood the transcript.
+pub(crate) const TRANSCRIPT_PREVIEW_LINES: usize = 6;
+
 /// Compact single-line summary of a tool's arguments for the REPL transcript.
 /// Pulls the primary arg (path/command/pattern) instead of dumping raw JSON.
 pub(crate) fn short_arg(name: &str, input: &str) -> String {
@@ -92,11 +98,14 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
                     .collect();
                 format!("{} steps: {}", steps.len(), tools.join(" → "))
             }),
-        "read" | "write" | "edit" | "grep" | "ls" | "glob" => get("path")
+        "read" => read_short_arg(obj.as_ref()),
+        "write" | "edit" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "glob" => get("path")
             .or_else(|| get("file"))
             .or_else(|| get("pattern"))
             .or_else(|| get("glob"))
             .map(str::to_string),
+        // The input line already shows the tool name, so only the mode.
+        "git" => Some(get("mode").unwrap_or("status").to_string()),
         "bash" => get("command").map(str::to_string),
         _ => None,
     };
@@ -107,6 +116,36 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
     let s = strip_ansi(s);
     let limit = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
     s[..limit].to_string()
+}
+
+/// Compact read target for the transcript input line, in editor goto style
+/// like opencode/pi: bare `path` for a whole-file read, `path:from-to` when
+/// paginating, `path:from+` for an open-ended offset, `N files` for fan-out
+/// (so `paths:[...]` never dumps raw JSON), or the glob. Raw JSON is never
+/// shown.
+fn read_short_arg(obj: Option<&serde_json::Map<String, Value>>) -> Option<String> {
+    let get = |k: &str| obj.and_then(|o| o.get(k)).and_then(Value::as_str);
+    if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(Value::as_array) {
+        let n = paths.len();
+        return Some(format!("{} file{}", n, if n == 1 { "" } else { "s" }));
+    }
+    if let Some(glob) = get("glob") {
+        return Some(glob.to_string());
+    }
+    let path = get("path").or_else(|| get("file"))?;
+    let offset = obj
+        .and_then(|o| o.get("offset"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
+    match obj.and_then(|o| o.get("limit")).and_then(Value::as_u64) {
+        Some(n) => {
+            let end = offset.saturating_add(n.max(1)).saturating_sub(1);
+            Some(format!("{path}:{offset}-{end}"))
+        }
+        None if offset > 1 => Some(format!("{path}:{offset}+")),
+        None => Some(path.to_string()),
+    }
 }
 
 /// First non-empty, trimmed line of a tool result, truncated — a one-line
@@ -155,15 +194,17 @@ fn strip_ansi(text: &str) -> String {
 
 /// A few informational lines from a tool result, rendered dim under the
 /// one-line summary: enough to see *what* happened without flooding the
-/// transcript. Blank lines and ANSI escapes are removed; when truncated, a
-/// `… +N more lines` tail notes how much was elided. `skip_first` lets
-/// callers omit the line the one-line summary already shows.
+/// transcript. Lines are trimmed on the right only, so indentation (tree
+/// output, indented code, nested listings) survives; blank lines and ANSI
+/// escapes are removed, long lines clipped at 120 chars, and overflow folds
+/// into a `… +N more lines` tail. `skip_first` lets callers omit the line
+/// the one-line summary already shows.
 pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool) -> Vec<String> {
     let mut lines = text
         .lines()
         .map(strip_ansi)
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty());
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.trim().is_empty());
     if skip_first {
         lines.next();
     }
@@ -193,21 +234,190 @@ pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool
     preview
 }
 
-/// Full diff preview for write/edit tool results: one transcript row per diff
-/// line, tail-capped so a pathological diff cannot flood the transcript.
-/// ponytail: flat 400-row cap; collapse unchanged hunks instead if it bites.
+/// Read snippet à la opencode/pi: the `{:>4}  content` numbered gutter is
+/// kept verbatim (trimmed on the right only, so gutter alignment and code
+/// indent survive — unlike the generic preview, which trims both sides),
+/// `==> file <==` fan-out headers stay as landmarks, and `[... N more
+/// lines …]` pagination trailers fold into a clean `… +N more lines` tail
+/// instead of leaking into the snippet as content. Tail-capped like other
+/// previews.
+pub(crate) fn read_preview_lines(text: &str, max: usize) -> Vec<String> {
+    let mut preview: Vec<String> = Vec::new();
+    let mut elided: usize = 0;
+    let mut trailer_more: u64 = 0;
+    for line in text.lines() {
+        let stripped = strip_ansi(line);
+        let trimmed = stripped.trim();
+        if let Some(n) = trailer_more_lines(trimmed) {
+            trailer_more += n;
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if preview.len() < max {
+            let clipped = stripped.trim_end();
+            let limit = clipped
+                .char_indices()
+                .nth(120)
+                .map(|(i, _)| i)
+                .unwrap_or(clipped.len());
+            if limit < clipped.len() {
+                preview.push(format!("{}…", &clipped[..limit]));
+            } else {
+                preview.push(clipped.to_string());
+            }
+        } else {
+            elided += 1;
+        }
+    }
+    let more = elided + trailer_more as usize;
+    if more > 0 {
+        preview.push(format!(
+            "… +{more} more line{}",
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    preview
+}
+
+/// How many unseen lines a `[... …]` trailer line reports, if any: the read
+/// pagination note (`[... {n} more lines; continue with offset … ...]`), the
+/// byte-budget note (no count), and the head+tail clamp marker
+/// (`[... {n} of {m} lines truncated ...]`) all share the `[... {n} …` shape.
+fn trailer_more_lines(trimmed: &str) -> Option<u64> {
+    if !trimmed.starts_with("[...") {
+        return None;
+    }
+    trimmed
+        .strip_prefix("[...")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|first| first.parse::<u64>().ok())
+}
+
+/// GitHub-style diff snippet for write/edit results: unified hunks with
+/// surrounding context (the `---`/`+++` file headers are dropped — the tool
+/// input line already names the path), long lines clipped like other
+/// previews, tail-capped so a pathological diff cannot flood the transcript.
+/// ponytail: flat row cap; collapse unchanged hunks instead if it bites.
 pub(crate) fn diff_preview_lines(diff: &str, max: usize) -> Vec<String> {
     let mut lines: Vec<String> = diff.lines().map(|l| l.trim_end().to_string()).collect();
-    if lines.len() > max {
-        let rest = lines.len() - max;
-        lines.truncate(max);
-        lines.push(format!("… +{rest} more diff lines"));
+    // Strip exactly the leading file headers (`--- a/…` / `+++ b/…`); deeper
+    // lines that happen to start with `---` are hunk content, not headers.
+    if lines.first().is_some_and(|l| l.starts_with("--- ")) {
+        lines.remove(0);
     }
-    lines
+    if lines.first().is_some_and(|l| l.starts_with("+++ ")) {
+        lines.remove(0);
+    }
+    let mut clipped: Vec<String> = lines
+        .into_iter()
+        .map(|line| {
+            let limit = line
+                .char_indices()
+                .nth(120)
+                .map(|(i, _)| i)
+                .unwrap_or(line.len());
+            if limit < line.len() {
+                format!("{}…", &line[..limit])
+            } else {
+                line
+            }
+        })
+        .collect();
+    if clipped.len() > max {
+        let rest = clipped.len() - max;
+        clipped.truncate(max);
+        clipped.push(format!("… +{rest} more diff lines"));
+    }
+    clipped
 }
 
 /// Outcome-first, human-sized result for the TUI transcript: the ✓/✗ glyph
 /// and its color already carry success/failure, so the summary leads with
+/// Read outcome in opencode/pi style: `lines A-B · M lines (+N more)` for a
+/// paginated or truncated read, `F files · M lines` for fan-out, and the plain
+/// `M lines` count otherwise. The range comes from the numbered gutter
+/// actually shown (truthful under clamping); `[... N more lines …]`
+/// pagination trailers feed the `(+N more)` tail instead of inflating the
+/// count, and `==> file <==` fan-out headers are counted as files, not lines.
+fn read_summary(obj: Option<&serde_json::Map<String, Value>>, text: &str) -> String {
+    let offset = obj
+        .and_then(|o| o.get("offset"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
+    let mut files = 0usize;
+    let mut shown = 0usize;
+    let mut first: Option<u64> = None;
+    let mut last = 0u64;
+    let mut more = 0u64;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("==>") {
+            files += 1;
+            continue;
+        }
+        if let Some(n) = trailer_more_lines(trimmed) {
+            more += n;
+            continue;
+        }
+        if trimmed.starts_with("[...") {
+            continue;
+        }
+        shown += 1;
+        if let Some(n) = read_gutter_number(line) {
+            if first.is_none() {
+                first = Some(n);
+            }
+            last = n;
+        }
+    }
+    let mut out = if files > 0 {
+        format!(
+            "{} file{} · {} line{}",
+            files,
+            if files == 1 { "" } else { "s" },
+            shown,
+            plural(shown)
+        )
+    } else if offset > 1 || more > 0 {
+        match first {
+            Some(a) if a != last => {
+                format!("lines {a}-{last} · {} line{}", shown, plural(shown))
+            }
+            Some(a) => format!("line {a} · {} line{}", shown, plural(shown)),
+            None => format!("{} line{}", shown, plural(shown)),
+        }
+    } else {
+        format!("{} line{}", shown, plural(shown))
+    };
+    if more > 0 {
+        out.push_str(&format!(" (+{more} more)"));
+    }
+    out
+}
+
+/// Line number from read's `{:>4}  content` gutter; `None` for `==>`
+/// headers, `[...` trailers, and unnumbered text. The two-space gap is
+/// required so a code line that merely starts with digits is never mistaken
+/// for a gutter.
+fn read_gutter_number(line: &str) -> Option<u64> {
+    let rest = line.trim_start();
+    let digits_len = rest
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .map(|(i, c)| i + c.len_utf8())
+        .last()?;
+    if !rest[digits_len..].starts_with("  ") {
+        return None;
+    }
+    rest[..digits_len].parse().ok()
+}
+
 /// what actually happened (counts, diffstats, first output line). Failure
 /// keeps the `failed ·` prefix: greppable, and it explains *why*. The tool
 /// input JSON is consulted for write/edit so the summary can show a diffstat
@@ -222,8 +432,8 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
     let get = |k: &str| obj.as_ref().and_then(|o| o.get(k)).and_then(|x| x.as_str());
     let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
     match name {
-        "read" => format!("{} line{}", lines, plural(lines)),
-        "grep" => {
+        "read" => read_summary(obj.as_ref(), text),
+        "grep" | "ffgrep" => {
             // Files mode (the default) lists paths, not matches.
             let files_mode = obj
                 .as_ref()
@@ -243,7 +453,7 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
                 format!("{lines} matches")
             }
         }
-        "find" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
+        "find" | "fffind" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
         "ls" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
         "bash" => match one_line_summary(text) {
             first if first.is_empty() => "(no output)".to_string(),
@@ -760,5 +970,66 @@ mod tests {
         assert_eq!(one_line_summary("progress\r\r\x07done"), "progressdone");
         // Fallback path: unparseable input JSON is sanitized too.
         assert_eq!(short_arg("x", "'\x1b[1mevil\x1b[0m\r"), "'evil");
+    }
+
+    #[test]
+    fn diff_preview_is_github_style_hunks_without_file_headers() {
+        let diff = "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1,5 +1,6 @@\n ctx\n-old\n+new\n ctx2\n";
+        let preview = diff_preview_lines(diff, 30);
+        // File headers are dropped (the tool input line already names the
+        // path); the hunk header and +/-/context lines remain.
+        assert!(!preview.iter().any(|l| l.starts_with("--- ")));
+        assert!(!preview.iter().any(|l| l.starts_with("+++ ")));
+        assert!(preview.iter().any(|l| l.starts_with("@@")));
+        assert!(preview.iter().any(|l| l == "-old"));
+        assert!(preview.iter().any(|l| l == "+new"));
+        assert!(preview.iter().any(|l| l == " ctx"));
+    }
+
+    #[test]
+    fn diff_preview_clips_long_lines_and_caps_the_tail() {
+        let long = format!("+{}", "x".repeat(200));
+        let diff = format!("--- a/f\n+++ b/f\n@@ -1 +1 @@\n{long}\n+two\n+three\n");
+        let preview = diff_preview_lines(&diff, 2);
+        assert_eq!(preview.len(), 3);
+        assert!(preview[0].starts_with("@@"));
+        assert!(preview[1].ends_with('…'));
+        assert!(preview[1].chars().count() <= 121);
+        assert_eq!(preview[2], "… +2 more diff lines");
+    }
+
+    #[test]
+    fn preview_preserves_indentation_for_all_tools() {
+        // Tree output, indented code, nested listings: the snippet must not
+        // flatten what the tool actually printed.
+        let text = "src/\n  main.rs\n    mod deep\n";
+        assert_eq!(
+            tool_result_preview(text, 6, false),
+            vec!["src/", "  main.rs", "    mod deep"]
+        );
+    }
+
+    #[test]
+    fn short_arg_covers_every_tool_without_raw_json() {
+        assert_eq!(
+            short_arg("find", r#"{"pattern": "TODO", "path": "."}"#),
+            "."
+        );
+        assert_eq!(short_arg("ffgrep", r#"{"pattern": "TODO"}"#), "TODO");
+        assert_eq!(short_arg("fffind", r#"{"pattern": "*.rs"}"#), "*.rs");
+        assert_eq!(short_arg("git", r#"{"mode": "diff"}"#), "diff");
+        assert_eq!(short_arg("git", "{}"), "status");
+    }
+
+    #[test]
+    fn summaries_cover_the_ff_aliases() {
+        assert_eq!(
+            tool_result_summary("ffgrep", "{}", "a.rs\nb.rs\n", true),
+            "2 files matched"
+        );
+        assert_eq!(
+            tool_result_summary("fffind", "{}", "a.rs\n", true),
+            "1 entry"
+        );
     }
 }
