@@ -314,6 +314,18 @@ pub(crate) struct Usage {
     pub(crate) cached_tokens: Option<u64>,
 }
 
+/// Normalized terminal condition for a model turn (chat-completions
+/// `finish_reason`; the responses API's `response.completed` / `.incomplete`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    /// Model finished its reply normally.
+    Stop,
+    /// Cut off by the output-token limit — the reply is likely truncated.
+    Length,
+    /// Stopped to execute tool calls.
+    ToolUse,
+}
+
 /// Chat-completions wire shape for usage. Cache detail nests under
 /// `prompt_tokens_details`, so it needs its own deserialization target.
 #[derive(Deserialize, Default)]
@@ -357,6 +369,10 @@ pub(crate) struct StreamChunk {
 pub(crate) struct StreamChoice {
     #[serde(default)]
     pub(crate) delta: StreamDelta,
+    /// Terminal condition for this choice, sent on the final chunk only
+    /// (e.g. "stop", "length", "tool_calls").
+    #[serde(default)]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

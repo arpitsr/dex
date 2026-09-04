@@ -366,8 +366,8 @@ pub(crate) fn summarize_old_messages(
     // repaint. A dropped receiver makes every send fail silently instead.
     let (sink, rx) = mpsc::channel();
     drop(rx);
-    let (summary, usage) = call_llm(config, &prompt, false, Some(sink), cancel)?;
-    Ok((summary.content.unwrap_or_default(), usage))
+    let turn = call_llm(config, &prompt, false, Some(sink), cancel)?;
+    Ok((turn.message.content.unwrap_or_default(), turn.usage))
 }
 
 /// Fold one call's usage into an accumulator (summing prompt, completion,
@@ -686,9 +686,9 @@ pub(crate) fn compact_history(
             drop(rx);
             let prefix_summary = match call_llm(_config, &prefix_prompt, false, Some(sink), _cancel)
             {
-                Ok((msg, u)) => {
-                    merge_usage(&mut usage_total, u);
-                    msg.content.unwrap_or_default()
+                Ok(turn) => {
+                    merge_usage(&mut usage_total, turn.usage);
+                    turn.message.content.unwrap_or_default()
                 }
                 Err(_) => {
                     deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())

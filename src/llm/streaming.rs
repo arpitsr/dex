@@ -1,8 +1,9 @@
 //! Shared streaming boundary. The concrete SSE readers remain compatible with
 //! both provider protocols and are called through these typed entry points.
 
-use crate::core::types::{ApiProtocol, ChatMessage, Provider, SinkLine, Usage};
+use crate::core::types::{ApiProtocol, ChatMessage, Provider, SinkLine};
 use crate::llm::config::LlmConfig;
+use crate::llm::stream::Turn;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -17,25 +18,16 @@ fn probed_apis() -> &'static Mutex<HashMap<(String, String), ApiProtocol>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A failure raised *after* the provider began streaming the `/responses`
-/// reply (dropped SSE connection, malformed chunk, cancellation). Purely a
-/// type-level marker: `Display` passes the inner message through untouched
-/// so callers matching on `"cancelled"` etc. keep working.
-#[derive(Debug)]
-pub(crate) struct MidStreamError(pub String);
+/// Failure raised after output already streamed; defined in `stream.rs` (the
+/// stream driver knows when output actually flowed), re-exported here where
+/// the protocol-fallback gate consumes it.
+pub(crate) use crate::llm::stream::MidStreamError;
 
-impl std::fmt::Display for MidStreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for MidStreamError {}
-
-/// Only a pre-stream rejection (HTTP status, connect failure) qualifies for
-/// protocol fallback; a mid-stream failure may have already put partial text
-/// on the transcript, and a retried call would duplicate it.
-fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
+/// Only a failure with no streamed output (HTTP status, connect failure,
+/// drop before the first delta) qualifies for protocol fallback; a
+/// mid-stream failure may have already put partial text on the transcript,
+/// and a retried call would duplicate it.
+pub(crate) fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<MidStreamError>().is_some()
 }
 
@@ -79,7 +71,7 @@ pub(crate) fn complete(
     with_tools: bool,
     sink: Option<::std::sync::mpsc::Sender<crate::core::types::SinkLine>>,
     cancel: &dyn crate::agent::state::CancellationSource,
-) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+) -> Result<Turn, Box<dyn std::error::Error>> {
     match effective_api(config) {
         ApiProtocol::ChatCompletions => {
             crate::llm::chat_completions::complete(config, messages, with_tools, sink, cancel)

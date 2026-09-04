@@ -13,9 +13,10 @@ use crate::core::format::{
     model_tool_result, short_arg, terminal_preview, tool_preview, tool_preview_body,
     tool_result_summary,
 };
-use crate::core::types::{ChatMessage, LlmToolCall, SinkLine, Usage};
+use crate::core::types::{ChatMessage, LlmToolCall, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
+use crate::llm::stream::Turn;
 use crate::session::Session;
 use crate::tools::{execute_outcome, ToolOutcome};
 
@@ -83,7 +84,7 @@ fn call_client_cancellable(
     messages: &[ChatMessage],
     with_tools: bool,
     console: &Console,
-) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+) -> Result<Turn, Box<dyn std::error::Error>> {
     let client = (*client).clone();
     let messages = messages.to_vec();
     let sink = console.sink().cloned();
@@ -233,18 +234,30 @@ pub(crate) fn process_turn(
         // Single clone for the provider worker thread happens inside
         // `call_client_cancellable`; no snapshot clone here (messages is
         // not mutated concurrently during the LLM call).
-        let (message, usage) =
-            match call_client_cancellable(client, cancel, messages, true, console) {
-                Ok(result) => result,
-                Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
-                    return Err("cancelled by user".into());
-                }
-                Err(e) => return Err(e),
-            };
-        if let Some(u) = usage {
+        let turn = match call_client_cancellable(client, cancel, messages, true, console) {
+            Ok(result) => result,
+            Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
+                return Err("cancelled by user".into());
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(u) = turn.usage {
             last_usage = Some(u.prompt_tokens);
             record_usage(config, state, console, u);
         }
+        // The provider cut the reply off at the output-token limit: whatever
+        // landed is likely mid-sentence. Say so instead of silently keeping
+        // a truncated reply as if it were complete.
+        if turn.stop_reason == Some(StopReason::Length) {
+            let note = "model output hit the output-token limit and may be truncated";
+            match console.sink() {
+                Some(sink) => {
+                    sink.send(SinkLine::System(note.to_string())).ok();
+                }
+                None => with_console(false, || eprintln!("[dex] {note}")),
+            }
+        }
+        let message = turn.message;
 
         if let Some(calls) = message.tool_calls.clone() {
             messages.push(ChatMessage {
@@ -459,9 +472,9 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
-            Ok((
-                ChatMessage {
+        ) -> Result<Turn, Box<dyn std::error::Error>> {
+            Ok(Turn {
+                message: ChatMessage {
                     role: "assistant".into(),
                     content: Some("hello from mock".into()),
                     tool_calls: None,
@@ -469,12 +482,13 @@ mod tests {
                     name: None,
                     ..Default::default()
                 },
-                Some(Usage {
+                usage: Some(Usage {
                     prompt_tokens: 1,
                     completion_tokens: 0,
                     cached_tokens: None,
                 }),
-            ))
+                stop_reason: None,
+            })
         }
     }
 
@@ -560,7 +574,7 @@ mod tests {
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
             _cancel: &dyn CancellationSource,
-        ) -> Result<(ChatMessage, Option<Usage>), Box<dyn std::error::Error>> {
+        ) -> Result<Turn, Box<dyn std::error::Error>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let message = if round == 0 {
                 ChatMessage {
@@ -588,14 +602,15 @@ mod tests {
                     ..Default::default()
                 }
             };
-            Ok((
+            Ok(Turn {
                 message,
-                Some(Usage {
+                usage: Some(Usage {
                     prompt_tokens: 1,
                     completion_tokens: 0,
                     cached_tokens: None,
                 }),
-            ))
+                stop_reason: None,
+            })
         }
     }
 
