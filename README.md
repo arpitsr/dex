@@ -148,7 +148,11 @@ windows and reasoning options come from the cached models.dev catalog — run
 catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`); opencode's is
 `OPENCODE_API_KEY`. There is no per-provider default key var outside the
 catalog — one provider's key never leaks into another. A model's advertised thinking options (e.g. `low/high/max`)
-are shown in the `/model` confirmation; `DEX_THINKING_EFFORT` picks one.
+are shown in the `/model` confirmation; `/thinking <level>` pins one per model
+(remembered per endpoint+model and validated against the advertised list —
+unknown models accept anything, a stale catalog never blocks).
+`DEX_THINKING_EFFORT` is the fallback when nothing is pinned, and an effort no
+model advertises warns once instead of failing opaquely at the API.
 Wire protocol resolves like opencode: responses first, one fallback to
 completions, remembered per endpoint+model. Native-protocol-only providers
 (no OpenAI-compatible endpoint in the catalog, e.g. anthropic) are not
@@ -395,7 +399,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
-| `DEX_THINKING_EFFORT` | Reasoning effort passed to the API (e.g. `medium`). |
+| `DEX_THINKING_EFFORT` | Default reasoning effort (a stored `/thinking` choice wins). |
 | `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`). |
 | `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |

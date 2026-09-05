@@ -434,6 +434,77 @@ pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
     (!values.is_empty()).then_some(values)
 }
 
+/// Per-model reasoning effort chosen via `/thinking`
+/// (`XDG_CACHE_HOME/dex/thinking-effort.json`): `"<base_url>|<model>"` →
+/// effort. Wins over `DEX_THINKING_EFFORT` (a stored choice is more specific
+/// than a global). `None` clears the entry.
+/// ponytail: read-through, no process cache — the file holds a handful of
+/// entries; add file-identity caching like `learned-apis.json` if it grows.
+fn thinking_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
+        return Some(std::path::PathBuf::from(dir).join("dex/thinking-effort.json"));
+    }
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache/dex/thinking-effort.json"))
+}
+
+fn thinking_map() -> serde_json::Map<String, serde_json::Value> {
+    thinking_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn write_thinking_map(map: &serde_json::Map<String, serde_json::Value>) {
+    let Some(path) = thinking_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(map) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+pub(crate) fn stored_thinking_effort(base_url: &str, model: &str) -> Option<String> {
+    thinking_map()
+        .get(format!("{base_url}|{model}").as_str())?
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// Remember (`Some`) or clear (`None`) the `/thinking` choice for one
+/// endpoint+model. Best-effort.
+pub(crate) fn remember_thinking_effort(base_url: &str, model: &str, effort: Option<&str>) {
+    let mut map = thinking_map();
+    let key = format!("{base_url}|{model}");
+    match effort.filter(|e| !e.is_empty()) {
+        Some(effort) => {
+            map.insert(key, serde_json::Value::from(effort));
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+    write_thinking_map(&map);
+}
+
+/// Validate a `/thinking` pick against the model's advertised options: the
+/// catalog's own casing on match, the raw pick for unknown models (a stale
+/// catalog shouldn't block), or the valid options when rejected.
+pub(crate) fn validate_thinking_effort(model: &str, pick: &str) -> Result<String, Vec<String>> {
+    match reasoning_options_for(model) {
+        Some(options) => options
+            .iter()
+            .find(|o| o.eq_ignore_ascii_case(pick))
+            .cloned()
+            .ok_or(options),
+        None => Ok(pick.to_string()),
+    }
+}
+
 fn persist_selection(selection: &str, provider: &Provider, base_url: &str) {
     let Some(path) = config_file_path() else {
         return;
@@ -1305,9 +1376,7 @@ impl LlmConfig {
             available_models,
             api,
             account_id,
-            thinking_effort: env::var("DEX_THINKING_EFFORT")
-                .ok()
-                .filter(|v| !v.is_empty()),
+            thinking_effort: None, // resolved below once model+endpoint are final
             context_window,
             reserve_tokens,
             keep_recent_tokens,
@@ -1329,6 +1398,7 @@ impl LlmConfig {
             this.apply_model(&model, false)?;
         } else {
             this.strip_routing_prefixes();
+            this.refresh_thinking_effort();
         }
         Ok(this)
     }
@@ -1456,6 +1526,9 @@ impl LlmConfig {
                 self.context_window = DEFAULT_CONTEXT_WINDOW;
             }
         }
+        // Effort follows the final model+endpoint: stored `/thinking`
+        // choice, else `DEX_THINKING_EFFORT`.
+        self.refresh_thinking_effort();
         Ok(result)
     }
 
@@ -1467,6 +1540,41 @@ impl LlmConfig {
 
     pub(crate) fn keep_recent_tokens(&self) -> u64 {
         self.keep_recent_tokens
+    }
+
+    /// Reasoning effort for the current model: a stored `/thinking` choice
+    /// wins, else `DEX_THINKING_EFFORT`, else unset. Warns once per
+    /// model+effort when the effective level isn't advertised for the model
+    /// (the catalog scan is skipped entirely when no effort is set, so the
+    /// common case stays free).
+    pub(crate) fn refresh_thinking_effort(&mut self) {
+        let effort = stored_thinking_effort(&self.base_url, &self.model).or_else(|| {
+            env::var("DEX_THINKING_EFFORT")
+                .ok()
+                .filter(|v| !v.is_empty())
+        });
+        if let Some(effort) = &effort {
+            if let Some(options) = reasoning_options_for(&self.model) {
+                if !options.iter().any(|o| o == effort) {
+                    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> =
+                        OnceLock::new();
+                    let key = format!("{}|{effort}", self.model);
+                    if WARNED
+                        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key)
+                    {
+                        eprintln!(
+                            "dex: thinking effort '{effort}' not advertised for model '{}' (options: {}); the API may reject it",
+                            self.model,
+                            options.join(", ")
+                        );
+                    }
+                }
+            }
+        }
+        self.thinking_effort = effort;
     }
 
     /// Base wire protocol + baked pin from an entry pin, re-reading the
@@ -1525,6 +1633,9 @@ impl LlmConfig {
         if let Some(api) = self.resolve_model_api(&current) {
             self.api = api;
         }
+        // The endpoint moved under the model: re-resolve the thinking knob
+        // for the new endpoint+model too.
+        self.refresh_thinking_effort();
         if persist {
             persist_selection(&self.model, &self.provider, &self.base_url);
         }
@@ -1537,8 +1648,8 @@ pub(crate) mod tests {
     use super::{
         build_ctx_map, detect_verify_command, load_config_file, load_dex_models_cache,
         load_provider_entries, model_api_from_env, persist_selection, reasoning_options_for,
-        remember_learned_api, usage_cost, ApiProtocol, LlmConfig, PermissionMode, Provider,
-        ProviderEntry,
+        remember_learned_api, remember_thinking_effort, stored_thinking_effort, usage_cost,
+        validate_thinking_effort, ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
     };
     use crate::core::types::Usage;
     use std::{collections::BTreeSet, env};
@@ -2862,5 +2973,102 @@ pub(crate) mod tests {
         assert_eq!(map.get("claude-x"), Some(&200000));
         assert!(!map.contains_key("zero"));
         assert!(!map.contains_key("nodoc"));
+    }
+
+    #[test]
+    fn thinking_effort_resolves_stored_then_env() {
+        // Precedence: stored `/thinking` choice > `DEX_THINKING_EFFORT` >
+        // unset; clearing falls back down the chain.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_THINKING_EFFORT",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-think-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::remove_var("DEX_THINKING_EFFORT");
+        let mut cfg = test_cfg();
+        cfg.refresh_thinking_effort();
+        assert_eq!(cfg.thinking_effort, None);
+        std::env::set_var("DEX_THINKING_EFFORT", "medium");
+        cfg.refresh_thinking_effort();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("medium"));
+        remember_thinking_effort(&cfg.base_url, &cfg.model, Some("low"));
+        cfg.refresh_thinking_effort();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("low"));
+        assert_eq!(
+            stored_thinking_effort(&cfg.base_url, &cfg.model).as_deref(),
+            Some("low")
+        );
+        remember_thinking_effort(&cfg.base_url, &cfg.model, None);
+        cfg.refresh_thinking_effort();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("medium"));
+        std::env::remove_var("DEX_THINKING_EFFORT");
+        cfg.refresh_thinking_effort();
+        assert_eq!(cfg.thinking_effort, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thinking_pick_validates_against_advertised_options() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+        let dir = std::env::temp_dir().join(format!("dex-thinkval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_generic_catalog(&dir);
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        // Case-insensitive pick, catalog casing back.
+        assert_eq!(
+            validate_thinking_effort("glm-x", "HIGH"),
+            Ok("high".to_string())
+        );
+        // Rejected pick returns the valid options.
+        assert_eq!(
+            validate_thinking_effort("glm-x", "ultra"),
+            Err(vec!["low".to_string(), "high".to_string()])
+        );
+        // Unknown model: accepted raw, a stale catalog never blocks.
+        assert_eq!(
+            validate_thinking_effort("m-unknown", "whatever"),
+            Ok("whatever".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_model_swaps_effort_with_the_model() {
+        // A model switch moves the thinking knob to the new model's stored
+        // choice instead of leaking the old one.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_THINKING_EFFORT",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-thinkswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::remove_var("DEX_THINKING_EFFORT");
+        let mut cfg = test_cfg();
+        remember_thinking_effort(&cfg.base_url, "m-r", Some("low"));
+        remember_thinking_effort(&cfg.base_url, "m-new", Some("high"));
+        cfg.refresh_thinking_effort();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("low"));
+        cfg.apply_model("m-new", false).unwrap();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("high"));
+        std::env::set_var("DEX_THINKING_EFFORT", "medium");
+        cfg.apply_model("m-bare", false).unwrap();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("medium"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
