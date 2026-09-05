@@ -555,18 +555,22 @@ pub(crate) fn usage_cost(
 }
 
 fn load_dex_models_cache() -> Option<Vec<String>> {
-    // dex cache is models.dev api.json — expose both bare and provider-qualified ids
-    // so /model shows provider and can set base_url without env
+    // dex cache is models.dev api.json — expose bare ids plus endpoint-qualified
+    // variants (`zen/<id>`, `go/<id>`) so a pick names the endpoint it targets;
+    // the prefixes are exactly the names `apply_model` routes on.
     if let Some(catalog) = load_dex_catalog() {
         if let Some(providers) = catalog.as_object() {
             let mut ids: Vec<String> = Vec::new();
             for (prov_key, entry) in providers {
                 if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                    // Only dex-known providers get a qualified variant; others just bare
+                    // Endpoint-qualified variants for the opencode endpoints;
+                    // other catalog providers stay bare. "openai" models are
+                    // bare-only: those the opencode endpoints serve already
+                    // appear under zen//go/ via the opencode/opencode-go
+                    // entries.
                     let dex_prefix: Option<&str> = match prov_key.as_str() {
-                        "opencode" => Some("opencode"),
+                        "opencode" => Some("zen"),
                         "opencode-go" => Some("go"),
-                        "openai" => Some("opencode"),
                         "openai-codex" | "codex" => Some("openai-codex"),
                         _ => None,
                     };
@@ -1345,8 +1349,9 @@ impl LlmConfig {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        build_ctx_map, detect_verify_command, model_api_from_env, remember_learned_api, usage_cost,
-        ApiProtocol, LlmConfig, ModelsResponse, PermissionMode, Provider,
+        build_ctx_map, detect_verify_command, load_dex_models_cache, model_api_from_env,
+        remember_learned_api, usage_cost, ApiProtocol, LlmConfig, ModelsResponse, PermissionMode,
+        Provider,
     };
     use crate::core::types::Usage;
     use std::env;
@@ -2049,6 +2054,26 @@ pub(crate) mod tests {
         assert_eq!(cfg.model, "m-go-only");
         // The pin holds even though the catalog says m-go-only lives on go.
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn models_cache_offers_endpoint_qualified_ids() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+        let dir = std::env::temp_dir().join(format!("dex-mlist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_routing_catalog(&dir);
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let ids = load_dex_models_cache().unwrap();
+        // Bare ids for every catalog model, plus endpoint-qualified variants
+        // so a pick can name its endpoint explicitly (`zen/…` vs `go/…`).
+        assert!(ids.contains(&"m-zen-only".to_string()));
+        assert!(ids.contains(&"zen/m-zen-only".to_string()));
+        assert!(ids.contains(&"m-go-only".to_string()));
+        assert!(ids.contains(&"go/m-go-only".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
