@@ -399,10 +399,10 @@ pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
     renderer.render(&blocks, &ThemeConfig::default())
 }
 
-/// Render a streamed thinking block: collapsed = a single dim italic
-/// "Thinking" indicator whose dots animate while the block streams and
-/// settle at "Thinking ..." once it closes; expanded (Ctrl+T) = the full
-/// text, dim italic.
+/// Render a streamed thinking block: collapsed = a single dim
+/// "◌ Thinking" indicator whose dots animate while the block streams and
+/// settle at "◌ Thinking ..." once it closes; expanded (Ctrl+T) = the full
+/// text, dim.
 fn thinking_display_lines(
     text: &str,
     expanded: bool,
@@ -410,9 +410,7 @@ fn thinking_display_lines(
     tick: u16,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(theme::muted_fg())
-        .add_modifier(Modifier::ITALIC);
+    let style = Style::default().fg(theme::muted_fg());
     let line =
         |s: &str| super::indent_transcript_line(Line::from(Span::styled(s.to_string(), style)));
     if expanded {
@@ -427,13 +425,13 @@ fn thinking_display_lines(
 /// The collapsed indicator's text: while the block streams, the dot count
 /// cycles 1→3 every other animation frame (~0.24s at the ~8 fps busy
 /// heartbeat) — deliberately slower than the stream flush so the dots read
-/// as a calm pulse; once the block closes it freezes at "Thinking ...".
+/// as a calm pulse; once the block closes it freezes at "◌ Thinking ...".
 fn thinking_indicator_text(thinking_open: bool, tick: u16) -> String {
     if !thinking_open {
-        return "Thinking ...".to_string();
+        return "◌ Thinking ...".to_string();
     }
     let dots = dots_for_tick(tick);
-    format!("Thinking {dots}")
+    format!("◌ Thinking {dots}")
 }
 
 /// Shared dot cadence: cycles 1→3 every other animation frame (~0.24s at
@@ -450,16 +448,14 @@ fn dots_for_tick(tick: u16) -> &'static str {
 fn thinking_indicator_line(thinking_open: bool, tick: u16, width: u16) -> Line<'static> {
     super::indent_transcript_line(Line::from(Span::styled(
         truncate_display(&thinking_indicator_text(thinking_open, tick), width),
-        Style::default()
-            .fg(theme::muted_fg())
-            .add_modifier(Modifier::ITALIC),
+        Style::default().fg(theme::muted_fg()),
     )))
 }
 
 struct TranscriptView;
 
 /// Wrapped rows for a transcript block at `width`. Thinking blocks are
-/// cached in their settled form — collapsed "Thinking ..." or the full dim
+/// cached in their settled form — collapsed "◌ Thinking ..." or the full dim
 /// text when expanded — so the streaming dots stay a per-frame overlay on
 /// the tail row and never trigger a re-wrap themselves.
 fn wrap_block(
@@ -685,11 +681,11 @@ impl ActivityView {
         let content_width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
         let (activity_text, activity_color) = if app.busy {
             // Dots cycle 1→3 on the shared cadence, matching the
-            // "Thinking .." indicator. The tool itself already shows in
+            // "◌ Thinking .." indicator. The tool itself already shows in
             // the transcript's ▸ block.
             (
                 truncate_display(
-                    &format!("Working {}", dots_for_tick(app.tick)),
+                    &format!("● Working {}", dots_for_tick(app.tick)),
                     content_width,
                 ),
                 theme::muted_fg(),
@@ -1583,7 +1579,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(joined.contains("Thinking ..."), "{joined}");
+        assert!(joined.contains("◌ Thinking ..."), "{joined}");
         // Collapsed is a bare indicator: no thought content leaks through.
         assert!(!joined.contains("second line"), "{joined}");
 
@@ -1595,7 +1591,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(streamed.contains("Thinking .."), "{streamed}");
+        assert!(streamed.contains("◌ Thinking .."), "{streamed}");
 
         let expanded = thinking_display_lines(text, true, false, 0, 80);
         assert!(expanded.len() >= 3, "{}", expanded.len());
@@ -1609,13 +1605,13 @@ mod tests {
     #[test]
     fn thinking_indicator_cycles_while_streaming_and_settles() {
         // Dots grow 1→3 every other animation frame, then loop.
-        assert_eq!(thinking_indicator_text(true, 0), "Thinking .");
-        assert_eq!(thinking_indicator_text(true, 2), "Thinking ..");
-        assert_eq!(thinking_indicator_text(true, 4), "Thinking ...");
-        assert_eq!(thinking_indicator_text(true, 6), "Thinking .");
+        assert_eq!(thinking_indicator_text(true, 0), "◌ Thinking .");
+        assert_eq!(thinking_indicator_text(true, 2), "◌ Thinking ..");
+        assert_eq!(thinking_indicator_text(true, 4), "◌ Thinking ...");
+        assert_eq!(thinking_indicator_text(true, 6), "◌ Thinking .");
         // Closed: static, never animated again.
         for tick in [0, 2, 4, 6, 999] {
-            assert_eq!(thinking_indicator_text(false, tick), "Thinking ...");
+            assert_eq!(thinking_indicator_text(false, tick), "◌ Thinking ...");
         }
     }
 
@@ -1643,7 +1639,7 @@ mod tests {
             },
         ];
         app.thinking_open = true;
-        app.tick = 2; // animated frame for this tick is "Thinking .."
+        app.tick = 2; // animated frame for this tick is "◌ Thinking .."
         let backend = TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
@@ -1657,9 +1653,9 @@ mod tests {
             .map(|l| text(l).trim().to_string())
             .collect();
         // The settled block stays at three dots even though a block is open.
-        assert!(lines.iter().any(|l| l == "Thinking ..."), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "◌ Thinking ..."), "{lines:?}");
         // The open tail block still animates.
-        assert!(lines.iter().any(|l| l == "Thinking .."), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "◌ Thinking .."), "{lines:?}");
     }
 
     #[test]

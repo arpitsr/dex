@@ -189,6 +189,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // not wait for a daemon-side skills scan before reporting the error.
     let skills_client = client.clone();
     let skills_handle = std::thread::spawn(move || skills_client.list_skills().unwrap_or_default());
+    // Sessions default to `<workspace>-<7 chars>` (k8s-style); an explicit
+    // `--name` wins. Generated client-side so the local placeholder shows the
+    // same name the daemon persists.
+    let session_name = args
+        .session_name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| Session::default_session_name(&info.cwd));
     let session_result: Result<(String, bool), String> = if let Some(reattach) = &args.reattach {
         // P10: attach to an existing persisted session on the daemon and get
         // the replay cursor, instead of creating a fresh one.
@@ -198,7 +206,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             .map_err(|e| format!("failed to reattach session: {e}"))
     } else {
         client
-            .create_session(&info.cwd, args.session_name.as_deref())
+            .create_session(&info.cwd, Some(&session_name))
             .map(|resp| (resp.session_id, false))
             .map_err(|e| format!("failed to create session: {e}"))
     };
@@ -311,35 +319,31 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         cancel_flag,
         last_click: None,
     };
+    if !is_reattach {
+        // Keep the local placeholder's display name in sync with the daemon
+        // record (a reattach overwrites `app.session` from disk below).
+        remote.app.session.set_name(session_name).ok();
+    }
 
-    // P10: reconstruct the transcript for a reattached session by replaying
-    // its journaled event stream. Idempotent replays skip stale approvals
+    // P10: reconstruct the transcript for a reattached session. Prefer the
+    // persisted JSONL messages (complete, includes user prompts the events
+    // journal never records); fall back to the events journal when the file
+    // isn't shared (true remote). Idempotent replays skip stale approvals
     // (parked approvals die with their turn on the daemon).
     if is_reattach {
-        let mut since = 0u64;
-        let mut batches = 0;
-        loop {
-            match remote.client.events(&remote.session_id, since) {
-                Ok(resp) => {
-                    if resp.events.is_empty() {
-                        break;
-                    }
-                    for env in resp.events {
-                        if !matches!(env.event, StreamEvent::ApprovalRequired { .. }) {
-                            handle_stream_event(&mut remote, env.event);
-                        }
-                    }
-                    since = resp.next_seq;
-                    batches += 1;
-                    if batches > 10_000 {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    push_info(&mut remote.app, format!("replay failed: {e}"));
-                    break;
-                }
+        let local = find_local_session_file(&remote.session_id);
+        let mut rebuilt = false;
+        if let Some(p) = local.as_deref() {
+            if let Ok(s) = Session::from_path(p) {
+                remote.app.session = s;
             }
+            if let Some(p) = local.as_deref() {
+                rebuilt = rebuild_remote_from_messages(&mut remote, p);
+            }
+        }
+        if !rebuilt {
+            let sid = remote.session_id.clone();
+            replay_remote_events(&mut remote, &sid);
         }
         push_info(
             &mut remote.app,
@@ -712,6 +716,100 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             };
         }
     }
+}
+
+/// Find the local JSONL for a daemon session id when files are shared
+/// (default co-located daemon). Matches exact id first, then id prefix,
+/// then file-stem — `Session::resume` only handles index/path, so an id
+/// lookup through it silently misses and left `/resume` with no file to
+/// rebuild from (blank terminal).
+fn find_local_session_file(sid: &str) -> Option<std::path::PathBuf> {
+    let all = Session::list_all().unwrap_or_default();
+    if let Some((p, _)) = all.iter().find(|(_, h)| h.id() == sid) {
+        return Some(p.clone());
+    }
+    let q = sid.to_ascii_lowercase();
+    if let Some((p, _)) = all.iter().find(|(_, h)| {
+        h.id().to_ascii_lowercase().starts_with(&q) || q.starts_with(&h.id().to_ascii_lowercase())
+    }) {
+        return Some(p.clone());
+    }
+    all.into_iter()
+        .find(|(p, _)| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem == sid || stem.starts_with(sid))
+        })
+        .map(|(p, _)| p)
+}
+
+/// Rebuild the transcript from the persisted JSONL messages (complete:
+/// includes the user prompts the events journal never records). Returns
+/// true when anything was rendered. Mirrors the local `/resume` path.
+fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) -> bool {
+    let Ok(loaded) = crate::session::load_messages_from_session(path) else {
+        return false;
+    };
+    if loaded.is_empty() {
+        return false;
+    }
+    let system = remote
+        .app
+        .messages
+        .first()
+        .cloned()
+        .unwrap_or(crate::core::types::ChatMessage::system(String::new()));
+    remote.app.messages.clear();
+    remote.app.messages.push(system);
+    remote.app.messages.extend(loaded);
+    super::rebuild_transcript(&mut remote.app);
+    if let Some(p) = remote.app.session.path() {
+        let plan = crate::session::load_plan(p);
+        if !plan.is_empty() {
+            remote.app.plan = plan;
+        }
+    } else {
+        let plan = crate::session::load_plan(path);
+        if !plan.is_empty() {
+            remote.app.plan = plan;
+        }
+    }
+    true
+}
+
+/// Replay the daemon's events journal into the transcript (best effort when
+/// no local file is available, e.g. true remote). Skips parked approvals;
+/// flushes the throttled assistant buffer so the replay is visible.
+fn replay_remote_events(remote: &mut RemoteApp, session_id: &str) {
+    let mut since = 0u64;
+    let mut batches = 0;
+    loop {
+        match remote.client.events(session_id, since) {
+            Ok(resp) => {
+                if resp.events.is_empty() {
+                    break;
+                }
+                for env in resp.events {
+                    if !matches!(env.event, StreamEvent::ApprovalRequired { .. }) {
+                        handle_stream_event(remote, env.event);
+                    }
+                }
+                since = resp.next_seq;
+                batches += 1;
+                if batches > 10_000 {
+                    break;
+                }
+            }
+            Err(e) => {
+                push_info(&mut remote.app, format!("replay failed: {e}"));
+                break;
+            }
+        }
+    }
+    flush_assistant(&mut remote.app);
+    close_thinking(&mut remote.app);
+    remote.app.autoscroll = true;
+    remote.app.scroll = 0;
 }
 
 fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
@@ -1290,12 +1388,15 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     "new session started."
                 };
                 let cwd = remote.app.cwd.clone();
-                match remote.client.create_session(&cwd, None) {
+                let name = Session::default_session_name(&cwd);
+                match remote.client.create_session(&cwd, Some(&name)) {
                     Ok(session) => {
                         remote.session_id = session.session_id;
                         reset_session_state(&mut remote.app);
                         remote.options.plan = None;
-                        remote.app.session = Session::in_memory(cwd);
+                        let mut fresh = Session::in_memory(cwd);
+                        fresh.set_name(name).ok();
+                        remote.app.session = fresh;
                         push_info(&mut remote.app, label.to_string());
                         push_skills_listing(&mut remote.app);
                     }
@@ -1482,10 +1583,18 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             }
         }
         _ if line.starts_with("/resume ") => {
+            if remote.app.busy {
+                push_info(
+                    &mut remote.app,
+                    "cannot resume a session while a turn is running.".to_string(),
+                );
+                return false;
+            }
             let selector = line["/resume ".len()..].trim().to_string();
-            // Resolve selector to a daemon session_id: index or id prefix.
-            // Filter the same way as the listing so indices line up.
-            let sid = remote
+            // Resolve selector to a daemon session_id + server-side path: index
+            // or id prefix. Filter the same way as the listing so indices line
+            // up. The daemon path doubles as the local file when co-located.
+            let resolved: Option<(String, Option<String>)> = remote
                 .client
                 .list_sessions()
                 .ok()
@@ -1496,7 +1605,9 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                             && s.message_count > 0
                     });
                     if let Ok(idx) = selector.parse::<usize>() {
-                        return sessions.get(idx).map(|s| s.session_id.clone());
+                        return sessions
+                            .get(idx)
+                            .map(|s| (s.session_id.clone(), Some(s.path.clone())));
                     }
                     // prefix or exact id/name match
                     let q = selector.to_ascii_lowercase();
@@ -1510,7 +1621,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                                     .to_ascii_lowercase()
                                     .contains(&q)
                         })
-                        .map(|s| s.session_id.clone())
+                        .map(|s| (s.session_id.clone(), Some(s.path.clone())))
                 })
                 .or_else(|| {
                     let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
@@ -1527,11 +1638,11 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                         })
                         .collect();
                     if let Ok(idx) = selector.parse::<usize>() {
-                        return filtered.get(idx).map(|(p, _)| {
+                        return filtered.get(idx).and_then(|(p, _)| {
                             // Resolve id from file header for local fallback.
                             crate::session::Session::from_path(p)
-                                .map(|s| s.id().to_string())
-                                .unwrap_or_default()
+                                .ok()
+                                .map(|s| (s.id().to_string(), Some(p.display().to_string())))
                         });
                     }
                     let q = selector.to_ascii_lowercase();
@@ -1547,82 +1658,57 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                                     .starts_with(&q)
                         })
                         .and_then(|(p, _)| crate::session::Session::from_path(p).ok())
-                        .map(|s| s.id().to_string())
+                        .map(|s| {
+                            let path = s.path().map(|p| p.display().to_string());
+                            (s.id().to_string(), path)
+                        })
                 });
-            let Some(sid) = sid else {
+            let Some((sid, daemon_path)) = resolved else {
                 push_info(
                     &mut remote.app,
                     format!("could not resume session: {selector} not found"),
                 );
                 return false;
             };
-            // Try to keep local Session in sync when files are shared.
-            let local_path = Session::resume(&remote.app.cwd, &sid)
-                .ok()
-                .and_then(|s| s.path().map(|p| p.to_path_buf()))
-                .or_else(|| {
-                    Session::resume(&remote.app.cwd, &selector)
-                        .ok()
-                        .and_then(|s| s.path().map(|p| p.to_path_buf()))
-                });
-            remote.app.transcript.clear();
-            remote.app.assistant_pending.clear();
-            remote.app.assistant_open = false;
+            // Local JSONL when files are shared (default co-located daemon):
+            // daemon path first, then an id lookup (Session::resume only
+            // handles index/path, so an id through it silently misses).
+            let local_path: Option<std::path::PathBuf> = daemon_path
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_file())
+                .or_else(|| find_local_session_file(&sid));
+            // Reattach before touching the transcript: a failed reattach must
+            // leave the current view intact instead of blanking it.
             match remote.client.reattach(&sid) {
                 Ok(resp) => {
                     remote.session_id = resp.session_id.clone();
+                    // Full per-session reset (transcript, usage, plan, scroll,
+                    // pending steering/approvals) so the old conversation
+                    // doesn't leak into the resumed one.
+                    reset_session_state(&mut remote.app);
+                    remote.options.plan = None;
                     if let Some(p) = local_path.as_deref() {
                         if let Ok(s) = Session::from_path(p) {
                             remote.app.session = s;
                         }
                     }
-                    let mut since = 0u64;
-                    let mut batches = 0;
-                    loop {
-                        match remote.client.events(&remote.session_id, since) {
-                            Ok(resp) => {
-                                if resp.events.is_empty() {
-                                    break;
-                                }
-                                for env in resp.events {
-                                    if !matches!(env.event, StreamEvent::ApprovalRequired { .. }) {
-                                        handle_stream_event(remote, env.event);
-                                    }
-                                }
-                                since = resp.next_seq;
-                                batches += 1;
-                                if batches > 10_000 {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                push_info(&mut remote.app, format!("replay failed: {e}"));
-                                break;
-                            }
-                        }
+                    // Prefer JSONL messages (complete, includes user prompts
+                    // the events journal never records); replay events only
+                    // when no local file is available (true remote).
+                    let mut rebuilt = false;
+                    if let Some(p) = local_path.as_deref() {
+                        rebuilt = rebuild_remote_from_messages(remote, p);
                     }
-                    // Fallback when the events journal is missing/empty
-                    // (old sessions, or journal not yet flushed): rebuild
-                    // from the JSONL messages so the terminal isn't blank.
-                    if remote.app.transcript.is_empty() {
-                        if let Some(p) = local_path.as_deref().or(remote.app.session.path()) {
-                            if let Ok(loaded) = crate::session::load_messages_from_session(p) {
-                                if !loaded.is_empty() {
-                                    let system = remote.app.messages.first().cloned().unwrap_or(
-                                        crate::core::types::ChatMessage::system(String::new()),
-                                    );
-                                    remote.app.messages.clear();
-                                    remote.app.messages.push(system);
-                                    remote.app.messages.extend(loaded);
-                                    super::rebuild_transcript(&mut remote.app);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(p) = remote.app.session.path() {
-                        let plan = crate::session::load_plan(p);
-                        if !plan.is_empty() {
-                            remote.app.plan = plan;
+                    if !rebuilt {
+                        let sid = remote.session_id.clone();
+                        replay_remote_events(remote, &sid);
+                        if remote.app.transcript.is_empty()
+                            && remote.app.assistant_pending.is_empty()
+                        {
+                            push_info(
+                                &mut remote.app,
+                                "resumed session has no replayable history.".to_string(),
+                            );
                         }
                     }
                     push_info(
@@ -1792,5 +1878,34 @@ mod tests {
         for row in &rows {
             assert!(row_width(row) <= 40, "row overflow: {}", row_width(row));
         }
+    }
+
+    #[test]
+    fn local_session_file_resolves_by_id_when_files_are_shared() {
+        // `/resume` resolves the daemon sid (an id, not an index/path), so the
+        // local lookup must handle ids — `Session::resume` only handles
+        // index/path and silently missed, leaving a blank terminal.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dex-resume-{}", std::process::id()));
+        let _env =
+            crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let mut s = crate::session::Session::new("/tmp/dex-resume-cwd".into(), None).unwrap();
+        s.append_message(crate::core::types::ChatMessage::user("hi".to_string()))
+            .unwrap();
+        let id = s.id().to_string();
+        let path = s.path().unwrap().to_path_buf();
+        drop(s);
+        assert_eq!(find_local_session_file(&id), Some(path.clone()));
+        assert_eq!(
+            find_local_session_file(&id[..8.min(id.len())]),
+            Some(path.clone())
+        );
+        assert!(find_local_session_file("no-such-session").is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("events.jsonl"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
