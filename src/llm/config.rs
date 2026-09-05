@@ -1115,6 +1115,21 @@ pub(crate) struct LlmConfig {
     pub(crate) client: reqwest::blocking::Client,
 }
 
+/// Base wire protocol + baked pin from the provider entry's `api:` pin and
+/// the global file `api:`. Single derivation shared by `from_env` and every
+/// provider switch; per-model overrides (`DEX_MODEL_APIS`, learned) apply
+/// on top via `resolve_model_api`.
+fn base_protocol(
+    api_pin: Option<ApiProtocol>,
+    file: &Option<serde_yaml::Value>,
+) -> (ApiProtocol, bool) {
+    let file_pin = load_config_str(file, "api");
+    let api = api_pin
+        .or(file_pin.as_deref().and_then(ApiProtocol::parse))
+        .unwrap_or(ApiProtocol::Responses);
+    (api, file_pin.is_some() || api_pin.is_some())
+}
+
 impl LlmConfig {
     pub(crate) fn from_env(
         base_url_override: Option<String>,
@@ -1193,25 +1208,16 @@ impl LlmConfig {
                 )
             })?;
         // Wire protocol default: the active provider's `api:` entry pin,
-        // else the global file `api:`, else responses.
-        let api_name = resolved
-            .api_pin
-            .map(|a| a.name().to_string())
-            .or_else(|| load_config_str(&file, "api"))
-            .unwrap_or_else(|| "openai-responses".to_string());
-        let api = match ApiProtocol::parse(&api_name) {
-            Some(api) => api,
-            None => {
-                return Err(format!(
-                    "unsupported api '{}'; use openai-completions or openai-responses",
-                    api_name
-                )
-                .into())
-            }
-        };
-        // Bake the global pin once: hot paths read the field instead of
-        // re-reading the file on every request.
-        let api_pinned = load_config_str(&file, "api").is_some() || resolved.api_pin.is_some();
+        // else the global file `api:`, else responses. A typo'd file `api:`
+        // fails fast instead of silently defaulting.
+        if let Some(name) = load_config_str(&file, "api") {
+            ApiProtocol::parse(&name).ok_or_else(|| {
+                format!("unsupported api '{name}'; use openai-completions or openai-responses")
+            })?;
+        }
+        // Baked once: hot paths read the fields instead of re-reading the
+        // file on every request.
+        let (api, api_pinned) = base_protocol(resolved.api_pin, &file);
         // The model carries its own wire protocol; the global `api` above is
         // only the default. Otherwise the `apply_model` call below resolves
         // (full `endpoint/id` key, then bare id, then learned fallback).
@@ -1377,18 +1383,7 @@ impl LlmConfig {
                     let (key, account) = resolve_credentials(&new_provider, &self.provider_entries)
                         .map_err(|e| e.to_string())?;
                     let resolved = resolve_provider(&new_provider, &self.provider_entries);
-                    let landing = resolved.landing.ok_or_else(|| {
-                        format!(
-                            "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
-                            new_provider.name()
-                        )
-                    })?;
-                    self.api_key = key;
-                    self.account_id = account;
-                    self.provider = new_provider;
-                    self.base_url = landing;
-                    self.endpoints = resolved.endpoints;
-                    self.provider_headers = resolved.headers;
+                    self.set_provider(new_provider, key, account, resolved)?;
                 }
                 sel = rest;
             }
@@ -1456,6 +1451,47 @@ impl LlmConfig {
         self.keep_recent_tokens
     }
 
+    /// Base wire protocol + baked pin from an entry pin, re-reading the
+    /// global file `api:` (cached). Per-model overrides apply on top.
+    fn refresh_protocol(&mut self, api_pin: Option<ApiProtocol>) {
+        let (api, pinned) = base_protocol(api_pin, &load_config_file());
+        self.api = api;
+        self.api_pinned = pinned;
+    }
+
+    /// Activate a fully-resolved provider bundle: endpoint, protocol base +
+    /// pin, and scoped headers move together, so a switch can never leave a
+    /// half-moved config behind. Errors (state untouched) when the provider
+    /// has no known endpoint instead of pointing requests at "".
+    fn set_provider(
+        &mut self,
+        provider: Provider,
+        api_key: String,
+        account_id: Option<String>,
+        resolved: ResolvedProvider,
+    ) -> Result<(), String> {
+        let ResolvedProvider {
+            landing,
+            endpoints,
+            api_pin,
+            headers,
+        } = resolved;
+        let landing = landing.ok_or_else(|| {
+            format!(
+                "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
+                provider.name()
+            )
+        })?;
+        self.provider = provider;
+        self.api_key = api_key;
+        self.account_id = account_id;
+        self.base_url = landing;
+        self.endpoints = endpoints;
+        self.provider_headers = headers;
+        self.refresh_protocol(api_pin);
+        Ok(())
+    }
+
     pub(crate) fn switch_provider(
         &mut self,
         provider: &Provider,
@@ -1463,29 +1499,8 @@ impl LlmConfig {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (api_key, account_id) = resolve_credentials(provider, &self.provider_entries)?;
         let resolved = resolve_provider(provider, &self.provider_entries);
-        let landing = resolved.landing.ok_or_else(|| {
-            format!(
-                "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
-                provider.name()
-            )
-        })?;
-        self.provider = provider.clone();
-        self.api_key = api_key;
-        self.account_id = account_id;
-        self.base_url = landing;
-        self.endpoints = resolved.endpoints;
-        self.provider_headers = resolved.headers;
-        // Wire protocol: the provider's `api:` entry pin, else the global
-        // file `api:`, else responses — then the current model's own
-        // resolution on top.
-        let api_name = resolved
-            .api_pin
-            .map(|a| a.name().to_string())
-            .or_else(|| load_config_str(&load_config_file(), "api"));
-        self.api = api_name
-            .as_deref()
-            .and_then(ApiProtocol::parse)
-            .unwrap_or(ApiProtocol::Responses);
+        self.set_provider(provider.clone(), api_key, account_id, resolved)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         // Keep the current model's own protocol when the global `api` is not
         // explicitly pinned.
         let current = self.model.clone();
@@ -2738,11 +2753,24 @@ pub(crate) mod tests {
             cfg.provider_headers.get("X-Prov").map(String::as_str),
             Some("prov")
         );
-        // Switching providers refreshes the whole bundle, not just the URL.
+        // Switching providers refreshes the whole bundle, not just the URL:
+        // endpoint, protocol base + pin, and scoped headers.
         cfg.apply_model("opencode/glm-x", false).unwrap();
         assert_eq!(cfg.provider, Provider::OpenCode);
         assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url().unwrap());
+        assert_eq!(cfg.api, ApiProtocol::Responses);
+        assert!(!cfg.api_pinned);
         assert!(cfg.provider_headers.is_empty());
+        // And back via `switch_provider`: pin, endpoint and headers return.
+        cfg.switch_provider(&Provider::Generic("zai".into()), false)
+            .unwrap();
+        assert_eq!(cfg.base_url, "https://custom.zai.example/v1");
+        assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
+        assert!(cfg.api_pinned);
+        assert_eq!(
+            cfg.provider_headers.get("X-Prov").map(String::as_str),
+            Some("prov")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
