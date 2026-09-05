@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::core::types::Skill;
 
@@ -59,6 +61,39 @@ pub(crate) fn unquote(s: &str) -> String {
 }
 
 pub(crate) fn discover_skills(dirs: &[PathBuf]) -> Vec<Skill> {
+    // The daemon calls this per chat turn (system prompt) and per
+    // `/api/skills`; each call scans 4+ dirs + parses SKILL.md frontmatter.
+    // Cache 10s keyed by the dir list — skill edits appear within seconds,
+    // and explicit `/skill:<name>` loads bypass via `discover_skills_fresh`.
+    static CACHE: OnceLock<Mutex<Option<CachedSkills>>> = OnceLock::new();
+    struct CachedSkills {
+        key: Vec<PathBuf>,
+        at: Instant,
+        skills: Vec<Skill>,
+    }
+    if let Some(hit) = CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cached| cached.key == dirs && cached.at.elapsed() < Duration::from_secs(10))
+    {
+        return hit.skills.clone();
+    }
+    let skills = discover_skills_fresh(dirs);
+    CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(CachedSkills {
+            key: dirs.to_vec(),
+            at: Instant::now(),
+            skills: skills.clone(),
+        });
+    skills
+}
+
+pub(crate) fn discover_skills_fresh(dirs: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in dirs {

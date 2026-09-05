@@ -100,7 +100,9 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::AskWrites),
         verify_command: None,
         extra_headers: Default::default(),
-        client: reqwest::blocking::Client::new(),
+        // Display-only copy never talks to a provider; share the
+        // process-wide client instead of initializing TLS + pool.
+        client: crate::client::http::shared_blocking_client(),
     }
 }
 
@@ -175,24 +177,31 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         .get_config()
         .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
 
-    let (session_id, is_reattach) = if let Some(reattach) = &args.reattach {
-        // P10: attach to an existing persisted session on the daemon and get
-        // the replay cursor, instead of creating a fresh one.
-        let resp = client
-            .reattach(reattach)
-            .map_err(|e| std::io::Error::other(format!("failed to reattach session: {e}")))?;
-        (resp.session_id, true)
-    } else {
-        let resp = client
-            .create_session(&info.cwd, args.session_name.as_deref())
-            .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
-        (resp.session_id, false)
-    };
-
-    // Skills live on the daemon (its workspace). Fetch once for autocomplete
-    // and for local `/skill:` handling; a stale list is harmless — the load
-    // call re-discovers on the daemon side.
-    let daemon_skills = client.list_skills().unwrap_or_default();
+    // Session create and skills fetch are independent (`create_session`
+    // only needs `info.cwd` above), so run them concurrently: one RTT +
+    // one daemon-side skills scan off the critical path.
+    // (Thread results cross as `String`/`Vec`, not `Box<dyn Error>`, which
+    // is not `Send`.)
+    let (session_result, daemon_skills) = std::thread::scope(|s| {
+        let skills_handle = s.spawn(|| client.list_skills().unwrap_or_default());
+        let session: Result<(String, bool), String> = if let Some(reattach) = &args.reattach {
+            // P10: attach to an existing persisted session on the daemon and get
+            // the replay cursor, instead of creating a fresh one.
+            client
+                .reattach(reattach)
+                .map(|resp| (resp.session_id, true))
+                .map_err(|e| format!("failed to reattach session: {e}"))
+        } else {
+            client
+                .create_session(&info.cwd, args.session_name.as_deref())
+                .map(|resp| (resp.session_id, false))
+                .map_err(|e| format!("failed to create session: {e}"))
+        };
+        (session, skills_handle.join().unwrap_or_default())
+    });
+    let (session_id, is_reattach) = session_result.map_err(std::io::Error::other)?;
+    // Skills live on the daemon (its workspace); a stale list is harmless —
+    // the load call re-discovers on the daemon side.
     let tui_skills: Vec<crate::core::types::Skill> = daemon_skills
         .into_iter()
         .map(|info| crate::core::types::Skill {
