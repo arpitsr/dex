@@ -85,19 +85,19 @@ Defaults come from a config file, layered under env vars and CLI flags:
 | Config file               | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
 | Built-in defaults         | provider `opencode`, model `gpt-5.6-luna` |
 
-Supported file keys: `provider`, `providers`, `base_url`, `model`, `api`, `headers`
+Supported file keys: `active_provider`, `providers`, `base_url`, `model`, `api`, `headers`
 (also `http_headers`, codex-style; `headers` wins per-key — other
   keys are preserved untouched). Each headers key accepts a mapping, a
   text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as the env
   vars / `--header`), or a list mixing both. `/model` and `/provider` selections are written
-back to the file's `model:`/`provider:`/`base_url:` keys, so a switch becomes
+back to the file's `model:`/`active_provider:`/`base_url:` keys, so a switch becomes
 the new default for later runs. Session state still re-applies the exact
 provider/model on `/resume`.
 
 A minimal `~/.config/dex/config.yaml`:
 
 ```yaml
-provider: opencode
+active_provider: opencode
 providers:
   opencode:
     api_key: sk-...        # the deposit place for this provider's key
@@ -131,7 +131,7 @@ Any models.dev provider with an OpenAI-style endpoint works without dedicated
 integration. Deposit its key under `providers:` and pick it by name:
 
 ```yaml
-provider: zai
+active_provider: zai
 providers:
   zai:
     api_key: zsk-...       # the deposit place; or export ZHIPU_API_KEY

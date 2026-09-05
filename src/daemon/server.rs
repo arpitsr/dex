@@ -1988,7 +1988,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));

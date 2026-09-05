@@ -83,6 +83,20 @@ fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String
         .filter(|s| !s.is_empty())
 }
 
+/// Selection pointer: `active_provider:` (a legacy `provider:` key is still
+/// honored with a one-time warning so pre-rename files keep loading).
+fn load_provider_name(file: &Option<serde_yaml::Value>) -> Option<String> {
+    if let Some(name) = load_config_str(file, "active_provider") {
+        return Some(name);
+    }
+    let legacy = load_config_str(file, "provider")?;
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!("dex: config key 'provider:' is renamed to 'active_provider:'; rename it in your config file")
+    });
+    Some(legacy)
+}
+
 /// A configured provider (`providers:` map in config.yaml): the deposit
 /// place for that provider's API key plus optional overrides. Endpoint,
 /// models, pricing, context windows and reasoning options come from the
@@ -385,7 +399,8 @@ pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol
 /// Write a model/provider selection back to the config file: `model:` keeps
 /// the stripped id (prefixes are re-derived, never stored, so a pinned
 /// `base_url:` on the next load can't trap a `go/…` prefix verbatim),
-/// `provider:`/`base_url:` the resolved values. Everything else (api_key,
+/// `active_provider:`/`base_url:` the resolved values (a legacy `provider:`
+/// key is removed on write-back). Everything else (api_key,
 /// api, comments excepted) is preserved verbatim. Best-effort: a read-only
 /// or missing file silently skips the write.
 /// ponytail: serde_yaml drops comments on write-back; restructure the file
@@ -430,11 +445,14 @@ fn persist_selection(selection: &str, provider: &Provider, base_url: &str) {
     if let Some(map) = root.as_mapping_mut() {
         for (k, v) in [
             ("model", serde_yaml::Value::from(selection)),
-            ("provider", serde_yaml::Value::from(provider.name())),
+            ("active_provider", serde_yaml::Value::from(provider.name())),
             ("base_url", serde_yaml::Value::from(base_url)),
         ] {
             map.insert(serde_yaml::Value::from(k), v);
         }
+        // Migrated to `active_provider:` above; drop the legacy pointer so
+        // files converge on the new schema after one persist.
+        map.remove(serde_yaml::Value::from("provider"));
     }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1160,7 +1178,7 @@ impl LlmConfig {
         }
         let provider_name = env::var("DEX_PROVIDER")
             .ok()
-            .or_else(|| load_config_str(&file, "provider"))
+            .or_else(|| load_provider_name(&file))
             .unwrap_or_else(|| "opencode".to_string());
         let provider_entries = load_provider_entries(&file);
         let known = known_providers(&provider_entries);
@@ -1518,8 +1536,9 @@ impl LlmConfig {
 pub(crate) mod tests {
     use super::{
         build_ctx_map, detect_verify_command, load_config_file, load_dex_models_cache,
-        load_provider_entries, model_api_from_env, reasoning_options_for, remember_learned_api,
-        usage_cost, ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
+        load_provider_entries, model_api_from_env, persist_selection, reasoning_options_for,
+        remember_learned_api, usage_cost, ApiProtocol, LlmConfig, PermissionMode, Provider,
+        ProviderEntry,
     };
     use crate::core::types::Usage;
     use std::{collections::BTreeSet, env};
@@ -1915,7 +1934,7 @@ pub(crate) mod tests {
         let cfg_path = dir.join("config.yaml");
         std::fs::write(
             &cfg_path,
-            "provider: opencode\nmodel: m-h\nhttp_headers:\n  X-File: file\n  X-Shared: codex\nheaders:\n  X-Shared: pi\n",
+            "active_provider: opencode\nmodel: m-h\nhttp_headers:\n  X-File: file\n  X-Shared: codex\nheaders:\n  X-Shared: pi\n",
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", &cfg_path);
@@ -2065,7 +2084,7 @@ pub(crate) mod tests {
         // The scoped deposit place wins over the env var.
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: opencode\nproviders:\n  opencode:\n    api_key: deposited\n",
+            "active_provider: opencode\nproviders:\n  opencode:\n    api_key: deposited\n",
         )
         .unwrap();
         assert_eq!(
@@ -2073,7 +2092,7 @@ pub(crate) mod tests {
             "deposited"
         );
         // Missing everywhere: the error points at the canonical names.
-        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
         std::env::remove_var("OPENCODE_API_KEY");
         let err = match LlmConfig::from_env(None, None, None, &[]) {
             Err(e) => e.to_string(),
@@ -2104,7 +2123,7 @@ pub(crate) mod tests {
         let path = dir.join("config.yaml");
         std::fs::write(
             &path,
-            "provider: opencode\nbase_url: https://file.example/v1\nmodel: file-model\napi: openai-completions\ncustom_key: keep-me\n",
+            "active_provider: opencode\nbase_url: https://file.example/v1\nmodel: file-model\napi: openai-completions\ncustom_key: keep-me\n",
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", &path);
@@ -2225,7 +2244,7 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("dex-pin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         write_routing_catalog(&dir);
-        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
@@ -2250,7 +2269,7 @@ pub(crate) mod tests {
         // File `base_url:` pin with a file model.
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: opencode\nbase_url: https://opencode.ai/zen/v1\nmodel: m-go-only\n",
+            "active_provider: opencode\nbase_url: https://opencode.ai/zen/v1\nmodel: m-go-only\n",
         )
         .unwrap();
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
@@ -2287,7 +2306,7 @@ pub(crate) mod tests {
     fn generic_config(dir: &std::path::Path, providers_yaml: &str) {
         std::fs::write(
             dir.join("config.yaml"),
-            format!("provider: zai\n{providers_yaml}"),
+            format!("active_provider: zai\n{providers_yaml}"),
         )
         .unwrap();
     }
@@ -2341,7 +2360,7 @@ pub(crate) mod tests {
         // Key falls back to the provider's own conventional env var.
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: zai\nproviders:\n  zai: {}\n",
+            "active_provider: zai\nproviders:\n  zai: {}\n",
         )
         .unwrap();
         std::env::set_var("ZAI_TEST_KEY", "zsk-from-env");
@@ -2445,7 +2464,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(dir.join("dex")).unwrap();
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: opencode\nmodel: go/m-z9\n",
+            "active_provider: opencode\nmodel: go/m-z9\n",
         )
         .unwrap();
         // Empty catalog dir: no routing interference, unknown model stays.
@@ -2499,7 +2518,7 @@ pub(crate) mod tests {
             .to_string(),
         )
         .unwrap();
-        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
@@ -2616,7 +2635,7 @@ pub(crate) mod tests {
         .unwrap();
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: zai\nproviders:\n  zai: {}\n",
+            "active_provider: zai\nproviders:\n  zai: {}\n",
         )
         .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
@@ -2650,6 +2669,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn legacy_provider_key_still_selects() {
+        // Pre-rename files used `provider:` for the selection pointer;
+        // they keep loading (with a one-time stderr warning), and the next
+        // write-back migrates the pointer to `active_provider:`.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-legacyprov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "provider: opencode\nproviders:\n  opencode:\n    api_key: deposited\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", &path);
+        std::env::remove_var("OPENCODE_API_KEY");
+        for key in [
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+        ] {
+            std::env::remove_var(key);
+        }
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        assert_eq!(cfg.api_key, "deposited");
+        // Write-back migrates the pointer and drops the legacy key.
+        persist_selection("m", &Provider::OpenCode, "https://opencode.ai/zen/v1");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("active_provider: opencode"), "{text}");
+        assert!(
+            !text.lines().any(|l| l.starts_with("provider:")),
+            "legacy key removed: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn api_pin_bakes_into_config() {
         // The global protocol pin is computed once in `from_env` (file or
         // provider entry) so hot paths never re-read the file.
@@ -2679,7 +2750,7 @@ pub(crate) mod tests {
         ] {
             std::env::remove_var(key);
         }
-        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
         assert!(
             !LlmConfig::from_env(None, None, None, &[])
                 .unwrap()
@@ -2687,7 +2758,7 @@ pub(crate) mod tests {
         );
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: opencode\napi: openai-completions\n",
+            "active_provider: opencode\napi: openai-completions\n",
         )
         .unwrap();
         assert!(
@@ -2697,7 +2768,7 @@ pub(crate) mod tests {
         );
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: opencode\nproviders:\n  opencode:\n    api: openai-completions\n",
+            "active_provider: opencode\nproviders:\n  opencode:\n    api: openai-completions\n",
         )
         .unwrap();
         assert!(
@@ -2731,7 +2802,7 @@ pub(crate) mod tests {
         write_generic_catalog(&dir);
         std::fs::write(
             dir.join("config.yaml"),
-            "provider: zai\nproviders:\n  zai:\n    api_key: zsk-deposit\n    base_url: https://custom.zai.example/v1\n    api: openai-completions\n    headers:\n      X-Prov: prov\n",
+            "active_provider: zai\nproviders:\n  zai:\n    api_key: zsk-deposit\n    base_url: https://custom.zai.example/v1\n    api: openai-completions\n    headers:\n      X-Prov: prov\n",
         )
         .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
