@@ -151,14 +151,9 @@ pub(crate) struct TraceWriter {
 }
 
 impl TraceWriter {
-    /// Open (append) a trace file with `0600` permissions.
+    /// Open (append) a trace file with `0600` permissions on unix.
     pub(crate) fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
+        let file = trace_file(path)?;
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
         })
@@ -173,6 +168,26 @@ impl TraceWriter {
             let _ = file.flush();
         }
     }
+}
+
+/// Unix: create/append with `0600` so traces stay private to the user.
+#[cfg(unix)]
+fn trace_file(path: std::path::PathBuf) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// No permission bits to set; plain create/append.
+#[cfg(not(unix))]
+fn trace_file(path: std::path::PathBuf) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 impl Clone for Console {
