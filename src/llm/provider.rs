@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use crate::core::types::Provider;
 
 /// Model used when `OPENAI_MODEL`, config file and `--model` are all unset.
-/// Both supported providers list it.
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 /// Context-window fallback when `DEX_CONTEXT_WINDOW` is unset and the
@@ -66,11 +65,6 @@ impl Provider {
         }
     }
 
-    /// Does the endpoint expose OpenAI-compatible `GET /models`?
-    pub(crate) fn has_model_listing(&self) -> bool {
-        !matches!(self, Self::OpenAiCodex)
-    }
-
     /// Does the endpoint also speak chat-completions, so a rejected
     /// `/responses` call may be retried there? (Empirical protocol fallback.)
     pub(crate) fn has_protocol_fallback(&self) -> bool {
@@ -112,8 +106,6 @@ mod tests {
             Some("https://opencode.ai/zen/go/v1")
         );
         assert!(Provider::OpenAiCodex.endpoints().is_empty());
-        assert!(Provider::OpenCode.has_model_listing());
-        assert!(!Provider::OpenAiCodex.has_model_listing());
         assert!(Provider::OpenCode.has_protocol_fallback());
         assert!(!Provider::OpenAiCodex.has_protocol_fallback());
         assert!(Provider::OpenAiCodex.credentials_refreshable());
