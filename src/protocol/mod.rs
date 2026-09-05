@@ -252,11 +252,60 @@ pub struct DaemonInfo {
     pub cwd: String,
     pub git_branch: Option<String>,
     pub git_dirty: bool,
+    /// Effective reasoning effort on the daemon (stored `/thinking` choice >
+    /// env > file). Carried so the client's `/thinking` display matches what
+    /// turns actually use instead of reporting "unset".
+    #[serde(default)]
+    pub thinking_effort: Option<String>,
+    /// Mismatch warning when the effort isn't advertised for the model.
+    /// Surfaced as a transcript line; never `eprintln!`d from the daemon,
+    /// which shares the TUI's terminal and would corrupt it.
+    #[serde(default)]
+    pub thinking_warning: Option<String>,
+}
+
+/// Lightweight git status for the footer, returned by `GET /api/git`.
+/// Split out of `DaemonInfo` so the TUI can poll for branch/dirty changes
+/// without re-resolving the full provider config (`LlmConfig::from_env`)
+/// on every poll.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitInfo {
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_dirty: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_info_round_trips_and_defaults_dirty() {
+        let info = GitInfo {
+            git_branch: Some("main".into()),
+            git_dirty: true,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: GitInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.git_branch.as_deref(), Some("main"));
+        assert!(back.git_dirty);
+        // Older daemons omit `git_dirty`; the footer treats it as clean.
+        let back: GitInfo = serde_json::from_str(r#"{"git_branch":"feat"}"#).unwrap();
+        assert_eq!(back.git_branch.as_deref(), Some("feat"));
+        assert!(!back.git_dirty);
+    }
+
+    #[test]
+    fn daemon_info_defaults_thinking_fields_for_old_daemons() {
+        // New client against an old daemon: missing thinking fields default
+        // to None instead of failing the `/api/config` parse.
+        let back: DaemonInfo = serde_json::from_str(
+            r#"{"provider":"opencode","model":"m","api":"openai-responses","available_models":[],"context_window":128000,"permission":"ask-writes","cwd":"/tmp","git_branch":"main","git_dirty":false}"#,
+        )
+        .unwrap();
+        assert!(back.thinking_effort.is_none());
+        assert!(back.thinking_warning.is_none());
+    }
 
     #[test]
     fn stream_event_round_trips_through_json() {
