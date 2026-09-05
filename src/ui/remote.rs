@@ -198,7 +198,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             let mut merged = std::collections::BTreeMap::new();
             for raw in &args.headers {
                 for (k, v) in crate::llm::config::parse_headers_str(raw) {
-                    merged.insert(k, v);
+                    crate::llm::config::insert_extra_header(&mut merged, &k, &v);
                 }
             }
             Some(merged)

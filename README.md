@@ -47,8 +47,8 @@ Defaults come from a config file, layered under env vars and CLI flags:
 | Config file               | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
 | Built-in defaults         | provider `opencode`, model `gpt-5.6-luna` |
 
-  Supported file keys: `provider`, `api_key`, `base_url`, `model`, `api`, `headers`
-  (also `http_headers`, codex-style; `headers` wins per-key — other
+Supported file keys: `provider`, `api_key`, `base_url`, `model`, `api`, `headers`
+(also `http_headers`, codex-style; `headers` wins per-key — other
   keys are preserved untouched). Each headers key accepts a mapping, a
   text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as the env
   vars / `--header`), or a list mixing both. `/model` and `/provider` selections are written
