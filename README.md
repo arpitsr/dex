@@ -85,7 +85,7 @@ Defaults come from a config file, layered under env vars and CLI flags:
 | Config file               | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
 | Built-in defaults         | provider `opencode`, model `gpt-5.6-luna` |
 
-Supported file keys: `active_provider`, `providers`, `base_url`, `model`, `api`, `headers`
+Supported file keys: `active_provider`, `providers`, `base_url`, `model`, `api`, `thinking_effort`, `headers`
 (also `http_headers`, codex-style; `headers` wins per-key — other
   keys are preserved untouched). Each headers key accepts a mapping, a
   text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as the env
@@ -152,7 +152,8 @@ are shown in the `/model` confirmation; `/thinking <level>` pins one per model
 (remembered per endpoint+model and validated against the advertised list —
 unknown models accept anything, a stale catalog never blocks).
 `DEX_THINKING_EFFORT` is the fallback when nothing is pinned, and an effort no
-model advertises warns once instead of failing opaquely at the API.
+model advertises warns once instead of failing opaquely at the API. A file
+`thinking_effort:` default sits under both (stored choice > env > file).
 Wire protocol resolves like opencode: responses first, one fallback to
 completions, remembered per endpoint+model. Native-protocol-only providers
 (no OpenAI-compatible endpoint in the catalog, e.g. anthropic) are not
@@ -399,7 +400,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
-| `DEX_THINKING_EFFORT` | Default reasoning effort (a stored `/thinking` choice wins). |
+| `DEX_THINKING_EFFORT` | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback). |
 | `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`). |
 | `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
