@@ -33,6 +33,17 @@ use super::{
     PendingApproval, Selection, TerminalCleanup,
 };
 
+/// Process start for the `ready in …` session-start line. Marked at `main()`
+/// entry so the duration covers the full cold start the
+/// `perf(daemon,llm): cut TUI cold start ~780ms to ~160ms` commit optimized
+/// (daemon spawn + session-registry scan + models.dev catalog parse +
+/// config/session/skills fetch), not just the TUI half after daemon boot.
+static LAUNCH_START: OnceLock<Instant> = OnceLock::new();
+
+pub(crate) fn mark_launch_start() {
+    LAUNCH_START.get_or_init(Instant::now);
+}
+
 /// Messages flowing from the per-turn worker thread into the UI loop.
 enum WorkerMessage {
     /// A stream event from the daemon.
@@ -130,12 +141,26 @@ fn skills_listing_line(skills: &[crate::core::types::Skill]) -> Option<Line<'sta
     ]))
 }
 
+/// The session-start launch-time line, shown below the skills listing so
+/// users can see how fast the TUI was ready to use. Muted so it stays
+/// quiet next to the skills line.
+fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        format!(
+            "ready in {}",
+            crate::core::format::format_duration(elapsed_secs)
+        ),
+        Style::default().fg(super::theme::muted_fg()),
+    )])
+}
+
 pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std::io::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(std::io::Error::other(
             "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
         ));
     }
+    let launch_start = *LAUNCH_START.get_or_init(Instant::now);
     OSC_START.get_or_init(Instant::now);
 
     let client = DaemonClient::new(daemon_url)
@@ -309,9 +334,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // resolved from this once.
     super::theme::detect_background();
 
-    // Session-start view: the DEX art, then the skills the daemon discovered.
+    // Session-start view: the DEX art, then the skills the daemon discovered,
+    // then how fast the TUI was ready to use.
     push_banner(&mut remote.app);
     push_skills_listing(&mut remote.app);
+    push_info_line(
+        &mut remote.app,
+        launch_time_line(launch_start.elapsed().as_secs_f64()),
+    );
 
     enable_raw_mode()?;
     // No startup drain here: a blind deadline cuts OSC reply bursts in half
@@ -1677,6 +1707,13 @@ mod tests {
             "names must follow the theme, got {fg:?}"
         );
         assert!(skills_listing_line(&[]).is_none());
+    }
+
+    #[test]
+    fn launch_time_line_shows_ready_duration() {
+        let line = launch_time_line(1.23);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "ready in 1.2s");
     }
 
     fn row_width(line: &ratatui::text::Line<'_>) -> usize {

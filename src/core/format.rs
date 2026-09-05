@@ -531,13 +531,15 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-/// Compact wall-clock label for a tool result: sub-second precision below
-/// 10s, whole seconds below a minute, then minutes.
+/// Compact wall-clock label for a tool result: millis below 1s,
+/// sub-second precision below 10s, whole seconds below a minute, then minutes.
 pub(crate) fn format_duration(secs: f64) -> String {
     if secs < 0.0 {
         return String::new();
     }
-    if secs < 10.0 {
+    if secs < 1.0 {
+        format!("{}ms", (secs * 1000.0).round() as u64)
+    } else if secs < 10.0 {
         format!("{secs:.1}s")
     } else if secs < 60.0 {
         format!("{:.0}s", secs.round())
@@ -924,7 +926,8 @@ mod tests {
 
     #[test]
     fn duration_formats_for_each_scale() {
-        assert_eq!(format_duration(0.42), "0.4s");
+        assert_eq!(format_duration(0.042), "42ms");
+        assert_eq!(format_duration(0.42), "420ms");
         assert_eq!(format_duration(2.14), "2.1s");
         assert_eq!(format_duration(9.96), "10.0s");
         assert_eq!(format_duration(41.96), "42s");

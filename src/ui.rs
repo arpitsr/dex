@@ -22,7 +22,7 @@ mod status;
 mod theme;
 mod wrapping;
 
-pub(crate) use remote::run_ratatui_repl_with_remote;
+pub(crate) use remote::{mark_launch_start, run_ratatui_repl_with_remote};
 pub(crate) use render::view;
 
 use input::InputField;
