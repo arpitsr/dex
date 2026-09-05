@@ -61,7 +61,7 @@ pub(crate) enum TranscriptBlock {
         lines: Vec<Line<'static>>,
     },
     /// Streamed model reasoning, stored raw. Rendered by `TranscriptView` as
-    /// a one-line preview (collapsed) or full dim italic text (expanded via
+    /// a one-line preview (collapsed) or full dim text (expanded via
     /// Ctrl+T); not routed through `lines()`.
     Thinking {
         stamp: u64,
@@ -858,7 +858,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
 
 /// Close the streaming thinking block, if any: stops the collapsed
 /// indicator's dot animation. The per-block display cache holds the settled
-/// "Thinking ..." row already (the dots are a per-frame overlay), but the
+/// "◌ Thinking ..." row already (the dots are a per-frame overlay), but the
 /// stamp bump forces a re-wrap so an expanded (Ctrl+T) block shows any text
 /// that arrived since the last throttled bump.
 pub(super) fn close_thinking(app: &mut App) {
