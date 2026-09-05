@@ -98,7 +98,9 @@ A minimal `~/.config/dex/config.yaml`:
 
 ```yaml
 provider: opencode
-api_key: sk-...
+providers:
+  opencode:
+    api_key: sk-...        # the deposit place for this provider's key
 model: glm-5.3-flash
 headers:
   X-Gateway-Key: abc123
@@ -107,8 +109,8 @@ headers:
 Or without a file:
 
 ```sh
-export OPENAI_API_KEY=sk-...   # the only required setting
-dex                           # model/base_url/protocol resolve themselves
+export OPENCODE_API_KEY=sk-...   # the only required setting
+dex                             # model/base_url/protocol resolve themselves
 ```
 
 Pick a provider and a model — the rest follows. Run `dex update --models`
@@ -143,8 +145,9 @@ providers:
 windows and reasoning options come from the cached models.dev catalog — run
 `dex update --models` once. The key resolves per provider: config
 `providers.<name>.api_key` > the provider's own documented env var (from the
-catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`) — `OPENAI_API_KEY` is
-only opencode's. A model's advertised thinking options (e.g. `low/high/max`)
+catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`); opencode's is
+`OPENCODE_API_KEY`. There is no per-provider default key var outside the
+catalog — one provider's key never leaks into another. A model's advertised thinking options (e.g. `low/high/max`)
 are shown in the `/model` confirmation; `DEX_THINKING_EFFORT` picks one.
 Wire protocol resolves like opencode: responses first, one fallback to
 completions, remembered per endpoint+model. Native-protocol-only providers
@@ -384,7 +387,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 
 | Variable             | Description                                              |
 | -------------------- | -------------------------------------------------------- |
-| `OPENAI_API_KEY`     | API key (required for `opencode`; export it in your shell profile). |
+| `OPENCODE_API_KEY`   | API key for the opencode gateway (required for `opencode`; export it in your shell profile). |
 | `OPENAI_BASE_URL`    | API base URL (default `https://opencode.ai/zen/v1`; usually left unset — model picks own endpoint). |
 | `OPENAI_MODEL`       | Model selection (default: config file `model:` or `gpt-5.6-luna`).          |
 | `OPENAI_API`         | Wire protocol default (`openai-completions` or `openai-responses`); pins one protocol for everything. |

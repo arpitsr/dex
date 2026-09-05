@@ -1793,7 +1793,7 @@ mod permission_gate_tests {
             "XDG_DATA_HOME",
             "DEX_PERMISSION",
             "DEX_PROVIDER",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_API",
         ]
@@ -1826,7 +1826,7 @@ mod permission_gate_tests {
         let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
             "DEX_PERMISSION",
             "DEX_PROVIDER",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_API",
         ]
@@ -1836,7 +1836,7 @@ mod permission_gate_tests {
         let _env2 = crate::session::EnvGuard(saved);
         std::env::set_var("DEX_PERMISSION", "read-only");
         std::env::set_var("DEX_PROVIDER", "opencode");
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:9");
         std::env::set_var("OPENAI_API", "chat");
 
@@ -1983,7 +1983,7 @@ mod e2e_tests {
             "DEX_CONFIG",
             "DEX_PERMISSION",
             "DEX_PROVIDER",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_API",
             "OPENAI_MODEL",
@@ -2003,7 +2003,7 @@ mod e2e_tests {
         std::env::set_var("DEX_CONFIG", data_dir.join("absent-config.yaml"));
         std::env::set_var("DEX_PERMISSION", "ask-writes");
         std::env::set_var("DEX_PROVIDER", "opencode");
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("OPENAI_BASE_URL", &llm_base);
         std::env::set_var("OPENAI_API", "chat");
         std::env::set_var("DEX_VERIFY", "true");
