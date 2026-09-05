@@ -321,13 +321,14 @@ fn thinking_display_lines(
 }
 
 /// The collapsed indicator's text: while the block streams, the dot count
-/// cycles 1→3 on the same ~8-tick cadence the delta throttle uses; once the
-/// block closes it freezes at "Thinking ...".
+/// cycles 1→3 on a 16-tick (~0.25s) cadence — deliberately slower than the
+/// 8-tick delta throttle so the dots read as a calm pulse; once the block
+/// closes it freezes at "Thinking ...".
 fn thinking_indicator_text(thinking_open: bool, tick: u16) -> String {
     if !thinking_open {
         return "Thinking ...".to_string();
     }
-    let dots = match (tick / 8) % 3 {
+    let dots = match (tick / 16) % 3 {
         0 => ".",
         1 => "..",
         _ => "...",
@@ -572,14 +573,16 @@ impl ActivityView {
         }
         let content_width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
         let (activity_text, activity_color) = if app.busy {
-            let frame = super::UI_SPINNER[(app.tick / 4) as usize % super::UI_SPINNER.len()];
+            let frame = super::UI_SPINNER[(app.tick / 8) as usize % super::UI_SPINNER.len()];
             let tool = app
                 .active_tool
                 .as_ref()
                 .map(|name| format!(" · {name}"))
                 .unwrap_or_default();
             (
-                truncate_display(&format!("{} working…{}", frame, tool), content_width),
+                // Spinner sits to the right of the text, matching the
+                // "Thinking .." indicator; one frame per 8 ticks (~0.13s).
+                truncate_display(&format!("working… {}{}", frame, tool), content_width),
                 theme::muted_fg(),
             )
         } else {
@@ -1460,7 +1463,7 @@ mod tests {
         assert!(!joined.contains("second line"), "{joined}");
 
         // While streaming, the collapsed indicator animates its dots.
-        let streaming = thinking_display_lines(text, false, true, 8, 80);
+        let streaming = thinking_display_lines(text, false, true, 16, 80);
         let streamed: String = streaming[0]
             .spans
             .iter()
@@ -1479,13 +1482,13 @@ mod tests {
 
     #[test]
     fn thinking_indicator_cycles_while_streaming_and_settles() {
-        // Dots grow 1→3 on the 8-tick throttle cadence, then loop.
+        // Dots grow 1→3 on the 16-tick cadence, then loop.
         assert_eq!(thinking_indicator_text(true, 0), "Thinking .");
-        assert_eq!(thinking_indicator_text(true, 8), "Thinking ..");
-        assert_eq!(thinking_indicator_text(true, 16), "Thinking ...");
-        assert_eq!(thinking_indicator_text(true, 24), "Thinking .");
+        assert_eq!(thinking_indicator_text(true, 16), "Thinking ..");
+        assert_eq!(thinking_indicator_text(true, 32), "Thinking ...");
+        assert_eq!(thinking_indicator_text(true, 48), "Thinking .");
         // Closed: static, never animated again.
-        for tick in [0, 8, 16, 24, 999] {
+        for tick in [0, 16, 32, 48, 999] {
             assert_eq!(thinking_indicator_text(false, tick), "Thinking ...");
         }
     }
@@ -1514,7 +1517,7 @@ mod tests {
             },
         ];
         app.thinking_open = true;
-        app.tick = 8; // animated frame for this tick is "Thinking .."
+        app.tick = 16; // animated frame for this tick is "Thinking .."
         let backend = TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
