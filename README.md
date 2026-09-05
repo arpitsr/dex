@@ -27,6 +27,23 @@ sessions and can be resumed.
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
 
+## Install
+
+Every `v*` tag builds binaries for `x86_64`/`aarch64` Linux (static musl — runs
+on any distro, no libssl or glibc constraints), `x86_64`/`aarch64` macOS, and
+`x86_64` Windows, and attaches them to the GitHub release.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/main/scripts/install.sh | sh
+```
+
+- Pin a version: `curl -fsSL .../install.sh | sh -s -- 0.2.0`
+- Custom directory: `DEX_INSTALL_DIR=/usr/local/bin curl -fsSL .../install.sh | sh`
+- Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
+  [releases page](https://github.com/arpitsr/dex/releases).
+
+Or build from source:
+
 ## Building
 
 Requires a Rust toolchain (edition 2021):
@@ -35,6 +52,27 @@ Requires a Rust toolchain (edition 2021):
 cargo build --release
 # binary: target/release/dex
 ```
+
+## Releasing
+
+Creating the `v*` tag is the only manual step; CI does the rest:
+
+```sh
+scripts/release.sh patch    # tag the next version — also major, minor, or 1.2.3
+# or by hand:
+git tag v0.1.1 && git push origin v0.1.1
+```
+
+`.github/workflows/release.yml` then: bumps `Cargo.toml`/`Cargo.lock` on the
+default branch (`develop`) to the tag's version (github-actions bot commit) →
+builds all targets from that commit → smoke tests → attaches tarballs +
+`SHA256SUMS` to the GitHub release. The install script resolves the latest
+release and picks the right asset for the running machine. `git pull`
+afterwards to pick up the version bump.
+
+If the default branch is protected, let GitHub Actions push to it (Settings →
+Branches → add the Actions bot as bypass), since the bump commit is written by
+CI.
 
 ## Configuration
 
