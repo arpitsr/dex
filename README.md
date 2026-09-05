@@ -272,7 +272,7 @@ the daemon's working directory.
 | `--no-session`     | Disable session persistence for this run.                |
 | `-n`, `--new`      | Start a new session (the default).                       |
 | `--permission <mode>` | Tool permissions: `read-only`, `ask-writes`, `ask-shell`, or `trusted` (default `trusted`). |
-| `--name <name>`    | Name the session.                                    |
+| `--name <name>`    | Name the session (default `<workspace>-<7 chars>`, e.g. `dex-k3m9x2q`).                                    |
 | `--reattach <id>`  | Attach to an existing daemon session and replay its event journal. |
 | `--skill <dir>`    | Add an extra skill directory to discover skills from.    |
 | `--tool`           | Run raw JSON tool mode (read JSON lines from stdin).     |
@@ -338,6 +338,7 @@ Sessions are stored as JSONL files under:
 
 - `$XDG_DATA_HOME/dex/sessions` (or `~/.local/share/dex/sessions`),
 - organized in subdirectories by a slug of the current working directory.
+- new sessions are named `<workspace>-<7 chars>` (workspace directory plus a k8s-style suffix, e.g. `dex-k3m9x2q`); override with `--name` or `/name`.
 
 Each file starts with a `session` header line followed by `message` entries and
 optional `session_info` (rename) entries. Entries are appended after every

@@ -175,7 +175,56 @@ impl Session {
         format!("{}-{:016x}", cwd.replace(['/', '\\'], "-"), hash)
     }
 
+    /// Default session name: `<workspace>-<7 chars>`, e.g. `dex-k3m9x2q`.
+    /// The workspace part is the lowercased cwd basename with anything
+    /// outside `[a-z0-9]` folded to `-`; the suffix is 7 k8s-style
+    /// `[a-z0-9]` chars, unique per session (see `Session::new`).
+    pub(crate) fn default_session_name(cwd: &str) -> String {
+        let base = std::path::Path::new(cwd)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let mut slug: String = base
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        while slug.contains("--") {
+            slug = slug.replace("--", "-");
+        }
+        slug = slug.trim_matches('-').to_string();
+        if slug.is_empty() {
+            slug = "session".to_string();
+        }
+        // ASCII-only by construction, so byte truncation is char-safe.
+        if slug.len() > 32 {
+            slug.truncate(32);
+            slug = slug.trim_end_matches('-').to_string();
+            if slug.is_empty() {
+                slug = "session".to_string();
+            }
+        }
+        format!("{}-{}", slug, Self::random_suffix_7())
+    }
+
+    /// 7 random `[a-z0-9]` chars sourced from a v4 UUID (OS RNG, already a
+    /// dependency): 36^7 combinations, no coordination needed.
+    fn random_suffix_7() -> String {
+        const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        bytes[..7]
+            .iter()
+            .map(|b| ALPHABET[usize::from(*b % 36)] as char)
+            .collect()
+    }
+
     pub(crate) fn new(cwd: String, name: Option<String>) -> io::Result<Self> {
+        // Unnamed sessions default to `<workspace>-<7 chars>`; an explicit
+        // `--name`/`/name` (or `Some` from the daemon request) always wins.
+        let name = match name {
+            Some(n) if !n.is_empty() => Some(n),
+            _ => Some(Self::default_session_name(&cwd)),
+        };
         let id = format!("{}_{}", Self::now_ms(), uuid4());
         let dir = Self::session_dir().join(Self::cwd_slug(&cwd));
         fs::create_dir_all(&dir)?;
@@ -1152,5 +1201,45 @@ mod tests {
         assert_eq!(recorded[0]["description"], "does demo things");
         assert_eq!(recorded[0]["path"], "/tmp/demo/SKILL.md");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn default_session_name_is_workspace_plus_k8s_suffix() {
+        let name = Session::default_session_name("/home/user/dex");
+        let (base, suffix) = name.rsplit_once('-').unwrap();
+        assert_eq!(base, "dex");
+        assert_eq!(suffix.len(), 7);
+        assert!(suffix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        // Sanitizes: punctuation/folds collapse to one `-`, lowercased.
+        assert!(Session::default_session_name("/home/user/My Project!").starts_with("my-project-"));
+        // Degenerate cwds fall back to `session`.
+        assert!(Session::default_session_name("/").starts_with("session-"));
+        assert!(Session::default_session_name("").starts_with("session-"));
+        // Unique per call.
+        assert_ne!(
+            Session::default_session_name("/home/user/dex"),
+            Session::default_session_name("/home/user/dex")
+        );
+    }
+
+    #[test]
+    fn new_session_defaults_name_but_keeps_explicit() {
+        let s = Session::new("/tmp/dex-name-default".into(), None).unwrap();
+        let name = s.name().unwrap().to_string();
+        assert!(name.starts_with("dex-name-default-"), "got: {name}");
+        assert_eq!(name.rsplit_once('-').unwrap().1.len(), 7);
+        // The generated name is persisted in the on-disk header.
+        let path = s.path().unwrap().to_path_buf();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let header: SessionHeader = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(header.name(), Some(name.as_str()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Session::new("/tmp/dex-name-explicit".into(), Some("mine".into())).unwrap();
+        assert_eq!(s.name(), Some("mine"));
+        let path = s.path().unwrap().to_path_buf();
+        let _ = std::fs::remove_file(&path);
     }
 }
