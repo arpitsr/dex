@@ -2988,11 +2988,18 @@ pub(crate) mod tests {
             "DEX_THINKING_EFFORT",
             "DEX_CONTEXT_WINDOW",
             "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "DEX_CONFIG",
         ]);
         let dir = std::env::temp_dir().join(format!("dex-think-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
+        // refresh_thinking_effort also falls back to the user config file;
+        // a machine with `thinking_effort:` set there would fail the first
+        // assertion, so point the config lookup at the empty temp dir too.
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::remove_var("DEX_CONFIG");
         std::env::remove_var("DEX_THINKING_EFFORT");
         let mut cfg = test_cfg();
         cfg.refresh_thinking_effort();
