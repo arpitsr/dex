@@ -292,6 +292,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         show_thinking: false,
         thinking_open: false,
         assistant_pending: String::new(),
+        stream_last_flush: Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
         display_cache: Vec::new(),
@@ -393,11 +394,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         // iterations of the loop.
         let mut pending: VecDeque<Event> = VecDeque::new();
         // ponytail: draw on change, not on a 60 fps heartbeat — every frame
-        // rebuilds the whole view (O(transcript)), which showed up as the top
-        // idle CPU cost. Draw when state changed (worker message / input
-        // event) or while a turn is animating (spinner + thinking dots);
-        // otherwise just park in event::poll.
+        // rebuilds the whole view + ratatui buffer diff (unicode widths per
+        // cell), the top CPU cost in the flamegraph. Draw on state change
+        // (worker message / input event); while busy also redraw at animation
+        // rate for the spinner + thinking dots, capped well below 60 fps.
         let mut dirty = true;
+        let mut last_busy_draw = Instant::now();
         loop {
             // Drain worker messages: the transcript updates live while the
             // turn streams in on the worker thread.
@@ -431,16 +433,23 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             if remote.app.tick_notice() {
                 dirty = true;
             }
-            if dirty || streamed || busy {
+            // Animation heartbeat while a turn runs: at most ~8 fps, and
+            // streaming/input draws reset the clock so they don't double up.
+            let now = Instant::now();
+            let anim_due = busy && now.duration_since(last_busy_draw) >= Duration::from_millis(120);
+            if dirty || streamed || anim_due {
                 // Advance the animation frame so the spinner + status update.
                 remote.app.tick = remote.app.tick.wrapping_add(1);
                 terminal.draw(|f| view(f, &mut remote.app))?;
                 dirty = false;
+                if busy {
+                    last_busy_draw = Instant::now();
+                }
             }
 
             let next = if let Some(event) = pending.pop_front() {
                 event
-            } else if event::poll(Duration::from_millis(if busy { 16 } else { 250 }))? {
+            } else if event::poll(Duration::from_millis(if busy { 100 } else { 250 }))? {
                 event::read()?
             } else {
                 continue;

@@ -177,11 +177,24 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
         } else if t.is_empty() {
             blocks.push(MarkdownBlock::BlankLine);
             i += 1;
+        } else if is_table_start(&lines, i) {
+            // Header + delimiter confirmed: buffer the whole table. Rows
+            // accumulate until a non-table line (or a blank line) ends it.
+            let mut buf = vec![lines[i].trim().to_string()];
+            i += 1;
+            while i < lines.len() && is_table_line(lines[i].trim()) {
+                buf.push(lines[i].trim().to_string());
+                i += 1;
+            }
+            blocks.push(
+                build_table_block(&buf).unwrap_or_else(|| MarkdownBlock::Paragraph(buf.clone())),
+            );
         } else {
             let mut para = Vec::new();
             while i < lines.len()
                 && !lines[i].trim_start().is_empty()
                 && !is_block_start(lines[i].trim_start())
+                && !is_table_start(&lines, i)
             {
                 para.push(lines[i].to_string());
                 i += 1;
@@ -207,6 +220,97 @@ fn is_block_start(t: &str) -> bool {
         || t.starts_with("* ")
         || t.starts_with("- [ ] ")
         || t.starts_with("- [x] ")
+}
+
+/// A GFM pipe-table line: `| a | b |`, `a | b | c`, `|---|:---:|`. Mirrors
+/// the crate's `MarkdownRenderer` table detection so both agree on what is
+/// buffered as a table candidate. Also used by the streaming buffer in
+/// `ui.rs` to hold markdown flushes until a table is complete.
+pub(super) fn is_table_line(t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() || !t.contains('|') {
+        return false;
+    }
+    if t.starts_with('|') && t.ends_with('|') && t.len() > 1 {
+        return true;
+    }
+    let pipe_count = t.chars().filter(|&c| c == '|').count();
+    if pipe_count < 2 {
+        return false;
+    }
+    let non_sep = t
+        .chars()
+        .filter(|c| !matches!(c, '|' | '-' | ':' | ' '))
+        .count();
+    if non_sep > 0 {
+        return true;
+    }
+    let sep_chars: Vec<char> = t.chars().filter(|c| !matches!(c, '|' | ' ')).collect();
+    !sep_chars.is_empty() && sep_chars.iter().all(|c| *c == '-' || *c == ':')
+}
+
+/// A GFM delimiter row: only `|`, `-`, `:` and spaces with at least one dash.
+fn is_table_delimiter(t: &str) -> bool {
+    let t = t.trim();
+    !t.is_empty() && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// A table starts at line `i` when the line is a table line and the next
+/// line is a delimiter row (GFM requires the header + separator pair).
+fn is_table_start(lines: &[&str], i: usize) -> bool {
+    is_table_line(lines[i].trim())
+        && lines
+            .get(i + 1)
+            .is_some_and(|n| is_table_delimiter(n.trim()))
+}
+
+/// Split a table row into cells: outer pipes are structural, `\|` is a
+/// literal pipe (GFM escape), everything else separates cells. Cell text is
+/// trimmed; empty rows stay empty rather than collapsing away.
+fn split_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let inner = if t.starts_with('|') && t.ends_with('|') && t.len() > 1 {
+        &t[1..t.len() - 1]
+    } else if let Some(rest) = t.strip_prefix('|') {
+        rest
+    } else if t.ends_with('|') && t.len() > 1 {
+        &t[..t.len() - 1]
+    } else {
+        t
+    };
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'|') {
+            chars.next();
+            cur.push('|');
+        } else if c == '|' {
+            cells.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(c);
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+/// Build a `MarkdownBlock::Table` from buffered table lines. The first
+/// delimiter row separates the header from the body; a table whose first
+/// line is itself a delimiter is not a table (fall back to a paragraph).
+fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
+    let sep = buf.iter().position(|l| is_table_delimiter(l))?;
+    if sep == 0 {
+        return None;
+    }
+    let headers = split_table_row(&buf[sep - 1]);
+    let rows: Vec<Vec<String>> = buf[sep + 1..]
+        .iter()
+        .filter(|l| !is_table_delimiter(l))
+        .map(|l| split_table_row(l))
+        .collect();
+    Some(MarkdownBlock::Table { headers, rows })
 }
 
 fn is_heading(t: &str) -> bool {
@@ -321,14 +425,14 @@ fn thinking_display_lines(
 }
 
 /// The collapsed indicator's text: while the block streams, the dot count
-/// cycles 1→3 on a 16-tick (~0.25s) cadence — deliberately slower than the
-/// 8-tick delta throttle so the dots read as a calm pulse; once the block
-/// closes it freezes at "Thinking ...".
+/// cycles 1→3 every other animation frame (~0.24s at the ~8 fps busy
+/// heartbeat) — deliberately slower than the stream flush so the dots read
+/// as a calm pulse; once the block closes it freezes at "Thinking ...".
 fn thinking_indicator_text(thinking_open: bool, tick: u16) -> String {
     if !thinking_open {
         return "Thinking ...".to_string();
     }
-    let dots = match (tick / 16) % 3 {
+    let dots = match (tick / 2) % 3 {
         0 => ".",
         1 => "..",
         _ => "...",
@@ -573,7 +677,9 @@ impl ActivityView {
         }
         let content_width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
         let (activity_text, activity_color) = if app.busy {
-            let frame = super::UI_SPINNER[(app.tick / 8) as usize % super::UI_SPINNER.len()];
+            // One spinner frame per animation draw (~0.12s at the busy
+            // heartbeat); the heartbeat caps the rate, not this divisor.
+            let frame = super::UI_SPINNER[app.tick as usize % super::UI_SPINNER.len()];
             let tool = app
                 .active_tool
                 .as_ref()
@@ -581,8 +687,8 @@ impl ActivityView {
                 .unwrap_or_default();
             (
                 // Spinner sits to the right of the text, matching the
-                // "Thinking .." indicator; one frame per 8 ticks (~0.13s).
-                truncate_display(&format!("working… {}{}", frame, tool), content_width),
+                // "Thinking .." indicator; one frame per animation draw.
+                truncate_display(&format!("Working {}{}", frame, tool), content_width),
                 theme::muted_fg(),
             )
         } else {
@@ -646,7 +752,15 @@ impl ActivityView {
 struct ComposerView;
 
 impl ComposerView {
-    fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    // `input_lines`/`cursor` are rendered once per frame in `view` (they
+    // also size the layout); re-wrapping here doubled the composer cost.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: Rect,
+        app: &mut App,
+        lines: Vec<Line<'static>>,
+        cursor: (u16, u16, u16),
+    ) {
         f.render_widget(Clear, area);
         let input_style = if app.busy || app.pending_approval.is_some() {
             Style::default()
@@ -659,7 +773,6 @@ impl ComposerView {
         };
         let block = input_block();
         let inner = block.inner(area);
-        let (lines, cursor) = render_input(&app.input, inner.width);
         let content_rows = inner.height;
         let scroll = (cursor.0 + 1).saturating_sub(content_rows);
         let paragraph = Paragraph::new(lines)
@@ -813,12 +926,20 @@ impl SlashSuggestionsView {
 struct BottomPane;
 
 impl BottomPane {
-    fn render(f: &mut ratatui::Frame, layout: &UiLayout, app: &mut App) {
+    fn render(
+        f: &mut ratatui::Frame,
+        layout: &UiLayout,
+        app: &mut App,
+        input_lines: Vec<Line<'static>>,
+        input_cursor: (u16, u16, u16),
+    ) {
         if layout.activity.height > 0 {
             ActivityView::render(f, layout.activity, app);
         }
         if layout.input.height > 0 {
-            ComposerView::render(f, layout.input, app);
+            ComposerView::render(f, layout.input, app, input_lines, input_cursor);
+        } else {
+            drop((input_lines, input_cursor));
         }
         if layout.footer.height > 0 {
             FooterView::render(f, layout.footer, app);
@@ -999,9 +1120,10 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     // a shorter line (e.g. "worked for …" replacing the spinner, or a
     // shrunken input) would leave trailing chars from the previous frame.
     f.render_widget(Clear, area);
-    let input_rows = render_input(&app.input, input_content_width(area.width))
-        .0
-        .len() as u16;
+    // ponytail: wrap the composer once — the rows size the layout and
+    // render it, so don't pay `render_input` twice per frame.
+    let (input_lines, input_cursor) = render_input(&app.input, input_content_width(area.width));
+    let input_rows = input_lines.len() as u16;
     let pending_total = app.pending_steering.len() + app.pending_followups.len();
     let visible_pending = pending_total.min(3) as u16;
     let extra_queue_line = u16::from(pending_total > 3);
@@ -1013,7 +1135,7 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
         compute_layout(area, input_rows, activity_items, false).expect("layout always exists");
 
     TranscriptView::render(f, layout.transcript, app);
-    BottomPane::render(f, &layout, app);
+    BottomPane::render(f, &layout, app, input_lines, input_cursor);
     if app.pending_approval.is_some() {
         ApprovalOverlay::render(f, area, app);
     }
@@ -1394,6 +1516,7 @@ mod tests {
             thinking_open: false,
             plan: crate::core::types::Plan::default(),
             assistant_pending: String::new(),
+            stream_last_flush: std::time::Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
             display_cache: Vec::new(),
@@ -1463,7 +1586,8 @@ mod tests {
         assert!(!joined.contains("second line"), "{joined}");
 
         // While streaming, the collapsed indicator animates its dots.
-        let streaming = thinking_display_lines(text, false, true, 16, 80);
+        // One step every other animation frame at the busy heartbeat.
+        let streaming = thinking_display_lines(text, false, true, 2, 80);
         let streamed: String = streaming[0]
             .spans
             .iter()
@@ -1482,13 +1606,13 @@ mod tests {
 
     #[test]
     fn thinking_indicator_cycles_while_streaming_and_settles() {
-        // Dots grow 1→3 on the 16-tick cadence, then loop.
+        // Dots grow 1→3 every other animation frame, then loop.
         assert_eq!(thinking_indicator_text(true, 0), "Thinking .");
-        assert_eq!(thinking_indicator_text(true, 16), "Thinking ..");
-        assert_eq!(thinking_indicator_text(true, 32), "Thinking ...");
-        assert_eq!(thinking_indicator_text(true, 48), "Thinking .");
+        assert_eq!(thinking_indicator_text(true, 2), "Thinking ..");
+        assert_eq!(thinking_indicator_text(true, 4), "Thinking ...");
+        assert_eq!(thinking_indicator_text(true, 6), "Thinking .");
         // Closed: static, never animated again.
-        for tick in [0, 16, 32, 48, 999] {
+        for tick in [0, 2, 4, 6, 999] {
             assert_eq!(thinking_indicator_text(false, tick), "Thinking ...");
         }
     }
@@ -1517,7 +1641,7 @@ mod tests {
             },
         ];
         app.thinking_open = true;
-        app.tick = 16; // animated frame for this tick is "Thinking .."
+        app.tick = 2; // animated frame for this tick is "Thinking .."
         let backend = TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
@@ -1542,7 +1666,8 @@ mod tests {
         // rendered display: new block wrapped, settled head block reused,
         // gap preserved, no stale rows.
         let mut app = test_app();
-        app.tick = 8;
+        // Flush immediately so the streamed delta lands in the transcript.
+        app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
         let backend = TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
@@ -1946,6 +2071,8 @@ mod tests {
                 duration: 0.0,
             },
         );
+        // Open the throttle window so the assistant delta renders at once.
+        app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
         super::super::append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("Looked at src/main.rs.".into()),
@@ -2286,11 +2413,16 @@ mod tests {
     fn consecutive_assistant_chunks_do_not_add_gaps() {
         // Streaming coalesces consecutive Assistant SinkLines into the tail
         // Assistant block; no inter-block gap must appear inside that block.
+        // Each streamed line flushes on its own window so the tail block
+        // holds both chunks (mirrors turn-end `flush_assistant` draining
+        // whatever the throttle still holds).
         let mut app = test_app();
+        app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
         super::super::append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("first".into()),
         );
+        app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
         super::super::append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("second".into()),
@@ -2407,5 +2539,135 @@ mod tests {
             out,
             "Here's what I did:\n\n## Changes\n\n- Refactored the loop\n- Added a cache\n\n### Verification\n\ncargo test passed.\n\n1. run tests\n2. commit\nAll good.\n"
         );
+    }
+
+    #[test]
+    fn split_markdown_detects_gfm_tables() {
+        let blocks =
+            split_markdown("| Name | Count |\n|------|-------|\n| alpha | 1 |\n| beta | 2 |");
+        match &blocks[0] {
+            MarkdownBlock::Table { headers, rows } => {
+                assert_eq!(headers, &["Name", "Count"]);
+                assert_eq!(rows, &[vec!["alpha", "1"], vec!["beta", "2"]]);
+            }
+            other => panic!("expected a table block, got {other:?}"),
+        }
+        // Alignment colons are part of the delimiter row, not cell text.
+        let aligned = split_markdown("| Left | Mid | Right |\n|:---|:---:|---:|\n| a | b | c |");
+        match &aligned[0] {
+            MarkdownBlock::Table { headers, rows } => {
+                assert_eq!(headers, &["Left", "Mid", "Right"]);
+                assert_eq!(rows, &[vec!["a", "b", "c"]]);
+            }
+            other => panic!("expected a table block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_markdown_unescapes_table_pipes() {
+        // `\|` is a literal pipe (GFM escape), not a cell separator.
+        let blocks = split_markdown("| Expr | N |\n|---|---|\n| a \\| b | 1 |");
+        match &blocks[0] {
+            MarkdownBlock::Table { rows, .. } => {
+                assert_eq!(rows, &[vec!["a | b", "1"]]);
+            }
+            other => panic!("expected a table block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_markdown_separates_butted_table_from_prose() {
+        // No blank line between the prose and the table: still two blocks.
+        let blocks = split_markdown("Some prose.\n| a | b |\n|---|---|\n| 1 | 2 |");
+        assert!(
+            matches!(blocks[0], MarkdownBlock::Paragraph(_)),
+            "{blocks:?}"
+        );
+        assert!(
+            matches!(blocks[1], MarkdownBlock::Table { .. }),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn split_markdown_keeps_pipe_prose_as_paragraph() {
+        // A stray pipe line with no delimiter row below is prose, not a table.
+        let blocks = split_markdown("run: a | b | c\nmore prose");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(
+            matches!(blocks[0], MarkdownBlock::Paragraph(_)),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_lines_render_tables_as_boxes() {
+        let lines = markdown_lines("| A | B |\n|---|---|\n| 1 | 2 |");
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Box-drawn table, not the raw pipe + dash delimiter row.
+        assert!(text.contains('─'), "no rule drawn: {text}");
+        assert!(text.contains('│'), "no column borders: {text}");
+        assert!(!text.contains("|---"), "raw delimiter leaked: {text}");
+        assert!(text.contains('A') && text.contains('2'), "{text}");
+    }
+
+    #[test]
+    fn streamed_table_renders_as_one_block() {
+        // Regression: markdown was re-parsed per throttle flush, so a table
+        // streaming line-by-line rendered as raw paragraphs (header flushed
+        // alone before its delimiter arrived). The flush must hold until the
+        // table is complete, then render the whole thing as a Table block.
+        let mut app = test_app();
+        let lines = [
+            "Here is the comparison:",
+            "",
+            "| File | Lines | Status |",
+            "|------|-------|--------|",
+            "| loop.rs | 420 | done |",
+            "| state.rs | 180 | ok |",
+            "",
+            "All good.",
+        ];
+        for line in lines {
+            super::super::append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Assistant(line.into()),
+            );
+        }
+        super::super::flush_assistant(&mut app);
+        let text: String = app
+            .transcript
+            .iter()
+            .filter_map(|b| match b {
+                super::super::TranscriptBlock::Assistant { lines, .. } => Some(lines),
+                _ => None,
+            })
+            .flatten()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('─'), "no rule drawn: {text}");
+        assert!(text.contains('│'), "no column borders: {text}");
+        assert!(!text.contains("|---"), "raw delimiter leaked: {text}");
+        assert!(text.contains("loop.rs") && text.contains("done"), "{text}");
+        // Narrow terminal: the table degrades by wrapping, never panics.
+        let backend = TestBackend::new(50, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::super::view(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn block_gaps_keeps_table_rows_tight_across_seams() {
+        // A throttle seam between table rows must not insert air: that would
+        // split one table into two blocks mid-column.
+        let out = with_block_gaps("| a | b |\n|---|---|\n", "| 1 | 2 |");
+        assert_eq!(out, "| 1 | 2 |\n");
+        // Same for the delimiter row following a header.
+        let out = with_block_gaps("| a | b |\n", "|---|---|");
+        assert_eq!(out, "|---|---|\n");
     }
 }

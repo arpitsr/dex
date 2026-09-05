@@ -43,6 +43,11 @@ pub(super) const TAB_WIDTH: usize = 8;
 /// Braille spinner frames, matching the headless console spinner.
 const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Max markdown re-parse rate while streaming (`markdown_lines` +
+/// tree-sitter runs once per window, not once per token). Wall-clock, not
+/// tick-based, so it stays constant when the frame rate changes.
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(120);
+
 /// A semantic transcript block. Gaps between blocks are **not** stored;
 /// they are inserted by `TranscriptView::render` (`ui/render.rs`) as a
 /// single blank `Line` between any two blocks. This makes gutter handling
@@ -215,10 +220,13 @@ pub(crate) struct App {
     pub(crate) thinking_open: bool,
     pub(crate) plan: crate::core::types::Plan,
     /// Assistant deltas buffered between throttle windows. `markdown_lines`
-    /// (term-md + tree-sitter) runs on the buffer at most once per ~8 ticks
-    /// instead of once per token; `flush_assistant` drains it into the tail
-    /// `Assistant` block.
+    /// (term-md + tree-sitter) runs on the buffer at most once per
+    /// `STREAM_FLUSH_INTERVAL` instead of once per token; `flush_assistant`
+    /// drains it into the tail `Assistant` block.
     pub(crate) assistant_pending: String,
+    /// Last wall-clock markdown/thinking flush; gates `append_sink_line`
+    /// throttling so the re-parse rate is frame-rate independent.
+    pub(crate) stream_last_flush: Instant,
     /// Wrapped rows per transcript block, parallel to `transcript`. Kept in
     /// sync (and `display_cache` rebuilt) by `TranscriptView::render` only
     /// when a block's stamp changes, a block is added, or the width changes.
@@ -601,6 +609,17 @@ pub(super) fn push_banner(app: &mut App) {
         .push(TranscriptBlock::Banner { stamp: 0, lines });
 }
 
+/// Wall-clock throttle gate: true once `STREAM_FLUSH_INTERVAL` elapsed
+/// since the last flush, so markdown re-parses stay capped when the frame
+/// rate changes.
+fn stream_flush_due(app: &App) -> bool {
+    app.stream_last_flush.elapsed() >= STREAM_FLUSH_INTERVAL
+}
+
+fn note_stream_flush(app: &mut App) {
+    app.stream_last_flush = Instant::now();
+}
+
 /// Drain the buffered assistant deltas into the tail `Assistant` block,
 /// rendering the markdown once for the whole buffered chunk. Call before
 /// anything reads the transcript or pushes a non-assistant block, so pending
@@ -609,6 +628,7 @@ fn flush_assistant(app: &mut App) {
     if app.assistant_pending.is_empty() {
         return;
     }
+    note_stream_flush(app);
     let new_lines: Vec<Line<'static>> = render::markdown_lines(app.assistant_pending.trim_end())
         .into_iter()
         .map(indent_transcript_line)
@@ -673,7 +693,19 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 app.assistant_pending.push('\n');
             }
             app.assistant_pending.push_str(&chunk);
-            if app.tick.is_multiple_of(8) {
+            // Tables need header + delimiter + rows in one render window:
+            // markdown is re-parsed per flush, so a table split across
+            // windows would fall back to raw paragraphs. Hold the flush
+            // while the buffer ends on a table line; prose, a blank line or
+            // the next non-assistant sink line releases the whole table.
+            let last_line = app
+                .assistant_pending
+                .trim_end()
+                .rsplit('\n')
+                .next()
+                .unwrap_or("");
+            let holding_table = render::is_table_line(last_line);
+            if stream_flush_due(app) && !holding_table {
                 flush_assistant(app);
             }
         }
@@ -682,16 +714,21 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 return;
             }
             app.assistant_open = false;
+            // ponytail: throttle re-wraps — reasoning arrives token-by-
+            // token; the block settles on close, which bumps unconditionally.
+            // (Gate read before the mutable borrow; clock reset after it.)
+            let due = stream_flush_due(app);
             if let Some(TranscriptBlock::Thinking { text, stamp }) = app.transcript.last_mut() {
                 text.push_str(&s);
-                // ponytail: throttle re-wraps — reasoning arrives token-by-
-                // token; the block settles on close, which bumps unconditionally.
-                if app.tick.is_multiple_of(8) {
+                if due {
                     *stamp = stamp.wrapping_add(1);
                 }
             } else {
                 app.transcript
                     .push(TranscriptBlock::Thinking { stamp: 0, text: s });
+            }
+            if due {
+                note_stream_flush(app);
             }
             app.thinking_open = true;
         }
@@ -1024,6 +1061,7 @@ mod tests {
             thinking_open: false,
             plan: crate::core::types::Plan::default(),
             assistant_pending: String::new(),
+            stream_last_flush: Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
             display_cache: Vec::new(),
@@ -1195,7 +1233,8 @@ mod tests {
     #[test]
     fn thinking_stream_coalesces_and_closes_on_assistant_text() {
         let mut app = test_app();
-        app.tick = 8; // throttle window open, so every delta bumps the version
+        // Throttle window open, so every delta bumps the version.
+        app.stream_last_flush = Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         for chunk in ["Let me ", "think."] {
             append_sink_line(
                 &mut app,
@@ -1203,6 +1242,9 @@ mod tests {
             );
         }
         assert!(app.thinking_open, "streaming deltas keep the block open");
+        // The thinking bumps reset the shared throttle clock; reopen the
+        // window so the assistant delta renders immediately.
+        app.stream_last_flush = Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("done".into()),
@@ -1242,7 +1284,8 @@ mod tests {
     #[test]
     fn assistant_lines_buffer_until_the_throttle_window() {
         let mut app = test_app();
-        app.tick = 1; // inside a throttle window
+        // Inside a throttle window: just flushed, so nothing renders yet.
+        app.stream_last_flush = Instant::now();
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("hello".into()),
@@ -1250,7 +1293,8 @@ mod tests {
         assert_eq!(app.assistant_pending, "hello\n");
         assert!(app.transcript.is_empty(), "nothing renders mid-window");
 
-        app.tick = 8;
+        // Window elapsed: the next delta flushes.
+        app.stream_last_flush = Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("world".into()),
@@ -1274,7 +1318,8 @@ mod tests {
         );
 
         // A non-assistant line drains the buffer before its own block lands.
-        app.tick = 1;
+        // Fresh window again so the tail buffers instead of flushing.
+        app.stream_last_flush = Instant::now();
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::Assistant("tail".into()),
