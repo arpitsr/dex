@@ -22,8 +22,8 @@ use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
-    FollowupRequest, LoadSkillRequest, ReattachResponse, SkillInfo, SteerRequest, StreamEnvelope,
-    StreamEvent,
+    FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse, SkillInfo, SteerRequest,
+    StreamEnvelope, StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills, discover_skills_fresh, skill_dirs};
@@ -34,6 +34,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/config", get(get_config))
+        .route("/api/git", get(get_git))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
@@ -125,6 +126,8 @@ fn resolve_daemon_info() -> DaemonInfo {
             cwd,
             git_branch,
             git_dirty,
+            thinking_effort: config.thinking_effort.clone(),
+            thinking_warning: config.thinking_mismatch_warning(),
         },
         Err(_) => {
             // Config is incomplete (e.g. no API key yet); report what we can
@@ -147,6 +150,8 @@ fn resolve_daemon_info() -> DaemonInfo {
                 cwd,
                 git_branch,
                 git_dirty,
+                thinking_effort: None,
+                thinking_warning: None,
             }
         }
     }
@@ -167,7 +172,32 @@ async fn get_config() -> Json<DaemonInfo> {
             cwd: String::new(),
             git_branch: None,
             git_dirty: false,
+            thinking_effort: None,
+            thinking_warning: None,
         });
+    Json(info)
+}
+
+/// Lightweight footer poll: just the daemon workspace's branch/dirty, behind
+/// the same 5s `cached_git_context` as `/api/config` so a 2s TUI poll costs
+/// at most one `git` spawn per 5s — and never pays `LlmConfig::from_env`.
+async fn get_git() -> Json<GitInfo> {
+    // `git` spawns block; keep them off the runtime workers like `get_config`.
+    let info = tokio::task::spawn_blocking(|| {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (git_branch, git_dirty) = cached_git_context(&cwd);
+        GitInfo {
+            git_branch,
+            git_dirty,
+        }
+    })
+    .await
+    .unwrap_or(GitInfo {
+        git_branch: None,
+        git_dirty: false,
+    });
     Json(info)
 }
 
@@ -1456,6 +1486,19 @@ async fn session_name(
 mod handler_tests {
     use super::*;
     use axum::extract::{Path, Query};
+
+    #[tokio::test]
+    async fn git_endpoint_matches_local_git_context() {
+        // `GET /api/git` is the footer's poll source; it must report the same
+        // branch/dirty as a direct `git_context` of the daemon cwd.
+        let Json(info) = get_git().await;
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (branch, dirty) = crate::core::format::git_context(&cwd);
+        assert_eq!(info.git_branch, branch);
+        assert_eq!(info.git_dirty, dirty);
+    }
 
     fn state_with_session(path: &std::path::Path) -> (Arc<DaemonState>, String) {
         let state = Arc::new(DaemonState::new());

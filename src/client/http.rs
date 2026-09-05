@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{
     ApprovalDecision, ApprovalResponse, ChatRequest, CreateSessionRequest, CreateSessionResponse,
-    DaemonInfo, EventsResponse, FollowupRequest, LoadSkillRequest, LoadSkillResponse,
+    DaemonInfo, EventsResponse, FollowupRequest, GitInfo, LoadSkillRequest, LoadSkillResponse,
     ReattachResponse, SessionInfo, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
 };
 
@@ -92,6 +92,21 @@ impl DaemonClient {
             .send()?
             .error_for_status()?
             .json::<DaemonInfo>()?;
+        Ok(info)
+    }
+
+    /// Poll the daemon workspace's branch/dirty for the status footer.
+    /// Short timeout + best-effort: a slow daemon must not hitch the TUI,
+    /// the next interval simply retries.
+    pub fn get_git(&self) -> Result<GitInfo, Box<dyn std::error::Error>> {
+        let info = self
+            .http
+            .get(format!("{}/api/git", self.base_url))
+            .headers(self.api_headers())
+            .timeout(Duration::from_secs(2))
+            .send()?
+            .error_for_status()?
+            .json::<GitInfo>()?;
         Ok(info)
     }
 
