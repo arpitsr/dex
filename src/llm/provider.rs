@@ -21,7 +21,7 @@ impl Provider {
     /// right endpoint via the models.dev catalog (see `apply_model`), so
     /// this is just the landing endpoint, not a per-model decision. Generic
     /// providers land on their catalog `api` URL instead (`None` here;
-    /// `LlmConfig::landing_base_url` resolves it).
+    /// `config::landing_base_url_for` resolves it).
     pub(crate) fn default_base_url(&self) -> Option<&'static str> {
         match self {
             Self::OpenCode => Some("https://opencode.ai/zen/v1"),
