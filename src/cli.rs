@@ -14,6 +14,10 @@ pub(crate) struct Args {
     pub session_name: Option<String>,
     pub skill_dirs: Vec<PathBuf>,
     pub permission: Option<PermissionMode>,
+    /// Extra HTTP headers for provider requests (`--header "X-Foo: bar"`,
+    /// repeatable). Same `Name: Value` / `Name=Value` / JSON-object syntax as
+    /// `DEX_HEADERS`.
+    pub headers: Vec<String>,
     /// P10: attach to an existing daemon session (replay its event journal)
     /// instead of creating a fresh one. `dex connect <url> --reattach <id>`.
     pub reattach: Option<String>,
@@ -53,10 +57,22 @@ pub(crate) fn parse_args() -> Args {
     let mut session_name = None;
     let mut skill_dirs = Vec::new();
     let mut permission = None;
+    let mut headers = Vec::new();
     let mut reattach = None;
     let mut rest = Vec::new();
     let mut input = env::args().skip(1);
     while let Some(arg) = input.next() {
+        // Attached forms (`--header=X: Y`, `-HX: Y`) for parity with curl.
+        if let Some(value) = arg.strip_prefix("--header=") {
+            headers.push(value.to_string());
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-H") {
+            if !value.is_empty() {
+                headers.push(value.to_string());
+                continue;
+            }
+        }
         match arg.as_str() {
             "--base-url" => base_url = Some(required(&mut input, "--base-url")),
             "--model" => model = Some(required(&mut input, "--model")),
@@ -74,6 +90,7 @@ pub(crate) fn parse_args() -> Args {
                 );
             }
             "--skill" => skill_dirs.push(PathBuf::from(required(&mut input, "--skill"))),
+            "--header" | "-H" => headers.push(required(&mut input, "--header")),
             _ => rest.push(arg),
         }
     }
@@ -86,6 +103,7 @@ pub(crate) fn parse_args() -> Args {
         session_name,
         skill_dirs,
         permission,
+        headers,
         reattach,
         rest,
     }
@@ -210,6 +228,7 @@ mod tests {
             session_name: None,
             skill_dirs: Vec::new(),
             permission: None,
+            headers: Vec::new(),
             reattach: None,
             rest: rest.iter().map(|s| s.to_string()).collect(),
         }

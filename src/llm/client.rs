@@ -41,11 +41,28 @@ pub(crate) fn authenticated_request(
     config: &LlmConfig,
 ) -> reqwest::blocking::RequestBuilder {
     let request = request.bearer_auth(&config.api_key);
-    config
+    let request = config
         .provider
         .auth_headers(config.account_id.as_deref())
         .into_iter()
-        .fold(request, |req, (name, value)| req.header(name, value))
+        .fold(request, |req, (name, value)| req.header(name, value));
+    // Custom headers (gateway auth, routing, attribution) go last so a
+    // proxy that keys on them sees the final value. `authorization` is
+    // never overridable here — the api key owns it. Malformed names or
+    // values are skipped so one bad header can't fail the turn.
+    let mut request = request;
+    for (name, value) in &config.extra_headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            request = request.header(name, value);
+        }
+    }
+    request
 }
 
 pub(crate) fn retryable_status(status: reqwest::StatusCode) -> bool {
@@ -247,6 +264,41 @@ mod tests {
                 stop_reason: None,
             })
         }
+    }
+
+    #[test]
+    fn authenticated_request_applies_custom_headers_and_protects_auth() {
+        let mut config = crate::llm::config::tests::test_cfg();
+        config.api_key = "secret".to_string();
+        config
+            .extra_headers
+            .insert("X-Gateway-Key".to_string(), "abc".to_string());
+        config
+            .extra_headers
+            .insert("Authorization".to_string(), "hacked".to_string());
+        config
+            .extra_headers
+            .insert("not a header".to_string(), "bad".to_string());
+        let req = authenticated_request(
+            config.client.get("http://localhost/v1/chat/completions"),
+            &config,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            req.headers()
+                .get("x-gateway-key")
+                .map(|v| v.to_str().unwrap()),
+            Some("abc")
+        );
+        // The api key owns `authorization`; a custom header can't hijack it.
+        assert_eq!(
+            req.headers()
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer secret")
+        );
+        assert!(!req.headers().contains_key("not a header"));
     }
 
     #[test]
