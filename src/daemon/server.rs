@@ -68,32 +68,39 @@ fn cached_git_context(cwd: &str) -> (Option<String>, bool) {
     // `git branch` + `git status` spawn two processes (~10-30ms); `/api/config`
     // runs on every TUI launch, and branch/dirty barely move within seconds.
     struct Entry {
-        cwd: String,
         at: Instant,
         branch: Option<String>,
         dirty: bool,
     }
-    static CACHE: OnceLock<Mutex<Option<Entry>>> = OnceLock::new();
+    // Keyed by cwd (not single-entry): the daemon reports its own cwd today,
+    // but a per-session cwd must not evict another session's entry.
+    // Best-effort cache — cleared (not LRU'd) past the cap.
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Entry>>> = OnceLock::new();
     if let Some(hit) = CACHE
-        .get_or_init(|| Mutex::new(None))
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|e| e.cwd == cwd && e.at.elapsed() < Duration::from_secs(5))
+        .get(cwd)
+        .filter(|e| e.at.elapsed() < Duration::from_secs(5))
     {
         return (hit.branch.clone(), hit.dirty);
     }
     let (branch, dirty) = git_context(cwd);
-    CACHE
-        .get_or_init(|| Mutex::new(None))
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(Entry {
-            cwd: cwd.to_string(),
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 32 {
+        cache.clear();
+    }
+    cache.insert(
+        cwd.to_string(),
+        Entry {
             at: Instant::now(),
             branch: branch.clone(),
             dirty,
-        });
+        },
+    );
     (branch, dirty)
 }
 

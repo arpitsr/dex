@@ -35,6 +35,11 @@ pub(crate) struct DaemonClient {
 /// Process-wide shared blocking client. `Client::new()` initializes a TLS
 /// backend + connection pool (~tens of ms); the TUI used to build one per
 /// `DaemonClient` plus one per display config. Clones are an atomic bump.
+///
+/// Timeout note: previously each `DaemonClient` built `Client::new()` with no
+/// timeouts (a hung daemon hung the TUI forever); the shared client sets a
+/// 10s connect / 300s per-read timeout instead. `wait_until_ready` still
+/// overrides to 2s per poll.
 static SHARED_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 
 pub(crate) fn shared_blocking_client() -> reqwest::blocking::Client {

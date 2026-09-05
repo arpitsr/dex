@@ -182,24 +182,30 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // one daemon-side skills scan off the critical path.
     // (Thread results cross as `String`/`Vec`, not `Box<dyn Error>`, which
     // is not `Send`.)
-    let (session_result, daemon_skills) = std::thread::scope(|s| {
-        let skills_handle = s.spawn(|| client.list_skills().unwrap_or_default());
-        let session: Result<(String, bool), String> = if let Some(reattach) = &args.reattach {
-            // P10: attach to an existing persisted session on the daemon and get
-            // the replay cursor, instead of creating a fresh one.
-            client
-                .reattach(reattach)
-                .map(|resp| (resp.session_id, true))
-                .map_err(|e| format!("failed to reattach session: {e}"))
-        } else {
-            client
-                .create_session(&info.cwd, args.session_name.as_deref())
-                .map(|resp| (resp.session_id, false))
-                .map_err(|e| format!("failed to create session: {e}"))
-        };
-        (session, skills_handle.join().unwrap_or_default())
-    });
-    let (session_id, is_reattach) = session_result.map_err(std::io::Error::other)?;
+    // The skills thread is detached on session failure: a failed launch must
+    // not wait for a daemon-side skills scan before reporting the error.
+    let skills_client = client.clone();
+    let skills_handle = std::thread::spawn(move || skills_client.list_skills().unwrap_or_default());
+    let session_result: Result<(String, bool), String> = if let Some(reattach) = &args.reattach {
+        // P10: attach to an existing persisted session on the daemon and get
+        // the replay cursor, instead of creating a fresh one.
+        client
+            .reattach(reattach)
+            .map(|resp| (resp.session_id, true))
+            .map_err(|e| format!("failed to reattach session: {e}"))
+    } else {
+        client
+            .create_session(&info.cwd, args.session_name.as_deref())
+            .map(|resp| (resp.session_id, false))
+            .map_err(|e| format!("failed to create session: {e}"))
+    };
+    let (session_id, is_reattach) = match session_result {
+        // `JoinHandle` drops detach the thread; only reached on the error
+        // path where the skills result is discarded anyway.
+        Err(e) => return Err(std::io::Error::other(e)),
+        Ok(ok) => (ok.0, ok.1),
+    };
+    let daemon_skills = skills_handle.join().unwrap_or_default();
     // Skills live on the daemon (its workspace); a stale list is harmless —
     // the load call re-discovers on the daemon side.
     let tui_skills: Vec<crate::core::types::Skill> = daemon_skills

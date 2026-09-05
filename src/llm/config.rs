@@ -112,6 +112,7 @@ fn learned_apis_path() -> Option<std::path::PathBuf> {
 /// identity. `from_env` consulted this file on every turn (one read + parse
 /// per turn); hits are now a mutex bump.
 struct CachedLearnedApis {
+    path: std::path::PathBuf,
     mtime: SystemTime,
     len: u64,
     map: serde_json::Map<String, serde_json::Value>,
@@ -134,7 +135,7 @@ fn learned_api_map() -> serde_json::Map<String, serde_json::Value> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .filter(|cached| cached.mtime == mtime && cached.len == len)
+        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
     {
         return hit.map.clone();
     }
@@ -147,6 +148,7 @@ fn learned_api_map() -> serde_json::Map<String, serde_json::Value> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace(CachedLearnedApis {
+            path,
             mtime,
             len,
             map: map.clone(),
@@ -291,6 +293,9 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
 }
 
 /// Best-effort index write; failures just mean the next launch re-parses.
+/// Atomic (tmp file + rename) so a concurrent `refresh` never leaves a torn
+/// `models.ctx.json` for a reader mid-turn; a stale reader just falls back to
+/// the full catalog parse on JSON error.
 fn write_ctx_index(map: &BTreeMap<String, u64>) {
     let Some(path) = dex_ctx_index_path() else {
         return;
@@ -302,7 +307,10 @@ fn write_ctx_index(map: &BTreeMap<String, u64>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_string(map) {
-        let _ = std::fs::write(path, text);
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -1248,8 +1256,8 @@ impl LlmConfig {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        detect_verify_command, model_api_from_env, remember_learned_api, usage_cost, ApiProtocol,
-        LlmConfig, ModelsResponse, PermissionMode, Provider,
+        build_ctx_map, detect_verify_command, model_api_from_env, remember_learned_api, usage_cost,
+        ApiProtocol, LlmConfig, ModelsResponse, PermissionMode, Provider,
     };
     use crate::core::types::Usage;
     use std::env;
@@ -1852,5 +1860,24 @@ pub(crate) mod tests {
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctx_map_covers_both_catalog_shapes_lowercased() {
+        let catalog = serde_json::json!({
+            "opencode": { "models": {
+                "GPT-5": { "limit": { "context": 128000 } },
+                "zero": { "limit": { "context": 0 } },
+                "nodoc": {},
+            } },
+            "models": {
+                "Claude-X": { "limit": { "context": 200000 } },
+            },
+        });
+        let map = build_ctx_map(&catalog);
+        assert_eq!(map.get("gpt-5"), Some(&128000));
+        assert_eq!(map.get("claude-x"), Some(&200000));
+        assert!(!map.contains_key("zero"));
+        assert!(!map.contains_key("nodoc"));
     }
 }
