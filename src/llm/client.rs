@@ -131,7 +131,6 @@ fn post_with_retry(
                 if let Ok((token, account)) = crate::llm::config::resolve_credentials(
                     &active_config.provider,
                     &active_config.provider_entries,
-                    None,
                 ) {
                     active_config.api_key = token;
                     active_config.account_id = account;

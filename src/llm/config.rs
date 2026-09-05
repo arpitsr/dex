@@ -180,52 +180,56 @@ fn endpoints_for(
     out
 }
 
-/// Per-provider credentials: config `providers.<name>.api_key` > the
-/// provider's own conventional env var from the catalog (`ZHIPU_API_KEY`,
-/// `OPENROUTER_API_KEY`, …) > legacy fallbacks. Codex reads its own
-/// credential file and ignores all of this.
+/// Per-provider credentials — the uniform deposit order for every provider
+/// except codex (which reads its own credential file):
+/// 1. `providers.<name>.api_key` in config.yaml,
+/// 2. the provider's own conventional env var from the catalog `env` map
+///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …),
+/// then a loud error naming the deposit places.
 pub(crate) fn resolve_credentials(
     provider: &Provider,
     entries: &BTreeMap<String, ProviderEntry>,
-    file_api_key: Option<&str>,
 ) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    match provider {
-        Provider::OpenCode => Ok((
-            env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .or_else(|| file_api_key.map(str::to_string))
-                .filter(|v| !v.is_empty())
-                .ok_or("OPENAI_API_KEY not set (export it or add api_key to config.yaml)")?,
-            None,
-        )),
-        Provider::OpenAiCodex => load_codex_credentials(),
-        Provider::Generic(name) => {
-            if let Some(key) = entries
-                .get(name)
-                .and_then(|e| e.api_key.clone())
-                .filter(|k| !k.is_empty())
-            {
+    if matches!(provider, Provider::OpenAiCodex) {
+        return load_codex_credentials();
+    }
+    let name = provider.name();
+    if let Some(key) = entries
+        .get(name)
+        .and_then(|e| e.api_key.clone())
+        .filter(|k| !k.is_empty())
+    {
+        return Ok((key, None));
+    }
+    // The provider's own documented env var; for opencode it is hardcoded
+    // too so the name works cache-less (the catalog is just the source).
+    let mut env_names: Vec<String> = load_dex_catalog()
+        .and_then(|c| catalog_env_var(name, &c))
+        .into_iter()
+        .collect();
+    if matches!(provider, Provider::OpenCode) {
+        env_names.push("OPENCODE_API_KEY".to_string());
+    }
+    env_names.sort();
+    env_names.dedup();
+    for var in &env_names {
+        if let Ok(key) = env::var(var) {
+            if !key.trim().is_empty() {
                 return Ok((key, None));
             }
-            let env_name = load_dex_catalog().and_then(|c| catalog_env_var(name, &c));
-            if let Some(var) = &env_name {
-                if let Ok(key) = env::var(var) {
-                    if !key.trim().is_empty() {
-                        return Ok((key, None));
-                    }
-                }
-            }
-            Err(format!(
-                "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
-                env_name.map(|v| format!(" or export {v}")).unwrap_or_else(|| {
-                    " or export the provider's key env var (run `dex update --models` to learn its name)"
-                        .to_string()
-                })
-            )
-            .into())
         }
     }
+    Err(format!(
+        "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
+        env_names
+            .first()
+            .map(|v| format!(" or export {v}"))
+            .unwrap_or_else(|| {
+                " or export the provider's key env var (run `dex update --models` to learn its name)"
+                    .to_string()
+            })
+    )
+    .into())
 }
 
 /// True when the user explicitly pinned the wire protocol: the `OPENAI_API`
@@ -1178,11 +1182,7 @@ impl LlmConfig {
         // only the default. `OPENAI_API` pins everything, otherwise the
         // `apply_model` call below resolves the selection-aware protocol
         // (full `endpoint/id` key, then bare id, then learned fallback).
-        let (api_key, account_id) = resolve_credentials(
-            &provider,
-            &provider_entries,
-            load_config_str(&file, "api_key").as_deref(),
-        )?;
+        let (api_key, account_id) = resolve_credentials(&provider, &provider_entries)?;
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1311,7 +1311,7 @@ impl LlmConfig {
                 if new_provider != self.provider {
                     // Best-effort credential switch; failure surfaces at next LLM call
                     if let Ok((k, acct)) =
-                        resolve_credentials(&new_provider, &self.provider_entries, None)
+                        resolve_credentials(&new_provider, &self.provider_entries)
                     {
                         self.api_key = k;
                         self.account_id = acct;
@@ -1403,7 +1403,7 @@ impl LlmConfig {
         provider: &Provider,
         persist: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (api_key, account_id) = resolve_credentials(provider, &self.provider_entries, None)?;
+        let (api_key, account_id) = resolve_credentials(provider, &self.provider_entries)?;
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
         let landing = match provider {
             Provider::Generic(name) => self
@@ -1757,12 +1757,12 @@ pub(crate) mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _g = EnvRestore::take(&[
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "CODEX_ACCESS_TOKEN",
             "CODEX_ACCOUNT_ID",
             "OPENAI_BASE_URL",
         ]);
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("CODEX_ACCESS_TOKEN", "codex-tok");
         std::env::remove_var("OPENAI_BASE_URL");
         let mut cfg = test_cfg();
@@ -1799,7 +1799,7 @@ pub(crate) mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _g = EnvRestore::take(&[
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_MODEL",
             "OPENAI_API",
@@ -1807,7 +1807,7 @@ pub(crate) mod tests {
             "DEX_MODELS",
             "DEX_CONFIG",
         ]);
-        std::env::set_var("OPENAI_API_KEY", "test-key2");
+        std::env::set_var("OPENCODE_API_KEY", "test-key2");
         std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("DEX_MODELS");
         std::env::set_var("DEX_PROVIDER", "opencode");
@@ -1867,7 +1867,7 @@ pub(crate) mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _g = EnvRestore::take(&[
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_MODEL",
             "OPENAI_API",
@@ -1888,7 +1888,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", &cfg_path);
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("DEX_MODELS");
         std::env::set_var("DEX_HEADERS", "X-Env: env");
@@ -2004,6 +2004,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn opencode_key_resolves_entry_then_own_env_var() {
+        // Deposit order: providers.opencode.api_key > OPENCODE_API_KEY.
+        // The legacy OPENAI_API_KEY spelling is gone on purpose: the name
+        // was the confusion (it is opencode's gateway key, not OpenAI's).
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENAI_MODEL",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENCODE_API_KEY",
+            "OPENAI_MODEL",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-okey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENAI_MODEL", "m");
+        for key in ["OPENCODE_API_KEY", "OPENAI_MODEL"] {
+            std::env::remove_var(key);
+        }
+        // The provider's own env var is the shell path.
+        std::env::set_var("OPENCODE_API_KEY", "canonical");
+        assert_eq!(
+            LlmConfig::from_env(None, None, None, &[]).unwrap().api_key,
+            "canonical"
+        );
+        // The scoped deposit place wins over the env var.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: opencode\nproviders:\n  opencode:\n    api_key: deposited\n",
+        )
+        .unwrap();
+        assert_eq!(
+            LlmConfig::from_env(None, None, None, &[]).unwrap().api_key,
+            "deposited"
+        );
+        // Missing everywhere: the error points at the canonical names.
+        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        std::env::remove_var("OPENCODE_API_KEY");
+        let err = match LlmConfig::from_env(None, None, None, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected missing-key error"),
+        };
+        assert!(err.contains("providers.opencode.api_key"), "{err}");
+        assert!(err.contains("OPENCODE_API_KEY"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn config_file_defaults_apply_and_env_wins() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
@@ -2014,7 +2073,7 @@ pub(crate) mod tests {
             "OPENAI_MODEL",
             "OPENAI_API",
             "OPENAI_BASE_URL",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_CONTEXT_WINDOW",
         ]);
@@ -2023,11 +2082,11 @@ pub(crate) mod tests {
         let path = dir.join("config.yaml");
         std::fs::write(
             &path,
-            "provider: opencode\napi_key: file-key\nbase_url: https://file.example/v1\nmodel: file-model\napi: openai-completions\ncustom_key: keep-me\n",
+            "provider: opencode\nbase_url: https://file.example/v1\nmodel: file-model\napi: openai-completions\ncustom_key: keep-me\n",
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", &path);
-        std::env::set_var("OPENAI_API_KEY", "env-key");
+        std::env::set_var("OPENCODE_API_KEY", "env-key");
         // No OPENAI_MODEL: file model + file base_url + file api apply.
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "file-model");
@@ -2043,7 +2102,6 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("model: go/new-model"));
         assert!(text.contains("custom_key: keep-me"));
-        assert!(text.contains("api_key: file-key"));
         // Learned protocol: remembered to the cache, picked up on the next
         // config build (nothing explicit pins this model's protocol).
         let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
@@ -2130,7 +2188,7 @@ pub(crate) mod tests {
             "OPENAI_MODEL",
             "OPENAI_API",
             "OPENAI_BASE_URL",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
             "DEX_CONTEXT_WINDOW",
@@ -2142,7 +2200,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("OPENAI_BASE_URL", "https://opencode.ai/zen/v1");
         std::env::set_var("OPENAI_MODEL", "m-go-only");
         for key in [
@@ -2203,7 +2261,7 @@ pub(crate) mod tests {
             "OPENAI_MODEL",
             "OPENAI_API",
             "OPENAI_BASE_URL",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
             "DEX_CONTEXT_WINDOW",
@@ -2221,7 +2279,7 @@ pub(crate) mod tests {
             "DEX_PROVIDER",
             "OPENAI_API",
             "OPENAI_BASE_URL",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
             "DEX_CONTEXT_WINDOW",
@@ -2274,7 +2332,7 @@ pub(crate) mod tests {
             "OPENAI_MODEL",
             "OPENAI_API",
             "OPENAI_BASE_URL",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
             "DEX_CONTEXT_WINDOW",
@@ -2286,7 +2344,7 @@ pub(crate) mod tests {
         generic_config(&dir, "providers:\n  zai:\n    api_key: zsk-deposit\n");
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         for key in [
             "DEX_PROVIDER",
             "OPENAI_API",
@@ -2353,7 +2411,7 @@ pub(crate) mod tests {
             "OPENAI_MODEL",
             "OPENAI_API",
             "OPENAI_BASE_URL",
-            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
             "DEX_CONTEXT_WINDOW",
@@ -2372,7 +2430,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join("cache/dex/models.dev.json"), "{}").unwrap();
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_MODEL_APIS", "m-z9=openai-completions");
         std::env::remove_var("OPENAI_API");
         std::env::remove_var("OPENAI_BASE_URL");
