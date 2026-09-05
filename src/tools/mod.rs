@@ -7,6 +7,7 @@ use similar::TextDiff;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,12 +18,14 @@ use std::time::{Duration, Instant};
 use crate::agent::state::CancellationSource;
 use crate::core::format::clamp_lines;
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
     fn setsid() -> i32;
 }
 
+#[cfg(unix)]
 const SIGKILL: i32 = 9;
 static CONFIGURED_OUTPUT_LIMIT: AtomicUsize = AtomicUsize::new(1_048_576);
 
@@ -340,34 +343,10 @@ fn run_bash_with_limits(
     max_bytes: usize,
     cancel: &dyn CancellationSource,
 ) -> Result<(String, Option<i32>), ToolError> {
-    let mut builder = Command::new("sh");
-    builder
-        .arg("-c")
-        .arg(command)
-        .envs(tool_runner_env())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // New session for the shell: drops the controlling tty, so tool children
-    // can never write to or race the user's terminal for input. Without this,
-    // a child that probes the terminal (e.g. `cargo test` running the theme
-    // tests → OSC 10/11 on /dev/tty) sends queries to the TUI's pts and races
-    // crossterm for the reply — the TUI can end up with half a color report
-    // typed into the composer.
-    // SAFETY: runs in the forked child before exec; it is not yet a process
-    // group leader, so setsid() succeeds.
-    unsafe {
-        builder.pre_exec(|| {
-            let _ = setsid();
-            Ok(())
-        });
-    }
-    let mut child = builder.spawn().map_err(ToolError::Io)?;
+    let mut child = shell_command(command).spawn().map_err(ToolError::Io)?;
     // Put the shell in its own process group so cancellation/timeout does not
     // leave descendants running.
-    unsafe {
-        let _ = setpgid(child.id() as i32, child.id() as i32);
-    }
+    mark_process_group(child.id());
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let stdout_reader = thread::spawn(move || read_limited(stdout, max_bytes));
@@ -378,20 +357,14 @@ fn run_bash_with_limits(
             break status;
         }
         if cancel.is_cancelled() {
-            unsafe {
-                let _ = kill(-(child.id() as i32), SIGKILL);
-            }
-            let _ = child.kill();
+            kill_process_group(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Ok(("Error: shell command cancelled".to_string(), None));
         }
         if Instant::now() >= deadline {
-            unsafe {
-                let _ = kill(-(child.id() as i32), SIGKILL);
-            }
-            let _ = child.kill();
+            kill_process_group(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -423,6 +396,71 @@ fn run_bash_with_limits(
         }
     }
     Ok((result, status.code()))
+}
+
+/// Spawn the workspace shell. Unix gets `sh -c` in a fresh session so tool
+/// children can never write to or race the user's terminal for input: a child
+/// that probes the terminal (e.g. `cargo test` running the theme tests →
+/// OSC 10/11 on /dev/tty) would otherwise send queries to the TUI's pts and
+/// race crossterm for the reply — the TUI can end up with half a color report
+/// typed into the composer.
+/// SAFETY: runs in the forked child before exec; it is not yet a process
+/// group leader, so setsid() succeeds.
+#[cfg(unix)]
+fn shell_command(command: &str) -> Command {
+    let mut builder = Command::new("sh");
+    builder
+        .arg("-c")
+        .arg(command)
+        .envs(tool_runner_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        builder.pre_exec(|| {
+            let _ = setsid();
+            Ok(())
+        });
+    }
+    builder
+}
+
+#[cfg(not(unix))]
+fn shell_command(command: &str) -> Command {
+    let mut builder = Command::new("cmd");
+    builder
+        .arg("/C")
+        .arg(command)
+        .envs(tool_runner_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    builder
+}
+
+#[cfg(unix)]
+fn mark_process_group(pid: u32) {
+    unsafe {
+        let _ = setpgid(pid as i32, pid as i32);
+    }
+}
+
+#[cfg(not(unix))]
+fn mark_process_group(_pid: u32) {}
+
+/// Kill the shell and (on unix) its whole process group so descendants do not
+/// outlive a cancel/timeout; Windows has no group kill, so just the shell.
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    unsafe {
+        let _ = kill(-(child.id() as i32), SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 /// `read` returns line-numbered content (right-aligned number + two-space gap
