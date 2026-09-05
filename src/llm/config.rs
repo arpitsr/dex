@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use crate::core::types::{ApiProtocol, PermissionMode, Provider};
 use crate::llm::provider::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL};
@@ -142,10 +143,46 @@ fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.dev.json"))
 }
 
+/// Parsed `models.dev.json` catalog, cached process-wide and invalidated by
+/// file identity (path + mtime + length). The catalog is 4+ MB and was
+/// re-parsed on every `LlmConfig::from_env` — i.e. on each TUI launch (via
+/// `/api/config`) and each chat turn (~180ms a pop). Cloning the cached
+/// value costs single-digit ms.
+struct CachedCatalog {
+    path: std::path::PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    value: serde_json::Value,
+}
+
+static CATALOG_CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
+
 fn load_dex_catalog() -> Option<serde_json::Value> {
     let path = dex_catalog_cache_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let meta = std::fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    if let Some(hit) = CATALOG_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
+    {
+        return Some(hit.value.clone());
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    CATALOG_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(CachedCatalog {
+            path,
+            mtime,
+            len,
+            value: value.clone(),
+        });
+    Some(value)
 }
 
 fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u64> {
@@ -393,7 +430,7 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut all: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let extra_headers = custom_headers_from_env();
+    let extra_headers = custom_headers_config_and_env();
     for id in fetch_provider_models(&client, provider, &base_url, &api_key, &extra_headers) {
         if seen.insert(id.clone()) {
             all.push(id);
@@ -531,7 +568,10 @@ pub(crate) fn permission_from_env() -> Result<PermissionMode, Box<dyn std::error
 /// `http_headers` shape) or `Name: Value` / `Name=Value` pairs separated by
 /// commas or newlines (Claude Code's `ANTHROPIC_CUSTOM_HEADERS` shape).
 /// Entries without a name, without a separator, or with an empty value are
-/// skipped; later entries win on duplicate names.
+/// skipped; later entries win on duplicate names (case-insensitive, last
+/// casing wins). `authorization` is dropped (the api key owns it) and a
+/// `{...}` value that isn't a JSON object falls back to pair parsing instead
+/// of silently yielding nothing.
 pub(crate) fn parse_headers_str(raw: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let trimmed = raw.trim();
@@ -555,17 +595,32 @@ pub(crate) fn parse_headers_str(raw: &str) -> BTreeMap<String, String> {
                 if val.is_empty() {
                     continue;
                 }
-                out.insert(name, val);
+                insert_extra_header(&mut out, &name, &val);
             }
+            return out;
         }
-        return out;
+        // Not a JSON object (`{bad`, a JSON array, …) — fall through to
+        // pair parsing instead of silently dropping everything. Outer braces
+        // are stripped so `{X-Foo: bar}` still yields `X-Foo`.
+    }
+    let mut body = trimmed;
+    if body.starts_with('{') {
+        body = body
+            .strip_prefix('{')
+            .unwrap_or(body)
+            .strip_suffix('}')
+            .unwrap_or(body)
+            .trim();
+        if body.is_empty() {
+            return out;
+        }
     }
     // Newline-separated values may themselves contain commas, so only split
     // on commas when the value is a single line.
-    let pieces: Vec<&str> = if trimmed.contains('\n') {
-        trimmed.split('\n').collect()
+    let pieces: Vec<&str> = if body.contains('\n') {
+        body.split('\n').collect()
     } else {
-        trimmed.split(',').collect()
+        body.split(',').collect()
     };
     for piece in pieces {
         let piece = piece.trim().trim_end_matches(',').trim();
@@ -578,10 +633,7 @@ pub(crate) fn parse_headers_str(raw: &str) -> BTreeMap<String, String> {
         };
         let name = name.trim().to_string();
         let value = value.trim().to_string();
-        if name.is_empty() || value.is_empty() {
-            continue;
-        }
-        out.insert(name, value);
+        insert_extra_header(&mut out, &name, &value);
     }
     out
 }
@@ -599,12 +651,29 @@ fn yaml_scalar_str(v: &serde_yaml::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn insert_config_header(out: &mut BTreeMap<String, String>, name: &str, value: &str) {
+/// Insert one header with case-insensitive "later wins" semantics: a later
+/// `x-foo` replaces an earlier `X-Foo` (last casing wins). Empty names/values
+/// and `authorization` (the api key owns that) are skipped so a bad entry
+/// can never poison the map — send-time filtering remains as defense in depth.
+pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str, value: &str) {
     let name = name.trim();
     let value = value.trim();
-    if !name.is_empty() && !value.is_empty() {
-        out.insert(name.to_string(), value.to_string());
+    if name.is_empty() || value.is_empty() {
+        return;
     }
+    if name.eq_ignore_ascii_case("authorization") {
+        return;
+    }
+    if let Some(existing) = out.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned() {
+        if existing != name {
+            out.remove(&existing);
+        }
+    }
+    out.insert(name.to_string(), value.to_string());
+}
+
+fn insert_config_header(out: &mut BTreeMap<String, String>, name: &str, value: &str) {
+    insert_extra_header(out, name, value);
 }
 
 fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml::Mapping) {
@@ -628,7 +697,7 @@ fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<S
         merge_config_headers_map(&mut out, map);
     } else if let Some(text) = value.as_str() {
         for (k, v) in parse_headers_str(text) {
-            out.insert(k, v);
+            insert_extra_header(&mut out, &k, &v);
         }
     } else if let Some(items) = value.as_sequence() {
         for item in items {
@@ -636,7 +705,7 @@ fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<S
                 merge_config_headers_map(&mut out, map);
             } else if let Some(text) = item.as_str() {
                 for (k, v) in parse_headers_str(text) {
-                    out.insert(k, v);
+                    insert_extra_header(&mut out, &k, &v);
                 }
             }
         }
@@ -649,7 +718,7 @@ fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<S
 fn load_config_headers(file: &Option<serde_yaml::Value>) -> BTreeMap<String, String> {
     let mut out = config_headers_map(file, "http_headers");
     for (k, v) in config_headers_map(file, "headers") {
-        out.insert(k, v);
+        insert_extra_header(&mut out, &k, &v);
     }
     out
 }
@@ -661,9 +730,19 @@ pub(crate) fn custom_headers_from_env() -> BTreeMap<String, String> {
     for key in ["ANTHROPIC_CUSTOM_HEADERS", "OPENAI_HEADERS", "DEX_HEADERS"] {
         if let Ok(raw) = env::var(key) {
             for (k, v) in parse_headers_str(&raw) {
-                out.insert(k, v);
+                insert_extra_header(&mut out, &k, &v);
             }
         }
+    }
+    out
+}
+
+/// Config-file + env headers (file < env), for paths without a full
+/// `LlmConfig` (e.g. the `/models` refresh). Case-insensitive later-wins.
+pub(crate) fn custom_headers_config_and_env() -> BTreeMap<String, String> {
+    let mut out = load_config_headers(&load_config_file());
+    for (k, v) in custom_headers_from_env() {
+        insert_extra_header(&mut out, &k, &v);
     }
     out
 }
@@ -716,11 +795,11 @@ impl LlmConfig {
         // Custom provider headers: config file < env < CLI flags.
         let mut extra_headers = load_config_headers(&file);
         for (k, v) in custom_headers_from_env() {
-            extra_headers.insert(k, v);
+            insert_extra_header(&mut extra_headers, &k, &v);
         }
         for raw in header_overrides {
             for (k, v) in parse_headers_str(raw) {
-                extra_headers.insert(k, v);
+                insert_extra_header(&mut extra_headers, &k, &v);
             }
         }
         let provider_name = env::var("DEX_PROVIDER")
@@ -1349,6 +1428,21 @@ pub(crate) mod tests {
         let messy = parse_headers_str("no-separator, : novalue, X-K: 1, X-K: 2");
         assert_eq!(messy.len(), 1);
         assert_eq!(messy.get("X-K").map(String::as_str), Some("2"));
+
+        // Case-insensitive duplicates collapse (last casing/value wins).
+        let ci = parse_headers_str("X-Foo: 1, x-foo: 2");
+        assert_eq!(ci.len(), 1);
+        assert_eq!(ci.get("x-foo").map(String::as_str), Some("2"));
+
+        // `authorization` never lands in the map (api key owns it).
+        assert!(parse_headers_str("Authorization: hacked").is_empty());
+        assert!(parse_headers_str(r#"{"authorization":"hacked"}"#).is_empty());
+
+        // A `{...}` value that isn't a JSON object falls back to pairs.
+        let fb = parse_headers_str("{bad json");
+        assert!(fb.is_empty(), "no separator means no pairs either");
+        let fb = parse_headers_str("{X-Foo: bar}");
+        assert_eq!(fb.get("X-Foo").map(String::as_str), Some("bar"));
     }
 
     #[test]

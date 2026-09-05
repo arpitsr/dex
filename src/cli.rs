@@ -62,6 +62,17 @@ pub(crate) fn parse_args() -> Args {
     let mut rest = Vec::new();
     let mut input = env::args().skip(1);
     while let Some(arg) = input.next() {
+        // Attached forms (`--header=X: Y`, `-HX: Y`) for parity with curl.
+        if let Some(value) = arg.strip_prefix("--header=") {
+            headers.push(value.to_string());
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-H") {
+            if !value.is_empty() {
+                headers.push(value.to_string());
+                continue;
+            }
+        }
         match arg.as_str() {
             "--base-url" => base_url = Some(required(&mut input, "--base-url")),
             "--model" => model = Some(required(&mut input, "--model")),

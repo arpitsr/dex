@@ -732,9 +732,12 @@ fn run_turn_inner(
     .map_err(|e| format!("failed to build config: {e}"))?;
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
+    // `insert_extra_header` drops empties + `authorization` and collapses
+    // case-insensitive duplicates, so the map stays clean (send-time
+    // filtering remains as defense in depth).
     if let Some(headers) = req.headers.as_ref() {
         for (k, v) in headers {
-            config.extra_headers.insert(k.clone(), v.clone());
+            crate::llm::config::insert_extra_header(&mut config.extra_headers, k, v);
         }
     }
     // Persist provider/model overrides so /resume restores the same provider/base_url without env
@@ -1259,11 +1262,33 @@ async fn reattach(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ReattachResponse>, StatusCode> {
-    let mut sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = sessions
-        .get(&session_id)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let entry = {
+        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(&session_id).cloned()
+    };
+    let entry = match entry {
+        Some(entry) => entry,
+        // The startup rebuild runs in the background for fast boot; a
+        // reattach racing it falls back to a one-shot disk lookup for this id.
+        None => {
+            let (path, header) = session::Session::list_all()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(_, header)| header.id() == session_id.as_str())
+                .ok_or(StatusCode::NOT_FOUND)?;
+            let entry = SessionEntry {
+                path: path.clone(),
+                name: header.name().map(ToOwned::to_owned),
+                cwd: header.cwd().to_string(),
+            };
+            state
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.clone(), entry.clone());
+            entry
+        }
+    };
     if !entry.path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1271,14 +1296,6 @@ async fn reattach(
     // Prune stale idempotency-recorded seq: reattach hands the client the
     // cursor to resume from.
     let seq = Session::max_event_seq(&entry.path);
-    sessions.insert(
-        session_id.clone(),
-        SessionEntry {
-            path: entry.path.clone(),
-            name: entry.name,
-            cwd: entry.cwd,
-        },
-    );
     Ok(Json(ReattachResponse {
         session_id: session_id.clone(),
         seq,
