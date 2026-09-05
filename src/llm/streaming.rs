@@ -36,7 +36,7 @@ pub(crate) fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
 /// `config.api`); otherwise a learned fallback overrides the configured
 /// default (`openai-responses`).
 fn effective_api(config: &LlmConfig) -> ApiProtocol {
-    if crate::llm::config::api_pinned()
+    if crate::llm::config::api_pinned(Some(config.provider.name()))
         || crate::llm::config::model_api_from_env(&config.model, &config.model).is_some()
     {
         return config.api;
@@ -53,7 +53,7 @@ fn effective_api(config: &LlmConfig) -> ApiProtocol {
 /// chat-completions? Only when nothing explicitly pinned the protocol, the
 /// provider exposes both wire shapes, and the failure isn't a cancellation.
 fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
-    if crate::llm::config::api_pinned() {
+    if crate::llm::config::api_pinned(Some(config.provider.name())) {
         return false; // user pinned one protocol for everything
     }
     if crate::llm::config::model_api_from_env(&config.model, &config.model).is_some() {

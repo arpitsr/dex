@@ -441,7 +441,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         _ if line.starts_with("/model ") => {
             let m = line["/model ".len()..].trim().to_string();
             if !m.is_empty() {
-                let old_provider = app.config.provider;
+                let old_provider = app.config.provider.clone();
                 let endpoint = app.config.apply_model(&m, true);
                 if !app
                     .config
@@ -462,26 +462,33 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 } else {
                     String::new()
                 };
+                // Surface the thinking knob when the picked model advertises
+                // reasoning options (models.dev reasoning_options).
+                let thinking_suffix = crate::llm::config::reasoning_options_for(&app.config.model)
+                    .map(|options| format!(" (thinking: {})", options.join(", ")))
+                    .unwrap_or_default();
                 match endpoint {
                     Some(name) => push_info(
                         app,
                         format!(
-                            "switched to model: {} @ {} ({}, {}){}",
+                            "switched to model: {} @ {} ({}, {}){}{}",
                             app.config.model,
                             name,
                             app.config.base_url,
                             app.config.api.name(),
-                            provider_suffix
+                            provider_suffix,
+                            thinking_suffix
                         ),
                     ),
                     None => push_info(
                         app,
                         format!(
-                            "switched to model: {} ({}, {}){}",
+                            "switched to model: {} ({}, {}){}{}",
                             app.config.model,
                             app.config.api.name(),
                             app.config.base_url,
-                            provider_suffix
+                            provider_suffix,
+                            thinking_suffix
                         ),
                     ),
                 }
@@ -489,21 +496,28 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         }
         _ if line.starts_with("/provider ") => {
             let name = line["/provider ".len()..].trim();
-            match Provider::parse(name) {
-                Ok(provider) if provider == app.config.provider => {
+            let known: std::collections::BTreeSet<String> =
+                app.config.provider_entries.keys().cloned().collect();
+            match Provider::parse_known(name, &known) {
+                Some(provider) if provider == app.config.provider => {
                     push_info(
                         app,
                         format!("provider already selected: {}", provider.name()),
                     );
                 }
-                Ok(provider) => match app.config.switch_provider(provider, true) {
+                Some(provider) => match app.config.switch_provider(&provider, true) {
                     Ok(()) => {
                         let _ = app.session.set_state("provider", provider.name());
                         push_info(app, format!("switched to provider: {}", provider.name()));
                     }
                     Err(error) => push_info(app, format!("could not switch provider: {}", error)),
                 },
-                Err(error) => push_info(app, error),
+                None => push_info(
+                    app,
+                    format!(
+                        "unknown provider: {name}; use opencode, openai-codex or a providers: entry"
+                    ),
+                ),
             }
         }
         _ => push_info(app, format!("unknown command: {}", line)),
@@ -527,9 +541,11 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
         Err(_) => return,
     };
     if let Some(name) = state.get("provider") {
-        match Provider::parse(name) {
-            Ok(provider) if provider != app.config.provider => {
-                match app.config.switch_provider(provider, false) {
+        let known: std::collections::BTreeSet<String> =
+            app.config.provider_entries.keys().cloned().collect();
+        match Provider::parse_known(name, &known) {
+            Some(provider) if provider != app.config.provider => {
+                match app.config.switch_provider(&provider, false) {
                     Ok(()) => push_info(app, format!("restored provider: {}", provider.name())),
                     Err(error) => push_info(
                         app,

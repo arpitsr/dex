@@ -1352,6 +1352,7 @@ mod tests {
                 permission: PermissionMode::Trusted,
                 verify_command: None,
                 extra_headers: Default::default(),
+                provider_entries: Default::default(),
                 client: reqwest::blocking::Client::new(),
             },
             messages: Vec::new(),

@@ -128,7 +128,11 @@ fn post_with_retry(
                 && active_config.provider.credentials_refreshable()
                 && attempt < MAX_RETRIES
             {
-                if let Ok((token, account)) = active_config.provider.load_credentials(None) {
+                if let Ok((token, account)) = crate::llm::config::resolve_credentials(
+                    &active_config.provider,
+                    &active_config.provider_entries,
+                    None,
+                ) {
                     active_config.api_key = token;
                     active_config.account_id = account;
                     continue;
@@ -151,7 +155,7 @@ fn post_with_retry(
             // nothing about the protocol, and a pinned `api:` means the user
             // already decided.
             if url.ends_with("/responses")
-                && !crate::llm::config::api_pinned()
+                && !crate::llm::config::api_pinned(Some(config.provider.name()))
                 && (status == reqwest::StatusCode::NOT_FOUND || status.is_server_error())
             {
                 return Err(format!(
