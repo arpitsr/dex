@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,8 +52,14 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+async fn health(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
+    // `rebuild_complete` is false while the background startup scan is still
+    // merging the disk registry; clients hitting 404s mid-window should
+    // retry rather than treat the session as gone.
+    Json(json!({
+        "status": "ok",
+        "rebuild_complete": state.rebuild_complete.load(Ordering::Relaxed),
+    }))
 }
 
 /// Best-effort runtime info so remote clients can render the same status
@@ -341,11 +348,9 @@ async fn chat(
     // Reject concurrent turns on the same session up front so the
     // append-only session log stays consistent. A replay must not hold the
     // active-turn slot, so it is checked before registration.
-    {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if !sessions.contains_key(&session_id) {
-            return Err(StatusCode::NOT_FOUND);
-        }
+    // Disk fallback: the session may predate the background rebuild scan.
+    if lookup_entry(&state, &session_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
     }
     // Pre-create per-turn channels so `POST /steer` / `POST /followup`
     // have a target as soon as the turn is registered (avoids a race where
@@ -1171,11 +1176,9 @@ async fn steer(
         return Err(StatusCode::BAD_REQUEST);
     }
     // Session must exist; steering only valid while a turn is active.
-    {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if !sessions.contains_key(&session_id) {
-            return Err(StatusCode::NOT_FOUND);
-        }
+    // Disk fallback: the session may predate the background rebuild scan.
+    if lookup_entry(&state, &session_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
     }
     let tx = {
         let map = state.steering_txs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1195,11 +1198,9 @@ async fn followup(
     if content.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if !sessions.contains_key(&session_id) {
-            return Err(StatusCode::NOT_FOUND);
-        }
+    // Disk fallback: the session may predate the background rebuild scan.
+    if lookup_entry(&state, &session_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
     }
     let tx = {
         let map = state.followup_txs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1210,17 +1211,44 @@ async fn followup(
     Ok(Json(json!({ "status": "ok" })))
 }
 
-/// Resolve a session file path from the registry, or 404.
-fn session_path(
-    state: &Arc<DaemonState>,
-    session_id: &str,
-) -> Result<std::path::PathBuf, StatusCode> {
-    state
+/// Registry lookup with a one-shot disk fallback: the startup rebuild runs
+/// in the background, so an id missing from the registry may simply not have
+/// been scanned yet. A disk hit is registered (live entries win over the
+/// later rebuild merge via `or_insert`) so subsequent lookups stay in-memory.
+fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
+    if let Some(entry) = state
         .sessions
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(session_id)
-        .map(|e| e.path.clone())
+        .cloned()
+    {
+        return Some(entry);
+    }
+    let (path, header) = session::Session::list_all()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(_, header)| header.id() == session_id)?;
+    let entry = SessionEntry {
+        path: path.clone(),
+        name: header.name().map(ToOwned::to_owned),
+        cwd: header.cwd().to_string(),
+    };
+    state
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id.to_string(), entry.clone());
+    Some(entry)
+}
+
+/// Resolve a session file path from the registry (with disk fallback), or 404.
+fn session_path(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<std::path::PathBuf, StatusCode> {
+    lookup_entry(state, session_id)
+        .map(|e| e.path)
         .filter(|p| p.exists())
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -1262,40 +1290,14 @@ async fn reattach(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ReattachResponse>, StatusCode> {
-    let entry = {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.get(&session_id).cloned()
-    };
-    let entry = match entry {
-        Some(entry) => entry,
-        // The startup rebuild runs in the background for fast boot; a
-        // reattach racing it falls back to a one-shot disk lookup for this id.
-        None => {
-            let (path, header) = session::Session::list_all()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|(_, header)| header.id() == session_id.as_str())
-                .ok_or(StatusCode::NOT_FOUND)?;
-            let entry = SessionEntry {
-                path: path.clone(),
-                name: header.name().map(ToOwned::to_owned),
-                cwd: header.cwd().to_string(),
-            };
-            state
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), entry.clone());
-            entry
-        }
-    };
+    let entry = lookup_entry(&state, &session_id).ok_or(StatusCode::NOT_FOUND)?;
     if !entry.path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
     state.seed_seq(&session_id, &entry.path);
     // Prune stale idempotency-recorded seq: reattach hands the client the
     // cursor to resume from.
-    let seq = Session::max_event_seq(&entry.path);
+    let seq = Session::max_event_seq(&entry.path).unwrap_or(0);
     Ok(Json(ReattachResponse {
         session_id: session_id.clone(),
         seq,

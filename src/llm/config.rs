@@ -146,18 +146,18 @@ fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
 /// Parsed `models.dev.json` catalog, cached process-wide and invalidated by
 /// file identity (path + mtime + length). The catalog is 4+ MB and was
 /// re-parsed on every `LlmConfig::from_env` — i.e. on each TUI launch (via
-/// `/api/config`) and each chat turn (~180ms a pop). Cloning the cached
-/// value costs single-digit ms.
+/// `/api/config`) and each chat turn (~180ms a pop). Shared through an `Arc`
+/// so cache hits are an atomic bump, not a deep clone of the whole tree.
 struct CachedCatalog {
     path: std::path::PathBuf,
     mtime: SystemTime,
     len: u64,
-    value: serde_json::Value,
+    value: std::sync::Arc<serde_json::Value>,
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
 
-fn load_dex_catalog() -> Option<serde_json::Value> {
+fn load_dex_catalog() -> Option<std::sync::Arc<serde_json::Value>> {
     let path = dex_catalog_cache_path()?;
     let meta = std::fs::metadata(&path).ok()?;
     let (mtime, len) = (meta.modified().ok()?, meta.len());
@@ -171,7 +171,8 @@ fn load_dex_catalog() -> Option<serde_json::Value> {
         return Some(hit.value.clone());
     }
     let text = std::fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let value: std::sync::Arc<serde_json::Value> =
+        std::sync::Arc::new(serde_json::from_str(&text).ok()?);
     CATALOG_CACHE
         .get_or_init(|| Mutex::new(None))
         .lock()
