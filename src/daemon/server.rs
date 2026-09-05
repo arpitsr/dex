@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -26,7 +26,7 @@ use crate::protocol::{
     StreamEvent,
 };
 use crate::session::{self, Session};
-use crate::skills::{discover_skills, skill_dirs};
+use crate::skills::{discover_skills, discover_skills_fresh, skill_dirs};
 
 use super::{DaemonState, PendingApproval, SessionEntry};
 
@@ -64,11 +64,51 @@ async fn health(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value
 
 /// Best-effort runtime info so remote clients can render the same status
 /// footer as the local TUI. Resolved from the daemon's own environment.
+fn cached_git_context(cwd: &str) -> (Option<String>, bool) {
+    // `git branch` + `git status` spawn two processes (~10-30ms); `/api/config`
+    // runs on every TUI launch, and branch/dirty barely move within seconds.
+    struct Entry {
+        at: Instant,
+        branch: Option<String>,
+        dirty: bool,
+    }
+    // Keyed by cwd (not single-entry): the daemon reports its own cwd today,
+    // but a per-session cwd must not evict another session's entry.
+    // Best-effort cache — cleared (not LRU'd) past the cap.
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Entry>>> = OnceLock::new();
+    if let Some(hit) = CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(cwd)
+        .filter(|e| e.at.elapsed() < Duration::from_secs(5))
+    {
+        return (hit.branch.clone(), hit.dirty);
+    }
+    let (branch, dirty) = git_context(cwd);
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 32 {
+        cache.clear();
+    }
+    cache.insert(
+        cwd.to_string(),
+        Entry {
+            at: Instant::now(),
+            branch: branch.clone(),
+            dirty,
+        },
+    );
+    (branch, dirty)
+}
+
 fn resolve_daemon_info() -> DaemonInfo {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (git_branch, git_dirty) = git_context(&cwd);
+    let (git_branch, git_dirty) = cached_git_context(&cwd);
     match LlmConfig::from_env(None, None, None, &[]) {
         Ok(config) => DaemonInfo {
             provider: config.provider.name().to_string(),
@@ -177,7 +217,9 @@ async fn load_skill(
     let (skill, content) = tokio::task::spawn_blocking(move || {
         let mut dirs = skill_dirs();
         dirs.extend(extra_dirs.iter().map(std::path::PathBuf::from));
-        let skills = discover_skills(&dirs);
+        // Explicit user load: bypass the discovery cache so a just-added
+        // skill resolves immediately.
+        let skills = discover_skills_fresh(&dirs);
         let skill = skills.into_iter().find(|s| s.name == skill_name)?;
         let content = std::fs::read_to_string(&skill.path).ok()?;
         Some((skill, content))

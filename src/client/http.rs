@@ -1,4 +1,5 @@
 use std::io::{self, BufRead};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::protocol::{
@@ -31,12 +32,34 @@ pub(crate) struct DaemonClient {
     http: reqwest::blocking::Client,
 }
 
+/// Process-wide shared blocking client. `Client::new()` initializes a TLS
+/// backend + connection pool (~tens of ms); the TUI used to build one per
+/// `DaemonClient` plus one per display config. Clones are an atomic bump.
+///
+/// Timeout note: previously each `DaemonClient` built `Client::new()` with no
+/// timeouts (a hung daemon hung the TUI forever); the shared client sets a
+/// 10s connect / 300s per-read timeout instead. `wait_until_ready` still
+/// overrides to 2s per poll.
+static SHARED_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+pub(crate) fn shared_blocking_client() -> reqwest::blocking::Client {
+    SHARED_CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(300))
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        })
+        .clone()
+}
+
 impl DaemonClient {
     pub fn new(base_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let base_url = base_url.trim_end_matches('/').to_string();
         Ok(Self {
             base_url,
-            http: reqwest::blocking::Client::new(),
+            http: shared_blocking_client(),
         })
     }
 
