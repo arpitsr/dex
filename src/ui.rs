@@ -338,10 +338,11 @@ struct TerminalCleanup;
 
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        use crossterm::event::DisableMouseCapture;
+        use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::LeaveAlternateScreen,
+            DisableBracketedPaste,
             DisableMouseCapture
         );
         let _ = crossterm::terminal::disable_raw_mode();

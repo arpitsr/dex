@@ -5,8 +5,8 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -378,7 +378,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         stdout,
         DisableMouseCapture,
         EnterAlternateScreen,
-        EnableMouseScroll
+        EnableMouseScroll,
+        // DECSET 2004: the terminal wraps pastes in `ESC[200~ … ESC[201~` so
+        // crossterm delivers them as one `Event::Paste`. Without it a paste is
+        // typed through as individual keys and every embedded newline arrives
+        // as a real Enter — submitting the first line of a multi-line paste.
+        EnableBracketedPaste
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -452,21 +457,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                     handle_key(&mut remote, key);
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut remote, mouse),
-                Event::Paste(s) => {
-                    // Tabs would render as tab stops and desync the frame;
-                    // expand them and drop other control characters.
-                    for c in s.chars() {
-                        match c {
-                            '\t' => {
-                                for _ in 0..4 {
-                                    remote.app.input.insert_char(' ');
-                                }
-                            }
-                            c if !c.is_control() => remote.app.input.insert_char(c),
-                            _ => {}
-                        }
-                    }
-                }
+                Event::Paste(s) => remote.app.input.insert_paste(&s),
                 Event::Resize(..) => {} // frame recomputed each draw
                 _ => {}
             }
@@ -483,7 +474,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let res = run();
     // Always restore the terminal, even if the loop returned early via `?`.
     disable_raw_mode().ok();
-    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     res
 }
 
