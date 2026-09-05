@@ -70,6 +70,40 @@ struct RemoteApp {
     /// Last left press (time, transcript cell, consecutive-click count) for
     /// double-/triple-click detection; the count caps at 3.
     last_click: Option<(Instant, (usize, usize), u8)>,
+    /// Last footer git poll; gates `GET /api/git` so the branch/dirty badge
+    /// refreshes without spawning `git` (or an HTTP RTT) every frame.
+    last_git_check: Instant,
+}
+
+/// How often an idle TUI re-polls `GET /api/git` for the footer. The daemon
+/// caches branch/dirty for 5s, so a 2s poll costs at most one `git` spawn
+/// per 5s — cheap enough to catch an external `git checkout` within seconds
+/// without the per-frame (~10-30ms) cost of `git branch + git status`.
+const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Best-effort footer refresh from the daemon; returns true when the badge
+/// visibly changed. Failures are ignored — the next interval retries.
+fn poll_git_status(remote: &mut RemoteApp) -> bool {
+    let Ok(info) = remote.client.get_git() else {
+        return false;
+    };
+    let changed =
+        remote.app.git_branch != info.git_branch || remote.app.git_dirty != info.git_dirty;
+    if changed {
+        remote.app.git_branch = info.git_branch;
+        remote.app.git_dirty = info.git_dirty;
+    }
+    changed
+}
+
+/// Throttled poll for the main loop; resets the clock even on failure so a
+/// down daemon does not turn into a per-frame retry storm.
+fn poll_git_status_if_due(remote: &mut RemoteApp) -> bool {
+    if remote.last_git_check.elapsed() < GIT_REFRESH_INTERVAL {
+        return false;
+    }
+    remote.last_git_check = Instant::now();
+    poll_git_status(remote)
 }
 
 /// Build a display-only config from the daemon's reported runtime info. The
@@ -93,7 +127,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         endpoints: provider.endpoints(),
         api: ApiProtocol::parse(&info.api).unwrap_or(ApiProtocol::Responses),
         account_id: None,
-        thinking_effort: None,
+        thinking_effort: info.thinking_effort.clone(),
         context_window: info.context_window,
         reserve_tokens: 16_384,
         keep_recent_tokens: 20_000,
@@ -318,6 +352,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         decision_tx,
         cancel_flag,
         last_click: None,
+        // Just seeded from `GET /api/config` above; don't re-poll on the
+        // first idle tick.
+        last_git_check: Instant::now(),
     };
     if !is_reattach {
         // Keep the local placeholder's display name in sync with the daemon
@@ -364,6 +401,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         &mut remote.app,
         launch_time_line(launch_start.elapsed().as_secs_f64()),
     );
+    // A mismatched `thinking_effort:` (config.yaml names a level the model
+    // doesn't advertise) used to `eprintln!` from the daemon thread here —
+    // mid OSC theme query / alternate screen — corrupting the display and
+    // leaking into the composer. It now arrives as data and renders as a
+    // transcript line inside the TUI.
+    if let Some(warning) = info.thinking_warning.clone() {
+        push_info(&mut remote.app, format!("dex: {warning}"));
+    }
 
     enable_raw_mode()?;
     // No startup drain here: a blind deadline cuts OSC reply bursts in half
@@ -434,6 +479,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             let busy = remote.app.busy;
             // An expired status notice needs one more frame to disappear.
             if remote.app.tick_notice() {
+                dirty = true;
+            }
+            // Footer branch/dirty goes stale when the workspace moves under us
+            // (`git checkout` in another terminal, or the agent's own bash/git
+            // tools). Poll while idle only — mid-turn streaming already redraws
+            // at animation rate, and the turn-end refresh below catches tool
+            // mutations — so the poll never hitches a streamed turn.
+            if !busy && poll_git_status_if_due(&mut remote) {
                 dirty = true;
             }
             // Animation heartbeat while a turn runs: at most ~8 fps, and
@@ -847,6 +900,13 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
             super::format_tokens(tokens)
         ));
     }
+    // Tools (bash/git/write/edit) may have switched branches or dirtied the
+    // tree mid-turn; refresh the footer now rather than waiting for the next
+    // idle interval. Best-effort and throttled by the daemon's 5s git cache,
+    // so a fast turn that lands inside the cache window still converges on
+    // the following idle poll.
+    remote.last_git_check = Instant::now();
+    poll_git_status(remote);
 }
 
 /// How long to hold a suspicious char run while waiting for the rest of an

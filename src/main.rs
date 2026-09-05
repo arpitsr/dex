@@ -33,6 +33,10 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         args.permission,
         &args.headers,
     )?;
+    // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
+    if let Some(warning) = config.thinking_mismatch_warning() {
+        eprintln!("dex: {warning}");
+    }
     // Verification opt-in only — see daemon/server.rs.
     if config.verify_command.is_none() && std::env::var("DEX_VERIFY").as_deref() == Ok("1") {
         config.verify_command = crate::llm::config::detect_verify_command();
