@@ -86,16 +86,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Set up cross toolchain (Linux musl via zig)
+      - name: Install zig (Linux musl cross-linker)
         if: matrix.cross
-        uses: taiki-e/setup-cross-toolchain-action@v1
+        uses: mlugg/setup-zig@v1
         with:
-          target: ${{ matrix.target }}
+          version: 0.13.0
       - name: Install cargo-zigbuild (Linux)
         if: matrix.cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+      - name: Install qemu-user-static (Linux)
+        if: matrix.cross
+        run: sudo apt-get -y -q install qemu-user-static
       - name: Build
         shell: bash
         run: |
@@ -109,7 +110,11 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/dex"
           [ -f "$bin.exe" ] && bin="$bin.exe"
-          "$bin" --version
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            qemu-aarch64-static "$bin" --version
+          else
+            "$bin" --version
+          fi
       - name: Package
         shell: bash
         run: |
