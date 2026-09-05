@@ -23,7 +23,7 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 /// survive the `/model` write-back. Missing/invalid file → None (env rules).
 /// Cached process-wide and invalidated by file identity (path + mtime +
 /// length): `from_env` runs per chat turn on the daemon, and each call was
-/// re-reading + re-parsing the file (plus once more via `api_pinned`).
+/// re-reading + re-parsing the file.
 struct CachedConfigFile {
     path: std::path::PathBuf,
     mtime: SystemTime,
@@ -83,16 +83,22 @@ fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String
         .filter(|s| !s.is_empty())
 }
 
-/// A configured generic provider (`providers:` map in config.yaml): the
-/// deposit place for that provider's API key plus optional overrides.
-/// Endpoint, models, pricing, context windows and reasoning options come
-/// from the models.dev catalog entry of the same key; the wire protocol is
-/// learned empirically unless pinned here.
+/// A configured provider (`providers:` map in config.yaml): the deposit
+/// place for that provider's API key plus optional overrides. Endpoint,
+/// models, pricing, context windows and reasoning options come from the
+/// models.dev catalog entry of the same key; the wire protocol is learned
+/// empirically unless pinned here. Applies to builtins too
+/// (`providers.opencode.api_key` beats the env var).
 #[derive(Clone, Default)]
 pub(crate) struct ProviderEntry {
     pub(crate) api_key: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) api: Option<ApiProtocol>,
+    /// Extra headers sent only to this provider (gateway auth, routing,
+    /// attribution). Same shapes as the global `headers:` key (mapping,
+    /// text block, or list); merged under the global/env/CLI extras, which
+    /// win on collision.
+    pub(crate) headers: BTreeMap<String, String>,
 }
 
 fn load_provider_entries(file: &Option<serde_yaml::Value>) -> BTreeMap<String, ProviderEntry> {
@@ -121,10 +127,18 @@ fn load_provider_entries(file: &Option<serde_yaml::Value>) -> BTreeMap<String, P
                 api: load_config_str(&entry, "api")
                     .as_deref()
                     .and_then(ApiProtocol::parse),
+                headers: config_headers_map(&entry, "headers"),
             },
         );
     }
     out
+}
+
+/// Names of configured generic providers — the extra vocabulary accepted
+/// wherever a provider name routes (`/model` + `/provider` prefixes,
+/// `parse_known`).
+fn known_providers(entries: &BTreeMap<String, ProviderEntry>) -> BTreeSet<String> {
+    entries.keys().cloned().collect()
 }
 
 /// Catalog `api` URL for a provider key ("zai" → its serving endpoint).
@@ -139,15 +153,20 @@ fn catalog_api(key: &str, catalog: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The provider's own conventional API-key env var (first key of the catalog
-/// `env` map: ZHIPU_API_KEY, OPENROUTER_API_KEY, …), so deposits work with
-/// the names each provider already documents instead of dex-invented ones.
-fn catalog_env_var(key: &str, catalog: &serde_json::Value) -> Option<String> {
-    catalog
+/// Every documented API-key env var for a provider (all keys of the catalog
+/// `env` map: e.g. ZHIPU_API_KEY, OPENROUTER_API_KEY, …), sorted so the
+/// resolution order never depends on JSON key order. Tried in order — a
+/// provider documenting several names accepts any of them.
+fn catalog_env_vars(key: &str, catalog: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = catalog
         .get(key)
         .and_then(|e| e.get("env"))
         .and_then(|v| v.as_object())
-        .and_then(|m| m.keys().next().cloned())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Landing base URL when nothing explicit is set: the builtin default, or
@@ -180,10 +199,47 @@ fn endpoints_for(
     out
 }
 
+/// Everything about the active provider derived in one place from the
+/// `providers:` map + models.dev catalog. Callers read the fields instead
+/// of re-deriving them, so a new provider-scoped concern (a compat flag,
+/// a credential flavor, …) is one field here + one line in
+/// `resolve_provider` — never a new `(provider, entries)` parameter pair
+/// threaded through callers.
+#[derive(Clone, Default)]
+pub(crate) struct ResolvedProvider {
+    /// Fallback endpoint when nothing explicit is set (builtin default, or
+    /// the entry override > catalog `api` URL for generics). `None` means
+    /// the provider has no known endpoint — callers fail loudly instead of
+    /// pointing requests at "".
+    pub(crate) landing: Option<String>,
+    /// Named endpoints offered to `/model` routing.
+    pub(crate) endpoints: BTreeMap<String, String>,
+    /// The entry's `api:` protocol pin, if any.
+    pub(crate) api_pin: Option<ApiProtocol>,
+    /// The entry's provider-scoped `headers:`.
+    pub(crate) headers: BTreeMap<String, String>,
+}
+
+/// Derive the active provider's runtime view. Infallible by design: a
+/// missing landing is `None` (the caller decides whether an explicit
+/// `base_url` already covers it), never a silent empty string.
+fn resolve_provider(
+    provider: &Provider,
+    entries: &BTreeMap<String, ProviderEntry>,
+) -> ResolvedProvider {
+    let entry = entries.get(provider.name());
+    ResolvedProvider {
+        landing: landing_base_url_for(provider, entries),
+        endpoints: endpoints_for(provider, entries),
+        api_pin: entry.and_then(|e| e.api),
+        headers: entry.map(|e| e.headers.clone()).unwrap_or_default(),
+    }
+}
+
 /// Per-provider credentials — the uniform deposit order for every provider
 /// except codex (which reads its own credential file):
 /// 1. `providers.<name>.api_key` in config.yaml,
-/// 2. the provider's own conventional env var from the catalog `env` map
+/// 2. the provider's own conventional env vars from the catalog `env` map
 ///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …).
 ///
 /// Then a loud error naming the deposit places.
@@ -202,17 +258,16 @@ pub(crate) fn resolve_credentials(
     {
         return Ok((key, None));
     }
-    // The provider's own documented env var; for opencode it is hardcoded
-    // too so the name works cache-less (the catalog is just the source).
+    // The provider's own documented env vars; for opencode the canonical
+    // name is hardcoded too so it works cache-less (the catalog is just
+    // the source for every other provider).
     let mut env_names: Vec<String> = load_dex_catalog()
-        .and_then(|c| catalog_env_var(name, &c))
-        .into_iter()
-        .collect();
-    if matches!(provider, Provider::OpenCode) {
-        env_names.push("OPENCODE_API_KEY".to_string());
+        .map(|c| catalog_env_vars(name, &c))
+        .unwrap_or_default();
+    if matches!(provider, Provider::OpenCode) && !env_names.iter().any(|v| v == "OPENCODE_API_KEY")
+    {
+        env_names.insert(0, "OPENCODE_API_KEY".to_string());
     }
-    env_names.sort();
-    env_names.dedup();
     for var in &env_names {
         if let Ok(key) = env::var(var) {
             if !key.trim().is_empty() {
@@ -222,37 +277,14 @@ pub(crate) fn resolve_credentials(
     }
     Err(format!(
         "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
-        env_names
-            .first()
-            .map(|v| format!(" or export {v}"))
-            .unwrap_or_else(|| {
-                " or export the provider's key env var (run `dex update --models` to learn its name)"
-                    .to_string()
-            })
+        if env_names.is_empty() {
+            " or export the provider's key env var (run `dex update --models` to learn its name)"
+                .to_string()
+        } else {
+            format!(" or export {}", env_names.join(", "))
+        }
     )
     .into())
-}
-
-/// True when the user explicitly pinned the wire protocol: the `OPENAI_API`
-/// env var or an `api:` key in config.yaml. Per-model `DEX_MODEL_APIS`
-/// entries don't count — they decide per model, but empirical fallback stays
-/// available for unlisted models.
-pub(crate) fn api_pinned(active_provider: Option<&str>) -> bool {
-    if env::var("OPENAI_API").is_ok() {
-        return true;
-    }
-    let file = load_config_file();
-    if load_config_str(&file, "api").is_some() {
-        return true;
-    }
-    active_provider
-        .and_then(|name| {
-            load_provider_entries(&file)
-                .get(name.to_ascii_lowercase().as_str())
-                .cloned()
-        })
-        .and_then(|e| e.api)
-        .is_some()
 }
 
 /// Persisted wire protocols learned empirically at runtime
@@ -351,7 +383,8 @@ pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol
 }
 
 /// Write a model/provider selection back to the config file: `model:` keeps
-/// the raw selection (endpoint prefixes like `go/…` re-route on restart),
+/// the stripped id (prefixes are re-derived, never stored, so a pinned
+/// `base_url:` on the next load can't trap a `go/…` prefix verbatim),
 /// `provider:`/`base_url:` the resolved values. Everything else (api_key,
 /// api, comments excepted) is preserved verbatim. Best-effort: a read-only
 /// or missing file silently skips the write.
@@ -746,9 +779,8 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
             let mut ids: Vec<String> = Vec::new();
             // Endpoint-qualified prefixes: builtins map to their named
             // endpoints, configured generic providers to their own name.
-            let configured: BTreeMap<String, String> = load_provider_entries(&load_config_file())
+            let configured: BTreeSet<String> = load_provider_entries(&load_config_file())
                 .into_keys()
-                .map(|n| (n.clone(), n))
                 .collect();
             for (prov_key, entry) in providers {
                 if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
@@ -756,7 +788,7 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
                         "opencode" => Some("zen".to_string()),
                         "opencode-go" => Some("go".to_string()),
                         "openai-codex" | "codex" => Some("openai-codex".to_string()),
-                        other => configured.get(other).cloned(),
+                        other => configured.contains(other).then(|| other.to_string()),
                     };
                     for id in models.keys() {
                         ids.push(id.clone());
@@ -983,15 +1015,11 @@ pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str
     out.insert(name.to_string(), value.to_string());
 }
 
-fn insert_config_header(out: &mut BTreeMap<String, String>, name: &str, value: &str) {
-    insert_extra_header(out, name, value);
-}
-
 fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml::Mapping) {
     for (k, v) in map {
         let name = k.as_str().unwrap_or_default();
         if let Some(val) = yaml_scalar_str(v) {
-            insert_config_header(out, name, &val);
+            insert_extra_header(out, name, &val);
         }
     }
 }
@@ -1059,7 +1087,16 @@ pub(crate) struct LlmConfig {
     /// Configured generic providers (`providers:` map): the deposit place for
     /// per-provider keys plus optional base_url/`api:` overrides.
     pub(crate) provider_entries: BTreeMap<String, ProviderEntry>,
+    /// The active provider's scoped `headers:`, refreshed on every provider
+    /// switch. Applied under the global/env/CLI extras, which win.
+    pub(crate) provider_headers: BTreeMap<String, String>,
     pub(crate) api: ApiProtocol,
+    /// True when the user pinned the wire protocol globally: a top-level
+    /// file `api:` or the active provider's entry `api:`. Baked once in
+    /// `from_env` so hot paths (`streaming`, `client`) never re-read the
+    /// file. Per-model `DEX_MODEL_APIS` entries don't count — they decide
+    /// per model, but empirical fallback stays available for unlisted models.
+    pub(crate) api_pinned: bool,
     pub(crate) account_id: Option<String>,
     pub(crate) thinking_effort: Option<String>,
     /// Model context window size in tokens (used for compaction + status bar).
@@ -1111,14 +1148,16 @@ impl LlmConfig {
             .or_else(|| load_config_str(&file, "provider"))
             .unwrap_or_else(|| "opencode".to_string());
         let provider_entries = load_provider_entries(&file);
-        let known: BTreeSet<String> = provider_entries.keys().cloned().collect();
+        let known = known_providers(&provider_entries);
         let provider = Provider::parse_known(&provider_name, &known).ok_or_else(|| {
             format!(
                 "unsupported provider '{provider_name}'; use opencode, openai-codex or a providers: entry"
             )
         })?;
+        // Model is a selection, not a provider property: `--model`, the
+        // file `model:`, or the builtin default. No env override — env
+        // cannot name a provider-qualified pick coherently.
         let model = model_override
-            .or_else(|| env::var("OPENAI_MODEL").ok())
             .or_else(|| load_config_str(&file, "model"))
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let mut available_models = env::var("DEX_MODELS")
@@ -1132,41 +1171,32 @@ impl LlmConfig {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
         let file_base_url = load_config_str(&file, "base_url");
-        // Any explicit base_url (CLI flag, OPENAI_BASE_URL, file `base_url:`)
-        // pins the endpoint — routing may not silently rewire what the user
-        // set. Only the fallback default (nothing set anywhere) routes.
-        let explicit_base_url =
-            base_url_override.is_some() || env_base_url.is_some() || file_base_url.is_some();
-        // Landing endpoint for a bare first pick: builtin default, or for a
-        // generic provider its config entry / catalog `api` URL. An empty
-        // landing means the generic provider has no known endpoint — fail
-        // loudly instead of pointing requests at "".
-        let landing = landing_base_url_for(&provider, &provider_entries);
+        // An explicit base_url (`--base-url`, file `base_url:`) pins the
+        // endpoint — routing may not silently rewire what the user set.
+        // Only the fallback default (nothing set anywhere) routes.
+        let explicit_base_url = base_url_override.is_some() || file_base_url.is_some();
+        // One derivation for everything provider-scoped; an explicit
+        // base_url (CLI/file) pins the endpoint and covers a missing
+        // landing, otherwise the landing is required — fail loudly instead
+        // of pointing requests at "".
+        let resolved = resolve_provider(&provider, &provider_entries);
         let base_url = base_url_override
-            .or(env_base_url)
             .or(file_base_url)
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| landing.clone().unwrap_or_default());
-        if base_url.is_empty() {
-            return Err(format!(
-                "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
-                provider.name()
-            )
-            .into());
-        }
-        // Wire protocol default: OPENAI_API pins everything, else the
-        // active provider's `api:` entry pin, else the global file `api:`,
-        // else responses.
-        let api_name = env::var("OPENAI_API")
-            .ok()
-            .or_else(|| {
-                provider_entries
-                    .get(provider.name())
-                    .and_then(|e| e.api)
-                    .map(|a| a.name().to_string())
-            })
+            .or(resolved.landing.clone())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
+                    provider.name()
+                )
+            })?;
+        // Wire protocol default: the active provider's `api:` entry pin,
+        // else the global file `api:`, else responses.
+        let api_name = resolved
+            .api_pin
+            .map(|a| a.name().to_string())
             .or_else(|| load_config_str(&file, "api"))
             .unwrap_or_else(|| "openai-responses".to_string());
         let api = match ApiProtocol::parse(&api_name) {
@@ -1179,9 +1209,11 @@ impl LlmConfig {
                 .into())
             }
         };
+        // Bake the global pin once: hot paths read the field instead of
+        // re-reading the file on every request.
+        let api_pinned = load_config_str(&file, "api").is_some() || resolved.api_pin.is_some();
         // The model carries its own wire protocol; the global `api` above is
-        // only the default. `OPENAI_API` pins everything, otherwise the
-        // `apply_model` call below resolves the selection-aware protocol
+        // only the default. Otherwise the `apply_model` call below resolves
         // (full `endpoint/id` key, then bare id, then learned fallback).
         let (api_key, account_id) = resolve_credentials(&provider, &provider_entries)?;
         let context_window = env::var("DEX_CONTEXT_WINDOW")
@@ -1232,8 +1264,6 @@ impl LlmConfig {
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
-        // Always expose zen/go for OpenCode so /model can set base_url without env
-        let endpoints: BTreeMap<String, String> = endpoints_for(&provider, &provider_entries);
         // Dex own cache (no pi dependency) — bootstraps with just current model if missing.
         if available_models.is_empty() {
             if let Some(cached) = load_dex_models_cache() {
@@ -1261,15 +1291,20 @@ impl LlmConfig {
             permission,
             extra_headers,
             client,
-            endpoints,
+            endpoints: resolved.endpoints,
             provider_entries,
+            provider_headers: resolved.headers,
+            api_pinned,
         };
         // A prefixed model override (--model go/foo or the daemon's
         // per-request model) routes to its endpoint; bare ids keep the
-        // resolved base_url. An explicit base_url (--base-url,
-        // OPENAI_BASE_URL, file `base_url:`) wins over routing.
+        // resolved base_url. An explicit base_url (--base-url, file
+        // `base_url:`) pins the endpoint: prefixes are naming only and
+        // stripped, never re-routed.
         if !explicit_base_url {
-            this.apply_model(&model, false);
+            this.apply_model(&model, false)?;
+        } else {
+            this.strip_routing_prefixes();
         }
         Ok(this)
     }
@@ -1277,12 +1312,8 @@ impl LlmConfig {
     /// Wire protocol for a fresh model selection: an explicit per-model
     /// table entry wins, otherwise a previously learned fallback for this
     /// `(base_url, model)`, otherwise the configured default is kept
-    /// (`None`). `OPENAI_API` pins everything and skips this entirely — the
-    /// caller keeps `self.api` untouched then.
+    /// (`None`).
     fn resolve_model_api(&self, selection: &str) -> Option<ApiProtocol> {
-        if env::var("OPENAI_API").is_ok() {
-            return None;
-        }
         if let Some(api) = model_api_from_env(selection, &self.model) {
             return Some(api);
         }
@@ -1297,35 +1328,67 @@ impl LlmConfig {
     /// owns the base_url. The wire protocol follows the same way
     /// (`DEX_MODEL_APIS`, then learned, then the global default) with the
     /// empirical responses→completions fallback as the last resort.
+    /// Strip provider/endpoint prefixes without side effects: no provider
+    /// switch, no credential lookup, no `base_url` change. Used on load when
+    /// the endpoint is explicitly pinned — the pin wins, so a stored `go/id`
+    /// names its endpoint but must not move it, and the persisted
+    /// `provider:`/`base_url:` fields stay authoritative. Unknown prefixes
+    /// stay part of the model id.
+    fn strip_routing_prefixes(&mut self) {
+        let mut sel = self.model.clone();
+        if let Some((prefix, rest)) = sel.split_once('/') {
+            let known = known_providers(&self.provider_entries);
+            if Provider::parse_known(prefix, &known).is_some() {
+                sel = rest.to_string();
+            }
+        }
+        if let Some((name, rest)) = sel.split_once('/') {
+            if self.endpoints.contains_key(name) {
+                sel = rest.to_string();
+            }
+        }
+        self.model = sel;
+    }
+
     /// Provider prefix is stripped first, then endpoint routing runs on the
     /// remainder. Returns the endpoint name when an endpoint route was
-    /// taken. With `persist`, the selection is written back to the config
-    /// file (it becomes the new default).
-    pub(crate) fn apply_model(&mut self, selection: &str, persist: bool) -> Option<String> {
+    /// taken, or an error when a provider-qualified pick names a provider
+    /// with no credentials/endpoint — state is left untouched then, so one
+    /// provider's key can never leak to another's endpoint. With `persist`,
+    /// the stripped id is written back to the config file (it becomes the
+    /// new default).
+    pub(crate) fn apply_model(
+        &mut self,
+        selection: &str,
+        persist: bool,
+    ) -> Result<Option<String>, String> {
         let prev_model = self.model.clone();
         let prev_provider = self.provider.clone();
         // Provider-qualified: "opencode/gpt-..." or "openai-codex/gpt-..." sets base_url without env
         let mut sel = selection;
         if let Some((prefix, rest)) = selection.split_once('/') {
-            let known: BTreeSet<String> = self.provider_entries.keys().cloned().collect();
+            let known = known_providers(&self.provider_entries);
             if let Some(new_provider) = Provider::parse_known(prefix, &known) {
                 if new_provider != self.provider {
-                    // Best-effort credential switch; failure surfaces at next LLM call
-                    if let Ok((k, acct)) =
-                        resolve_credentials(&new_provider, &self.provider_entries)
-                    {
-                        self.api_key = k;
-                        self.account_id = acct;
-                    }
-                    // Switch even without creds so /model shows intent;
-                    // auth failure surfaces at the next LLM call. Generic
-                    // providers land on their config entry / catalog URL.
-                    let landing = landing_base_url_for(&new_provider, &self.provider_entries)
-                        .unwrap_or_else(|| self.base_url.clone());
-                    let new_endpoints = endpoints_for(&new_provider, &self.provider_entries);
+                    // Resolve everything before mutating: a half-switched
+                    // config (new provider, old key/URL/headers) is worse
+                    // than no switch at all. Generic providers land on
+                    // their config entry / catalog URL.
+                    let (key, account) = resolve_credentials(&new_provider, &self.provider_entries)
+                        .map_err(|e| e.to_string())?;
+                    let resolved = resolve_provider(&new_provider, &self.provider_entries);
+                    let landing = resolved.landing.ok_or_else(|| {
+                        format!(
+                            "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
+                            new_provider.name()
+                        )
+                    })?;
+                    self.api_key = key;
+                    self.account_id = account;
                     self.provider = new_provider;
                     self.base_url = landing;
-                    self.endpoints = new_endpoints;
+                    self.endpoints = resolved.endpoints;
+                    self.provider_headers = resolved.headers;
                 }
                 sel = rest;
             }
@@ -1361,12 +1424,12 @@ impl LlmConfig {
             }
         }
         // The model carries its wire protocol; the global `api` is the
-        // fallback and `OPENAI_API` pins it.
+        // fallback and the global pin keeps it.
         if let Some(api) = self.resolve_model_api(selection) {
             self.api = api;
         }
         if persist && (self.model != prev_model || self.provider != prev_provider) {
-            persist_selection(selection, &self.provider, &self.base_url);
+            persist_selection(&self.model, &self.provider, &self.base_url);
         }
         // Dex standalone: contextWindow from models.dev catalog > provider default; refresh unless env pinned it.
         if env::var("DEX_CONTEXT_WINDOW").is_err() {
@@ -1380,19 +1443,13 @@ impl LlmConfig {
                 self.context_window = DEFAULT_CONTEXT_WINDOW;
             }
         }
-        result
+        Ok(result)
     }
 
     /// Trigger compaction when prompt exceeds this many tokens.
     /// Pi: contextWindow - reserveTokens (16384) leaves room for reply.
     pub(crate) fn compaction_threshold(&self) -> u64 {
         self.context_window.saturating_sub(self.reserve_tokens)
-    }
-
-    /// Tokens reserved for the model's reply (pi default 16384).
-    #[allow(dead_code)]
-    pub(crate) fn reserve_tokens(&self) -> u64 {
-        self.reserve_tokens
     }
 
     pub(crate) fn keep_recent_tokens(&self) -> u64 {
@@ -1405,49 +1462,38 @@ impl LlmConfig {
         persist: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (api_key, account_id) = resolve_credentials(provider, &self.provider_entries)?;
-        let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
-        let landing = match provider {
-            Provider::Generic(name) => self
-                .provider_entries
-                .get(name)
-                .and_then(|e| e.base_url.clone())
-                .or_else(|| load_dex_catalog().and_then(|c| catalog_api(name, &c)))
-                .ok_or_else(|| {
-                    format!(
-                        "provider '{name}' has no base_url: set it under providers: or run `dex update --models`"
-                    )
-                })?,
-            _ => provider.default_base_url().unwrap_or_default().to_string(),
-        };
+        let resolved = resolve_provider(provider, &self.provider_entries);
+        let landing = resolved.landing.ok_or_else(|| {
+            format!(
+                "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
+                provider.name()
+            )
+        })?;
         self.provider = provider.clone();
         self.api_key = api_key;
         self.account_id = account_id;
-        self.base_url = env_base_url.unwrap_or(landing);
-        self.endpoints = endpoints_for(&self.provider, &self.provider_entries);
-        // Wire protocol: OPENAI_API pins everything, else the provider's
-        // `api:` entry pin, else the global file `api:`, else responses —
-        // then the current model's own resolution on top.
-        let api_name = env::var("OPENAI_API")
-            .ok()
-            .or_else(|| {
-                self.provider_entries
-                    .get(provider.name())
-                    .and_then(|e| e.api)
-                    .map(|a| a.name().to_string())
-            })
+        self.base_url = landing;
+        self.endpoints = resolved.endpoints;
+        self.provider_headers = resolved.headers;
+        // Wire protocol: the provider's `api:` entry pin, else the global
+        // file `api:`, else responses — then the current model's own
+        // resolution on top.
+        let api_name = resolved
+            .api_pin
+            .map(|a| a.name().to_string())
             .or_else(|| load_config_str(&load_config_file(), "api"));
         self.api = api_name
             .as_deref()
             .and_then(ApiProtocol::parse)
             .unwrap_or(ApiProtocol::Responses);
         // Keep the current model's own protocol when the global `api` is not
-        // explicitly pinned via `OPENAI_API`.
+        // explicitly pinned.
         let current = self.model.clone();
         if let Some(api) = self.resolve_model_api(&current) {
             self.api = api;
         }
         if persist {
-            persist_selection(&self.model, provider, &self.base_url);
+            persist_selection(&self.model, &self.provider, &self.base_url);
         }
         Ok(())
     }
@@ -1458,55 +1504,35 @@ pub(crate) mod tests {
     use super::{
         build_ctx_map, detect_verify_command, load_config_file, load_dex_models_cache,
         load_provider_entries, model_api_from_env, reasoning_options_for, remember_learned_api,
-        usage_cost, ApiProtocol, LlmConfig, PermissionMode, Provider,
+        usage_cost, ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
     };
     use crate::core::types::Usage;
-    use std::env;
+    use std::{collections::BTreeSet, env};
 
     #[test]
     fn apply_model_routes_prefixed_selection_to_endpoint() {
-        let mut cfg = LlmConfig {
-            provider: Provider::OpenCode,
-            api_key: "k".into(),
-            base_url: "https://opencode.ai/zen/v1".into(),
-            model: "gpt-5.6-luna".into(),
-            available_models: Vec::new(),
-            endpoints: [
-                ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-                (
-                    "go".to_string(),
-                    "https://opencode.ai/zen/go/v1".to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            api: ApiProtocol::Responses,
-            account_id: None,
-            thinking_effort: None,
-            context_window: 128_000,
-            reserve_tokens: 16_384,
-            keep_recent_tokens: 20_000,
-            permission: PermissionMode::AskWrites,
-            verify_command: None,
-            extra_headers: Default::default(),
-            client: reqwest::blocking::Client::new(),
-            provider_entries: Default::default(),
-        };
+        let mut cfg = test_cfg();
+        cfg.model = "gpt-5.6-luna".into();
         // Bare id keeps the current base_url.
-        assert_eq!(cfg.apply_model("gpt-5.6-luna", false), None);
+        assert_eq!(cfg.apply_model("gpt-5.6-luna", false).unwrap(), None);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         // Prefixed id routes to the endpoint and strips the prefix.
-        assert_eq!(cfg.apply_model("go/kimi-k2", false).as_deref(), Some("go"));
+        assert_eq!(
+            cfg.apply_model("go/kimi-k2", false).unwrap().as_deref(),
+            Some("go")
+        );
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "kimi-k2");
         // Provider-native slashes in model ids survive under an endpoint.
         assert_eq!(
-            cfg.apply_model("go/moonshotai/kimi-k2", false).as_deref(),
+            cfg.apply_model("go/moonshotai/kimi-k2", false)
+                .unwrap()
+                .as_deref(),
             Some("go")
         );
         assert_eq!(cfg.model, "moonshotai/kimi-k2");
         // Unknown prefix is a plain model id.
-        assert_eq!(cfg.apply_model("unknown/m", false), None);
+        assert_eq!(cfg.apply_model("unknown/m", false).unwrap(), None);
         assert_eq!(cfg.model, "unknown/m");
     }
 
@@ -1635,6 +1661,7 @@ pub(crate) mod tests {
             .into_iter()
             .collect(),
             api: ApiProtocol::Responses,
+            api_pinned: false,
             account_id: None,
             thinking_effort: None,
             context_window: 128_000,
@@ -1645,6 +1672,7 @@ pub(crate) mod tests {
             extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
             provider_entries: Default::default(),
+            provider_headers: Default::default(),
         }
     }
 
@@ -1672,27 +1700,26 @@ pub(crate) mod tests {
         }
     }
 
-    /// DEX_MODEL_APIS table with `OPENAI_API` unpinned so resolution runs.
+    /// DEX_MODEL_APIS table with `DEX_API` unpinned so resolution runs.
     fn model_apis_env(table: &str) -> EnvRestore {
-        let guard = EnvRestore::take(&["DEX_MODEL_APIS", "OPENAI_API"]);
+        let guard = EnvRestore::take(&["DEX_MODEL_APIS"]);
         std::env::set_var("DEX_MODEL_APIS", table);
-        std::env::remove_var("OPENAI_API");
         guard
     }
 
     #[test]
     fn apply_model_follows_model_apis() {
-        // Serializes process-env redirection (DEX_MODEL_APIS/OPENAI_API)
+        // Serializes process-env redirection (DEX_MODEL_APIS/DEX_API)
         // against daemon tests holding the same guard.
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = model_apis_env("m-c=openai-completions");
         let mut cfg = test_cfg();
-        cfg.apply_model("m-c", false);
+        cfg.apply_model("m-c", false).unwrap();
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         // Unknown ids keep the current protocol.
-        cfg.apply_model("m-r", false);
+        cfg.apply_model("m-r", false).unwrap();
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
     }
 
@@ -1703,11 +1730,11 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _guard = model_apis_env("m-x=openai-completions,go/m-x=openai-responses");
         let mut cfg = test_cfg();
-        cfg.apply_model("go/m-x", false);
+        cfg.apply_model("go/m-x", false).unwrap();
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "m-x");
         assert_eq!(cfg.api, ApiProtocol::Responses);
-        cfg.apply_model("m-x", false);
+        cfg.apply_model("m-x", false).unwrap();
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
     }
 
@@ -1733,15 +1760,16 @@ pub(crate) mod tests {
 
     #[test]
     fn provider_parse_accepts_aliases() {
-        assert_eq!(Provider::parse("opencode").unwrap(), Provider::OpenCode);
-        assert_eq!(Provider::parse("codex").unwrap(), Provider::OpenAiCodex);
-        assert_eq!(
-            Provider::parse("openai-codex").unwrap(),
-            Provider::OpenAiCodex
-        );
-        assert!(Provider::parse("unknown").is_err());
-        // "openai" is no longer an alias: configure providers.openai instead
-        assert!(Provider::parse("openai").is_err());
+        let known: BTreeSet<String> = ["zai".to_string()].into_iter().collect();
+        let assert_known = |name: &str| Provider::parse_known(name, &known).unwrap();
+        assert_eq!(assert_known("opencode"), Provider::OpenCode);
+        assert_eq!(assert_known("codex"), Provider::OpenAiCodex);
+        assert_eq!(assert_known("openai-codex"), Provider::OpenAiCodex);
+        assert_eq!(assert_known("zai"), Provider::Generic("zai".to_string()));
+        assert!(Provider::parse_known("unknown", &known).is_none());
+        // No "openai" alias: a generic `providers.openai` entry is the way
+        // to point that name at an OpenAI-compatible endpoint.
+        assert!(Provider::parse_known("openai", &known).is_none());
         assert_eq!(
             Provider::OpenCode.default_base_url(),
             Some("https://opencode.ai/zen/v1")
@@ -1757,20 +1785,14 @@ pub(crate) mod tests {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _g = EnvRestore::take(&[
-            "OPENCODE_API_KEY",
-            "CODEX_ACCESS_TOKEN",
-            "CODEX_ACCOUNT_ID",
-            "OPENAI_BASE_URL",
-        ]);
+        let _g = EnvRestore::take(&["OPENCODE_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID"]);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("CODEX_ACCESS_TOKEN", "codex-tok");
-        std::env::remove_var("OPENAI_BASE_URL");
         let mut cfg = test_cfg();
         // starts as OpenCode @ zen
         assert_eq!(cfg.provider, Provider::OpenCode);
         // Switch to codex via provider-qualified model — no env base_url required
-        cfg.apply_model("openai-codex/gpt-5.6-luna", false);
+        cfg.apply_model("openai-codex/gpt-5.6-luna", false).unwrap();
         assert_eq!(cfg.provider, Provider::OpenAiCodex);
         assert_eq!(
             cfg.base_url,
@@ -1778,18 +1800,18 @@ pub(crate) mod tests {
         );
         assert_eq!(cfg.model, "gpt-5.6-luna");
         // Switch back via the provider prefix
-        cfg.apply_model("opencode/gpt-4o", false);
+        cfg.apply_model("opencode/gpt-4o", false).unwrap();
         assert_eq!(cfg.provider, Provider::OpenCode);
         assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url().unwrap());
         assert_eq!(cfg.model, "gpt-4o");
         // Provider + endpoint: opencode/go/kimi -> go endpoint
-        cfg.apply_model("opencode/go/kimi-k2", false);
+        cfg.apply_model("opencode/go/kimi-k2", false).unwrap();
         assert_eq!(cfg.provider, Provider::OpenCode);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "kimi-k2");
         // Bare endpoint still works without provider prefix
         cfg = test_cfg();
-        cfg.apply_model("go/kimi-k2", false);
+        cfg.apply_model("go/kimi-k2", false).unwrap();
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.model, "kimi-k2");
     }
@@ -1801,15 +1823,11 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _g = EnvRestore::take(&[
             "OPENCODE_API_KEY",
-            "OPENAI_BASE_URL",
-            "OPENAI_MODEL",
-            "OPENAI_API",
             "DEX_PROVIDER",
             "DEX_MODELS",
             "DEX_CONFIG",
         ]);
         std::env::set_var("OPENCODE_API_KEY", "test-key2");
-        std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("DEX_MODELS");
         std::env::set_var("DEX_PROVIDER", "opencode");
         // No config file: point DEX_CONFIG at a missing path.
@@ -1869,9 +1887,6 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _g = EnvRestore::take(&[
             "OPENCODE_API_KEY",
-            "OPENAI_BASE_URL",
-            "OPENAI_MODEL",
-            "OPENAI_API",
             "DEX_PROVIDER",
             "DEX_MODELS",
             "DEX_CONFIG",
@@ -1890,7 +1905,6 @@ pub(crate) mod tests {
         .unwrap();
         std::env::set_var("DEX_CONFIG", &cfg_path);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
-        std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("DEX_MODELS");
         std::env::set_var("DEX_HEADERS", "X-Env: env");
         std::env::set_var("OPENAI_HEADERS", "X-Env2: openai");
@@ -2006,20 +2020,15 @@ pub(crate) mod tests {
 
     #[test]
     fn opencode_key_resolves_entry_then_own_env_var() {
-        // Deposit order: providers.opencode.api_key > OPENCODE_API_KEY.
-        // The legacy OPENAI_API_KEY spelling is gone on purpose: the name
-        // was the confusion (it is opencode's gateway key, not OpenAI's).
+        // Deposit order: providers.opencode.api_key > OPENCODE_API_KEY
+        // (opencode's gateway key).
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvRestore::take(&[
             "DEX_CONFIG",
             "DEX_PROVIDER",
-            "OPENAI_MODEL",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
             "OPENCODE_API_KEY",
-            "OPENAI_MODEL",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
             "DEX_CONTEXT_WINDOW",
@@ -2031,10 +2040,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("OPENAI_MODEL", "m");
-        for key in ["OPENCODE_API_KEY", "OPENAI_MODEL"] {
-            std::env::remove_var(key);
-        }
+        std::env::remove_var("OPENCODE_API_KEY");
         // The provider's own env var is the shell path.
         std::env::set_var("OPENCODE_API_KEY", "canonical");
         assert_eq!(
@@ -2064,16 +2070,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn config_file_defaults_apply_and_env_wins() {
+    fn config_file_defaults_apply() {
+        // Model, endpoint and protocol come from `--model`/`--base-url`,
+        // the file, or builtins — never env vars (those are provider
+        // properties, not agent globals).
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvRestore::take(&[
             "DEX_CONFIG",
             "DEX_PROVIDER",
-            "OPENAI_MODEL",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
             "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_CONTEXT_WINDOW",
@@ -2088,20 +2094,23 @@ pub(crate) mod tests {
         .unwrap();
         std::env::set_var("DEX_CONFIG", &path);
         std::env::set_var("OPENCODE_API_KEY", "env-key");
-        // No OPENAI_MODEL: file model + file base_url + file api apply.
+        // File model + file base_url + file api apply; a `--model`
+        // override beats the file.
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "file-model");
         assert_eq!(cfg.base_url, "https://file.example/v1");
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
-        // Env model beats the file.
-        std::env::set_var("OPENAI_MODEL", "env-model");
-        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
-        assert_eq!(cfg.model, "env-model");
+        let cfg = LlmConfig::from_env(None, Some("flag-model".to_string()), None, &[]).unwrap();
+        assert_eq!(cfg.model, "flag-model");
         // Write-back: selection lands in the file, unknown keys survive.
         let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
-        cfg.apply_model("go/new-model", true);
+        cfg.apply_model("go/new-model", true).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("model: go/new-model"));
+        assert!(text.contains("model: new-model"));
+        assert!(
+            !text.contains("go/new-model"),
+            "persisted id is stripped: {text}"
+        );
         assert!(text.contains("custom_key: keep-me"));
         // Learned protocol: remembered to the cache, picked up on the next
         // config build (nothing explicit pins this model's protocol).
@@ -2145,50 +2154,53 @@ pub(crate) mod tests {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["XDG_CACHE_HOME", "DEX_MODEL_APIS", "OPENAI_API"]);
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME", "DEX_MODEL_APIS"]);
         let dir = std::env::temp_dir().join(format!("dex-route-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         write_routing_catalog(&dir);
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::remove_var("DEX_MODEL_APIS");
-        std::env::remove_var("OPENAI_API");
         let mut cfg = test_cfg();
         cfg.endpoints
             .insert("go".to_string(), "https://go.example/v1".to_string());
         // Bare pick living on another endpoint moves base_url by itself.
-        assert_eq!(cfg.apply_model("m-go-only", false).as_deref(), Some("go"));
+        assert_eq!(
+            cfg.apply_model("m-go-only", false).unwrap().as_deref(),
+            Some("go")
+        );
         assert_eq!(cfg.base_url, "https://go.example/v1");
         assert_eq!(cfg.model, "m-go-only");
         // Back to a zen-only model.
-        assert_eq!(cfg.apply_model("m-zen-only", false).as_deref(), Some("zen"));
+        assert_eq!(
+            cfg.apply_model("m-zen-only", false).unwrap().as_deref(),
+            Some("zen")
+        );
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         // A model the current endpoint serves never moves — dual-served ids
         // must not ping-pong between endpoints.
-        assert_eq!(cfg.apply_model("m-zen-only", false), None);
+        assert_eq!(cfg.apply_model("m-zen-only", false).unwrap(), None);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         // Unknown models and custom URLs stay put.
-        assert_eq!(cfg.apply_model("m-unknown", false), None);
+        assert_eq!(cfg.apply_model("m-unknown", false).unwrap(), None);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         cfg.base_url = "https://custom.example/v1".to_string();
-        assert_eq!(cfg.apply_model("m-go-only", false), None);
+        assert_eq!(cfg.apply_model("m-go-only", false).unwrap(), None);
         assert_eq!(cfg.base_url, "https://custom.example/v1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn explicit_base_url_wins_over_catalog_routing() {
-        // OPENAI_BASE_URL is a user pin even when it names a known endpoint:
-        // a go-only model stays on the pinned URL instead of being silently
-        // rerouted to the serving endpoint.
+        // An explicit pin holds even when it names a known endpoint: a
+        // go-only model stays on the pinned URL instead of being silently
+        // rerouted to the serving endpoint. Pins are `--base-url` and file
+        // `base_url:` only — endpoint properties, not env globals.
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvRestore::take(&[
             "DEX_CONFIG",
             "DEX_PROVIDER",
-            "OPENAI_MODEL",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
             "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
@@ -2202,20 +2214,32 @@ pub(crate) mod tests {
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
-        std::env::set_var("OPENAI_BASE_URL", "https://opencode.ai/zen/v1");
-        std::env::set_var("OPENAI_MODEL", "m-go-only");
         for key in [
             "DEX_PROVIDER",
-            "OPENAI_API",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
             "DEX_CONTEXT_WINDOW",
         ] {
             std::env::remove_var(key);
         }
+        // `--base-url` pin with a `--model` override.
+        let cfg = LlmConfig::from_env(
+            Some("https://opencode.ai/zen/v1".to_string()),
+            Some("m-go-only".to_string()),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "m-go-only");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        // File `base_url:` pin with a file model.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: opencode\nbase_url: https://opencode.ai/zen/v1\nmodel: m-go-only\n",
+        )
+        .unwrap();
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "m-go-only");
-        // The pin holds even though the catalog says m-go-only lives on go.
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2245,10 +2269,12 @@ pub(crate) mod tests {
         .unwrap();
     }
 
-    fn generic_config(dir: &std::path::Path, providers_yaml: &str) -> std::path::PathBuf {
-        let path = dir.join("config.yaml");
-        std::fs::write(&path, format!("provider: zai\n{providers_yaml}")).unwrap();
-        path
+    fn generic_config(dir: &std::path::Path, providers_yaml: &str) {
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!("provider: zai\n{providers_yaml}"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2259,9 +2285,6 @@ pub(crate) mod tests {
         let _guard = EnvRestore::take(&[
             "DEX_CONFIG",
             "DEX_PROVIDER",
-            "OPENAI_MODEL",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
             "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
@@ -2275,11 +2298,8 @@ pub(crate) mod tests {
         generic_config(&dir, "providers:\n  zai:\n    api_key: zsk-deposit\n");
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("OPENAI_MODEL", "glm-x");
         for key in [
             "DEX_PROVIDER",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
             "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
@@ -2289,7 +2309,8 @@ pub(crate) mod tests {
             std::env::remove_var(key);
         }
         // Endpoint + key from the deposit place; catalog supplies the URL.
-        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        // (`--model` stands in for the removed model env override.)
+        let cfg = LlmConfig::from_env(None, Some("glm-x".to_string()), None, &[]).unwrap();
         assert_eq!(cfg.provider.name(), "zai");
         assert_eq!(cfg.base_url, "https://api.zai.example/v4");
         assert_eq!(cfg.api_key, "zsk-deposit");
@@ -2300,7 +2321,7 @@ pub(crate) mod tests {
         // `/model zai/glm-x` is a no-op (already there); unknown prefixes
         // must still stay plain model ids.
         let mut cfg = cfg;
-        assert!(cfg.apply_model("unknown/m", false).is_none());
+        assert!(cfg.apply_model("unknown/m", false).unwrap().is_none());
         assert_eq!(cfg.model, "unknown/m");
         // Key falls back to the provider's own conventional env var.
         std::fs::write(
@@ -2330,9 +2351,6 @@ pub(crate) mod tests {
         let _guard = EnvRestore::take(&[
             "DEX_CONFIG",
             "DEX_PROVIDER",
-            "OPENAI_MODEL",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
             "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
@@ -2346,26 +2364,19 @@ pub(crate) mod tests {
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
-        for key in [
-            "DEX_PROVIDER",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
-            "OPENAI_MODEL",
-        ] {
-            std::env::remove_var(key);
-        }
+        std::env::remove_var("DEX_PROVIDER");
         // Completion list offers the configured provider's qualified ids.
         let ids = load_dex_models_cache().unwrap();
         assert!(ids.contains(&"glm-x".to_string()));
         assert!(ids.contains(&"zai/glm-x".to_string()));
         // Provider-qualified pick switches to the generic provider.
         let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
-        assert!(cfg.apply_model("zai/glm-x", false).is_none()); // already on zai
+        assert!(cfg.apply_model("zai/glm-x", false).unwrap().is_none()); // already on zai
         assert_eq!(cfg.model, "glm-x");
         // From opencode, the same pick switches provider AND endpoint.
         let mut cfg = test_cfg();
         cfg.provider_entries = load_provider_entries(&load_config_file());
-        assert_eq!(cfg.apply_model("zai/glm-x", false), None);
+        assert_eq!(cfg.apply_model("zai/glm-x", false).unwrap(), None);
         assert_eq!(cfg.provider.name(), "zai");
         assert_eq!(cfg.base_url, "https://api.zai.example/v4");
         // Thinking options come from the catalog for the selected model.
@@ -2399,19 +2410,15 @@ pub(crate) mod tests {
 
     #[test]
     fn prefixed_selection_restores_protocol_on_restart() {
-        // `model: go/<id>` in the config file must honor a bare-id
+        // A `model: go/<id>` in the config file must honor a bare-id
         // `DEX_MODEL_APIS` entry: the full selection key is tried first,
-        // then the stripped id (previously both lookups used the raw
-        // `go/<id>` string, so bare entries never matched after restart).
+        // then the stripped id.
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvRestore::take(&[
             "DEX_CONFIG",
             "DEX_PROVIDER",
-            "OPENAI_MODEL",
-            "OPENAI_API",
-            "OPENAI_BASE_URL",
             "OPENCODE_API_KEY",
             "DEX_MODEL_APIS",
             "DEX_MODELS",
@@ -2433,13 +2440,309 @@ pub(crate) mod tests {
         std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_MODEL_APIS", "m-z9=openai-completions");
-        std::env::remove_var("OPENAI_API");
-        std::env::remove_var("OPENAI_BASE_URL");
-        std::env::remove_var("OPENAI_MODEL");
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "m-z9");
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_selection_reloads_stripped() {
+        // Persisted `model:` must reload onto the same endpoint without the
+        // raw prefix: `from_env` treats a file `base_url:` as an explicit
+        // pin and skips routing, so a stored `go/<id>` would otherwise be
+        // sent to the API verbatim after restart.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Catalog whose serving URLs are exactly the builtin endpoints.
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("dex/models.dev.json"),
+            serde_json::json!({
+                "opencode": {
+                    "api": "https://opencode.ai/zen/v1",
+                    "models": { "m-zen": { "limit": { "context": 1 } } }
+                },
+                "opencode-go": {
+                    "api": "https://opencode.ai/zen/go/v1",
+                    "models": { "m-go": { "limit": { "context": 1 } } }
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        for key in [
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+        ] {
+            std::env::remove_var(key);
+        }
+        let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        cfg.apply_model("go/m-go", true).unwrap();
+        assert_eq!(cfg.model, "m-go");
+        // Restart with the persisted file (now carrying a `base_url:`, i.e.
+        // the explicit-pin path): the id stays stripped, the endpoint holds.
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.model, "m-go");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
+        // And back to a zen model, bare this time.
+        let mut cfg = cfg;
+        cfg.apply_model("m-zen", true).unwrap();
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.model, "m-zen");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_model_refuses_provider_switch_without_credentials_or_endpoint() {
+        // A provider-qualified pick is atomic: without credentials or a
+        // known endpoint the switch is refused and the old key/URL stay
+        // put — never one provider's key against another's endpoint.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "OPENCODE_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_ACCOUNT_ID",
+            "CODEX_HOME",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in ["OPENCODE_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID"] {
+            std::env::remove_var(key);
+        }
+        // Hermetic XDG/CODEX_HOME: no credential file, no catalog.
+        let dir = std::env::temp_dir().join(format!("dex-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("CODEX_HOME", dir.join("codex-home"));
+        let mut cfg = test_cfg();
+        assert!(cfg.apply_model("openai-codex/gpt-x", false).is_err());
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        assert_eq!(cfg.api_key, "k");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(cfg.model, "m-r");
+        // Configured generic provider with neither key nor endpoint.
+        cfg.provider_entries
+            .insert("zai".to_string(), ProviderEntry::default());
+        assert!(cfg.apply_model("zai/glm-x", false).is_err());
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        assert_eq!(cfg.api_key, "k");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(cfg.model, "m-r");
+        // Key deposited but no endpoint anywhere: same refusal.
+        cfg.provider_entries.insert(
+            "zai-keyed".to_string(),
+            ProviderEntry {
+                api_key: Some("zsk-x".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.apply_model("zai-keyed/glm-x", false).is_err());
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        assert_eq!(cfg.api_key, "k");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catalog_env_vars_tries_every_documented_name() {
+        // A provider documenting several key env vars accepts any of them —
+        // not just the first key in the catalog `env` map.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+            "ZAI_A_KEY",
+            "ZAI_B_KEY",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-multienv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("dex/models.dev.json"),
+            serde_json::json!({
+                "zai": {
+                    "api": "https://api.zai.example/v4",
+                    "env": { "ZAI_B_KEY": "second", "ZAI_A_KEY": "first" },
+                    "models": { "glm-x": { "limit": { "context": 1 } } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: zai\nproviders:\n  zai: {}\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        for key in [
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "ZAI_A_KEY",
+            "ZAI_B_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+        // Only the non-first documented name is set.
+        std::env::set_var("ZAI_A_KEY", "a-key");
+        assert_eq!(
+            LlmConfig::from_env(None, None, None, &[]).unwrap().api_key,
+            "a-key"
+        );
+        // Neither set: the error names every documented name.
+        std::env::remove_var("ZAI_A_KEY");
+        let err = match LlmConfig::from_env(None, None, None, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected missing-key error"),
+        };
+        assert!(err.contains("ZAI_A_KEY"), "{err}");
+        assert!(err.contains("ZAI_B_KEY"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_pin_bakes_into_config() {
+        // The global protocol pin is computed once in `from_env` (file or
+        // provider entry) so hot paths never re-read the file.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-pinbake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        for key in [
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+        ] {
+            std::env::remove_var(key);
+        }
+        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        assert!(
+            !LlmConfig::from_env(None, None, None, &[])
+                .unwrap()
+                .api_pinned
+        );
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: opencode\napi: openai-completions\n",
+        )
+        .unwrap();
+        assert!(
+            LlmConfig::from_env(None, None, None, &[])
+                .unwrap()
+                .api_pinned
+        );
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: opencode\nproviders:\n  opencode:\n    api: openai-completions\n",
+        )
+        .unwrap();
+        assert!(
+            LlmConfig::from_env(None, None, None, &[])
+                .unwrap()
+                .api_pinned
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_provider_bundles_entry_overrides() {
+        // One derivation feeds every consumer: entry `base_url:` beats the
+        // catalog URL, entry `api:` pins (and bakes `api_pinned`), entry
+        // `headers:` land in `provider_headers` — and all three refresh on
+        // a provider switch.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-resolved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_generic_catalog(&dir);
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: zai\nproviders:\n  zai:\n    api_key: zsk-deposit\n    base_url: https://custom.zai.example/v1\n    api: openai-completions\n    headers:\n      X-Prov: prov\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        for key in [
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+        ] {
+            std::env::remove_var(key);
+        }
+        let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.base_url, "https://custom.zai.example/v1");
+        assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
+        assert!(cfg.api_pinned);
+        assert_eq!(
+            cfg.provider_headers.get("X-Prov").map(String::as_str),
+            Some("prov")
+        );
+        // Switching providers refreshes the whole bundle, not just the URL.
+        cfg.apply_model("opencode/glm-x", false).unwrap();
+        assert_eq!(cfg.provider, Provider::OpenCode);
+        assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url().unwrap());
+        assert!(cfg.provider_headers.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

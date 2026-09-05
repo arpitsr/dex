@@ -101,6 +101,8 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         verify_command: None,
         extra_headers: Default::default(),
         provider_entries: Default::default(),
+        provider_headers: Default::default(),
+        api_pinned: false,
         // Display-only copy never talks to a provider; share the
         // process-wide client instead of initializing TLS + pool.
         client: crate::client::http::shared_blocking_client(),
