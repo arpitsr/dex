@@ -1,10 +1,11 @@
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use crate::core::types::{ApiProtocol, PermissionMode, Provider};
+use crate::llm::auth::load_codex_credentials;
 use crate::llm::provider::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL};
 
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
@@ -83,15 +84,171 @@ fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String
         .filter(|s| !s.is_empty())
 }
 
+/// A configured generic provider (`providers:` map in config.yaml): the
+/// deposit place for that provider's API key plus optional overrides.
+/// Endpoint, models, pricing, context windows and reasoning options come
+/// from the models.dev catalog entry of the same key; the wire protocol is
+/// learned empirically unless pinned here.
+#[derive(Clone, Default)]
+pub(crate) struct ProviderEntry {
+    pub(crate) api_key: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api: Option<ApiProtocol>,
+}
+
+fn load_provider_entries(file: &Option<serde_yaml::Value>) -> BTreeMap<String, ProviderEntry> {
+    let Some(map) = file
+        .as_ref()
+        .and_then(|f| f.get("providers"))
+        .and_then(|p| p.as_mapping())
+    else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in map {
+        let Some(name) = key
+            .as_str()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        let entry = Some(value.clone());
+        out.insert(
+            name,
+            ProviderEntry {
+                api_key: load_config_str(&entry, "api_key"),
+                base_url: load_config_str(&entry, "base_url"),
+                api: load_config_str(&entry, "api")
+                    .as_deref()
+                    .and_then(ApiProtocol::parse),
+            },
+        );
+    }
+    out
+}
+
+/// Catalog `api` URL for a provider key ("zai" → its serving endpoint).
+/// Entries without one (native-API providers like anthropic) are not usable
+/// as generic OpenAI-compatible providers — that absence is the gate.
+fn catalog_api(key: &str, catalog: &serde_json::Value) -> Option<String> {
+    catalog
+        .get(key)
+        .and_then(|e| e.get("api"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// The provider's own conventional API-key env var (first key of the catalog
+/// `env` map: ZHIPU_API_KEY, OPENROUTER_API_KEY, …), so deposits work with
+/// the names each provider already documents instead of dex-invented ones.
+fn catalog_env_var(key: &str, catalog: &serde_json::Value) -> Option<String> {
+    catalog
+        .get(key)
+        .and_then(|e| e.get("env"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.keys().next().cloned())
+}
+
+/// Landing base URL when nothing explicit is set: the builtin default, or
+/// for a generic provider its config entry override > catalog `api` URL.
+fn landing_base_url_for(
+    provider: &Provider,
+    entries: &BTreeMap<String, ProviderEntry>,
+) -> Option<String> {
+    match provider {
+        Provider::Generic(name) => entries
+            .get(name)
+            .and_then(|e| e.base_url.clone())
+            .or_else(|| load_dex_catalog().and_then(|c| catalog_api(name, &c))),
+        other => other.default_base_url().map(str::to_string),
+    }
+}
+
+/// Endpoint table for `/model` routing: builtin endpoints plus, for generic
+/// providers, their single catalog/config endpoint under the provider name.
+fn endpoints_for(
+    provider: &Provider,
+    entries: &BTreeMap<String, ProviderEntry>,
+) -> BTreeMap<String, String> {
+    let mut out = provider.endpoints();
+    if let Provider::Generic(name) = provider {
+        if let Some(url) = landing_base_url_for(provider, entries) {
+            out.insert(name.clone(), url);
+        }
+    }
+    out
+}
+
+/// Per-provider credentials: config `providers.<name>.api_key` > the
+/// provider's own conventional env var from the catalog (`ZHIPU_API_KEY`,
+/// `OPENROUTER_API_KEY`, …) > legacy fallbacks. Codex reads its own
+/// credential file and ignores all of this.
+pub(crate) fn resolve_credentials(
+    provider: &Provider,
+    entries: &BTreeMap<String, ProviderEntry>,
+    file_api_key: Option<&str>,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    match provider {
+        Provider::OpenCode => Ok((
+            env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(|| file_api_key.map(str::to_string))
+                .filter(|v| !v.is_empty())
+                .ok_or("OPENAI_API_KEY not set (export it or add api_key to config.yaml)")?,
+            None,
+        )),
+        Provider::OpenAiCodex => load_codex_credentials(),
+        Provider::Generic(name) => {
+            if let Some(key) = entries
+                .get(name)
+                .and_then(|e| e.api_key.clone())
+                .filter(|k| !k.is_empty())
+            {
+                return Ok((key, None));
+            }
+            let env_name = load_dex_catalog().and_then(|c| catalog_env_var(name, &c));
+            if let Some(var) = &env_name {
+                if let Ok(key) = env::var(var) {
+                    if !key.trim().is_empty() {
+                        return Ok((key, None));
+                    }
+                }
+            }
+            Err(format!(
+                "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
+                env_name.map(|v| format!(" or export {v}")).unwrap_or_else(|| {
+                    " or export the provider's key env var (run `dex update --models` to learn its name)"
+                        .to_string()
+                })
+            )
+            .into())
+        }
+    }
+}
+
 /// True when the user explicitly pinned the wire protocol: the `OPENAI_API`
 /// env var or an `api:` key in config.yaml. Per-model `DEX_MODEL_APIS`
 /// entries don't count — they decide per model, but empirical fallback stays
 /// available for unlisted models.
-pub(crate) fn api_pinned() -> bool {
+pub(crate) fn api_pinned(active_provider: Option<&str>) -> bool {
     if env::var("OPENAI_API").is_ok() {
         return true;
     }
-    load_config_str(&load_config_file(), "api").is_some()
+    let file = load_config_file();
+    if load_config_str(&file, "api").is_some() {
+        return true;
+    }
+    active_provider
+        .and_then(|name| {
+            load_provider_entries(&file)
+                .get(name.to_ascii_lowercase().as_str())
+                .cloned()
+        })
+        .and_then(|e| e.api)
+        .is_some()
 }
 
 /// Persisted wire protocols learned empirically at runtime
@@ -196,7 +353,36 @@ pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol
 /// or missing file silently skips the write.
 /// ponytail: serde_yaml drops comments on write-back; restructure the file
 /// if round-tripping comments ever matters.
-fn persist_selection(selection: &str, provider: Provider, base_url: &str) {
+/// Reasoning-effort options the selected model advertises (models.dev
+/// `reasoning_options`, e.g. glm-5.3-flash: low/high/max). Shown in `/model`
+/// replies so the thinking knob is discoverable per model; `None` when the
+/// catalog has no entry or advertises no effort options.
+pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
+    let catalog = load_dex_catalog()?;
+    let needle = model.to_ascii_lowercase();
+    let entry = catalog.as_object()?.values().find_map(|provider| {
+        provider
+            .get("models")
+            .and_then(|m| m.as_object())
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|(id, _)| id.to_ascii_lowercase() == needle)
+                    .map(|(_, v)| v)
+            })
+    })?;
+    let options = entry.get("reasoning_options")?.as_array()?;
+    let values: Vec<String> = options
+        .iter()
+        .filter_map(|o| o.get("values"))
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
+fn persist_selection(selection: &str, provider: &Provider, base_url: &str) {
     let Some(path) = config_file_path() else {
         return;
     };
@@ -520,7 +706,7 @@ fn catalog_cost<'a>(
 /// the full input price.
 pub(crate) fn usage_cost(
     model: &str,
-    provider: Provider,
+    provider: &Provider,
     base_url: &str,
     usage: &crate::core::types::Usage,
 ) -> Option<f64> {
@@ -530,7 +716,7 @@ pub(crate) fn usage_cost(
     let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
         entry.get("api").and_then(|v| v.as_str()) == Some(base_url)
     })
-    .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.contains(&key)))
+    .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.iter().any(|k| k == key)))
     .or_else(|| catalog_cost(&catalog, &needle, |_, _| true))?;
     let input_rate = cost_val
         .get("input")
@@ -561,22 +747,23 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
     if let Some(catalog) = load_dex_catalog() {
         if let Some(providers) = catalog.as_object() {
             let mut ids: Vec<String> = Vec::new();
+            // Endpoint-qualified prefixes: builtins map to their named
+            // endpoints, configured generic providers to their own name.
+            let configured: BTreeMap<String, String> = load_provider_entries(&load_config_file())
+                .into_keys()
+                .map(|n| (n.clone(), n))
+                .collect();
             for (prov_key, entry) in providers {
                 if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                    // Endpoint-qualified variants for the opencode endpoints;
-                    // other catalog providers stay bare. "openai" models are
-                    // bare-only: those the opencode endpoints serve already
-                    // appear under zen//go/ via the opencode/opencode-go
-                    // entries.
-                    let dex_prefix: Option<&str> = match prov_key.as_str() {
-                        "opencode" => Some("zen"),
-                        "opencode-go" => Some("go"),
-                        "openai-codex" | "codex" => Some("openai-codex"),
-                        _ => None,
+                    let dex_prefix: Option<String> = match prov_key.as_str() {
+                        "opencode" => Some("zen".to_string()),
+                        "opencode-go" => Some("go".to_string()),
+                        "openai-codex" | "codex" => Some("openai-codex".to_string()),
+                        other => configured.get(other).cloned(),
                     };
                     for id in models.keys() {
                         ids.push(id.clone());
-                        if let Some(prefix) = dex_prefix {
+                        if let Some(prefix) = &dex_prefix {
                             if prefix != id.as_str() {
                                 ids.push(format!("{prefix}/{id}"));
                             }
@@ -670,7 +857,7 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|v| !v.is_empty());
     let base_url = env_base_url
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| provider.default_base_url().to_string());
+        .unwrap_or_else(|| provider.default_base_url().unwrap_or_default().to_string());
     let api_key = std::env::var("OPENAI_API_KEY")
         .ok()
         .ok_or("models.dev unavailable and OPENAI_API_KEY not set for fallback")?;
@@ -682,13 +869,13 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
     let mut all: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let extra_headers = custom_headers_config_and_env();
-    for id in fetch_provider_models(&client, provider, &base_url, &api_key, &extra_headers) {
+    for id in fetch_provider_models(&client, &provider, &base_url, &api_key, &extra_headers) {
         if seen.insert(id.clone()) {
             all.push(id);
         }
     }
     for (name, url) in &endpoints {
-        for id in fetch_provider_models(&client, provider, url, &api_key, &extra_headers) {
+        for id in fetch_provider_models(&client, &provider, url, &api_key, &extra_headers) {
             let prefixed = format!("{name}/{id}");
             if seen.insert(prefixed.clone()) {
                 all.push(prefixed);
@@ -752,7 +939,7 @@ struct ModelEntry {
 /// model alone.
 fn fetch_provider_models(
     client: &reqwest::blocking::Client,
-    provider: Provider,
+    provider: &Provider,
     base_url: &str,
     api_key: &str,
     extra_headers: &BTreeMap<String, String>,
@@ -1006,6 +1193,9 @@ pub(crate) struct LlmConfig {
     pub(crate) model: String,
     pub(crate) available_models: Vec<String>,
     pub(crate) endpoints: BTreeMap<String, String>,
+    /// Configured generic providers (`providers:` map): the deposit place for
+    /// per-provider keys plus optional base_url/`api:` overrides.
+    pub(crate) provider_entries: BTreeMap<String, ProviderEntry>,
     pub(crate) api: ApiProtocol,
     pub(crate) account_id: Option<String>,
     pub(crate) thinking_effort: Option<String>,
@@ -1057,7 +1247,13 @@ impl LlmConfig {
             .ok()
             .or_else(|| load_config_str(&file, "provider"))
             .unwrap_or_else(|| "opencode".to_string());
-        let provider = Provider::parse(&provider_name)?;
+        let provider_entries = load_provider_entries(&file);
+        let known: BTreeSet<String> = provider_entries.keys().cloned().collect();
+        let provider = Provider::parse_known(&provider_name, &known).ok_or_else(|| {
+            format!(
+                "unsupported provider '{provider_name}'; use opencode, openai-codex or a providers: entry"
+            )
+        })?;
         let model = model_override
             .or_else(|| env::var("OPENAI_MODEL").ok())
             .or_else(|| load_config_str(&file, "model"))
@@ -1080,13 +1276,34 @@ impl LlmConfig {
         // set. Only the fallback default (nothing set anywhere) routes.
         let explicit_base_url =
             base_url_override.is_some() || env_base_url.is_some() || file_base_url.is_some();
+        // Landing endpoint for a bare first pick: builtin default, or for a
+        // generic provider its config entry / catalog `api` URL. An empty
+        // landing means the generic provider has no known endpoint — fail
+        // loudly instead of pointing requests at "".
+        let landing = landing_base_url_for(&provider, &provider_entries);
         let base_url = base_url_override
             .or(env_base_url)
             .or(file_base_url)
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| provider.default_base_url().to_string());
+            .unwrap_or_else(|| landing.clone().unwrap_or_default());
+        if base_url.is_empty() {
+            return Err(format!(
+                "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
+                provider.name()
+            )
+            .into());
+        }
+        // Wire protocol default: OPENAI_API pins everything, else the
+        // active provider's `api:` entry pin, else the global file `api:`,
+        // else responses.
         let api_name = env::var("OPENAI_API")
             .ok()
+            .or_else(|| {
+                provider_entries
+                    .get(provider.name())
+                    .and_then(|e| e.api)
+                    .map(|a| a.name().to_string())
+            })
             .or_else(|| load_config_str(&file, "api"))
             .unwrap_or_else(|| "openai-responses".to_string());
         let api = match ApiProtocol::parse(&api_name) {
@@ -1103,8 +1320,11 @@ impl LlmConfig {
         // only the default. `OPENAI_API` pins everything, otherwise the
         // `apply_model` call below resolves the selection-aware protocol
         // (full `endpoint/id` key, then bare id, then learned fallback).
-        let (api_key, account_id) =
-            provider.load_credentials(load_config_str(&file, "api_key").as_deref())?;
+        let (api_key, account_id) = resolve_credentials(
+            &provider,
+            &provider_entries,
+            load_config_str(&file, "api_key").as_deref(),
+        )?;
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1154,7 +1374,7 @@ impl LlmConfig {
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
         // Always expose zen/go for OpenCode so /model can set base_url without env
-        let endpoints: BTreeMap<String, String> = provider.endpoints();
+        let endpoints: BTreeMap<String, String> = endpoints_for(&provider, &provider_entries);
         // Dex own cache (no pi dependency) — bootstraps with just current model if missing.
         if available_models.is_empty() {
             if let Some(cached) = load_dex_models_cache() {
@@ -1183,6 +1403,7 @@ impl LlmConfig {
             extra_headers,
             client,
             endpoints,
+            provider_entries,
         };
         // A prefixed model override (--model go/foo or the daemon's
         // per-request model) routes to its endpoint; bare ids keep the
@@ -1223,22 +1444,29 @@ impl LlmConfig {
     /// file (it becomes the new default).
     pub(crate) fn apply_model(&mut self, selection: &str, persist: bool) -> Option<String> {
         let prev_model = self.model.clone();
-        let prev_provider = self.provider;
+        let prev_provider = self.provider.clone();
         // Provider-qualified: "opencode/gpt-..." or "openai-codex/gpt-..." sets base_url without env
         let mut sel = selection;
         if let Some((prefix, rest)) = selection.split_once('/') {
-            if let Ok(new_provider) = Provider::parse(prefix) {
+            let known: BTreeSet<String> = self.provider_entries.keys().cloned().collect();
+            if let Some(new_provider) = Provider::parse_known(prefix, &known) {
                 if new_provider != self.provider {
                     // Best-effort credential switch; failure surfaces at next LLM call
-                    if let Ok((k, acct)) = new_provider.load_credentials(None) {
+                    if let Ok((k, acct)) =
+                        resolve_credentials(&new_provider, &self.provider_entries, None)
+                    {
                         self.api_key = k;
                         self.account_id = acct;
                     }
                     // Switch even without creds so /model shows intent;
-                    // auth failure surfaces at the next LLM call.
+                    // auth failure surfaces at the next LLM call. Generic
+                    // providers land on their config entry / catalog URL.
+                    let landing = landing_base_url_for(&new_provider, &self.provider_entries)
+                        .unwrap_or_else(|| self.base_url.clone());
+                    let new_endpoints = endpoints_for(&new_provider, &self.provider_entries);
                     self.provider = new_provider;
-                    self.base_url = new_provider.default_base_url().to_string();
-                    self.endpoints = new_provider.endpoints();
+                    self.base_url = landing;
+                    self.endpoints = new_endpoints;
                 }
                 sel = rest;
             }
@@ -1279,7 +1507,7 @@ impl LlmConfig {
             self.api = api;
         }
         if persist && (self.model != prev_model || self.provider != prev_provider) {
-            persist_selection(selection, self.provider, &self.base_url);
+            persist_selection(selection, &self.provider, &self.base_url);
         }
         // Dex standalone: contextWindow from models.dev catalog > provider default; refresh unless env pinned it.
         if env::var("DEX_CONTEXT_WINDOW").is_err() {
@@ -1314,20 +1542,40 @@ impl LlmConfig {
 
     pub(crate) fn switch_provider(
         &mut self,
-        provider: Provider,
+        provider: &Provider,
         persist: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let (api_key, account_id) = resolve_credentials(provider, &self.provider_entries, None)?;
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
-        let (api_key, account_id) = provider.load_credentials(None)?;
-        self.provider = provider;
+        let landing = match provider {
+            Provider::Generic(name) => self
+                .provider_entries
+                .get(name)
+                .and_then(|e| e.base_url.clone())
+                .or_else(|| load_dex_catalog().and_then(|c| catalog_api(name, &c)))
+                .ok_or_else(|| {
+                    format!(
+                        "provider '{name}' has no base_url: set it under providers: or run `dex update --models`"
+                    )
+                })?,
+            _ => provider.default_base_url().unwrap_or_default().to_string(),
+        };
+        self.provider = provider.clone();
         self.api_key = api_key;
         self.account_id = account_id;
-        self.base_url = env_base_url
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| provider.default_base_url().to_string());
-        self.endpoints = provider.endpoints();
+        self.base_url = env_base_url.unwrap_or(landing);
+        self.endpoints = endpoints_for(&self.provider, &self.provider_entries);
+        // Wire protocol: OPENAI_API pins everything, else the provider's
+        // `api:` entry pin, else the global file `api:`, else responses —
+        // then the current model's own resolution on top.
         let api_name = env::var("OPENAI_API")
             .ok()
+            .or_else(|| {
+                self.provider_entries
+                    .get(provider.name())
+                    .and_then(|e| e.api)
+                    .map(|a| a.name().to_string())
+            })
             .or_else(|| load_config_str(&load_config_file(), "api"));
         self.api = api_name
             .as_deref()
@@ -1349,9 +1597,9 @@ impl LlmConfig {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        build_ctx_map, detect_verify_command, load_dex_models_cache, model_api_from_env,
-        remember_learned_api, usage_cost, ApiProtocol, LlmConfig, ModelsResponse, PermissionMode,
-        Provider,
+        build_ctx_map, detect_verify_command, load_config_file, load_dex_models_cache,
+        load_provider_entries, model_api_from_env, reasoning_options_for, remember_learned_api,
+        usage_cost, ApiProtocol, LlmConfig, ModelsResponse, PermissionMode, Provider,
     };
     use crate::core::types::Usage;
     use std::env;
@@ -1383,6 +1631,7 @@ pub(crate) mod tests {
             verify_command: None,
             extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
+            provider_entries: Default::default(),
         };
         // Bare id keeps the current base_url.
         assert_eq!(cfg.apply_model("gpt-5.6-luna", false), None);
@@ -1453,7 +1702,7 @@ pub(crate) mod tests {
         assert_eq!(
             usage_cost(
                 "m-1",
-                Provider::OpenCode,
+                &Provider::OpenCode,
                 "https://go.example/v1",
                 &usage(1_000_000, 0, None)
             ),
@@ -1464,7 +1713,7 @@ pub(crate) mod tests {
         assert_eq!(
             usage_cost(
                 "m-1",
-                Provider::OpenCode,
+                &Provider::OpenCode,
                 "https://go.example/v1",
                 &usage(1_000_000, 100_000, Some(400_000))
             ),
@@ -1475,7 +1724,7 @@ pub(crate) mod tests {
         assert_eq!(
             usage_cost(
                 "m-1",
-                Provider::OpenCode,
+                &Provider::OpenCode,
                 "https://unrelated.example/v1",
                 &usage(1_000_000, 0, None)
             ),
@@ -1486,7 +1735,7 @@ pub(crate) mod tests {
         assert_eq!(
             usage_cost(
                 "m-1",
-                Provider::OpenCode,
+                &Provider::OpenCode,
                 "https://unrelated.example/v1",
                 &usage(1_000_000, 1_000_000, None)
             ),
@@ -1496,7 +1745,7 @@ pub(crate) mod tests {
         assert_eq!(
             usage_cost(
                 "m-2",
-                Provider::OpenAiCodex,
+                &Provider::OpenAiCodex,
                 "https://x.example/v1",
                 &usage(1_000_000, 0, None)
             ),
@@ -1536,6 +1785,7 @@ pub(crate) mod tests {
             verify_command: None,
             extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
+            provider_entries: Default::default(),
         }
     }
 
@@ -1634,11 +1884,11 @@ pub(crate) mod tests {
         assert!(Provider::parse("unknown").is_err());
         assert_eq!(
             Provider::OpenCode.default_base_url(),
-            "https://opencode.ai/zen/v1"
+            Some("https://opencode.ai/zen/v1")
         );
         assert_eq!(
             Provider::OpenAiCodex.default_base_url(),
-            "https://chatgpt.com/backend-api/codex"
+            Some("https://chatgpt.com/backend-api/codex")
         );
     }
 
@@ -1662,12 +1912,15 @@ pub(crate) mod tests {
         // Switch to codex via provider-qualified model — no env base_url required
         cfg.apply_model("openai-codex/gpt-5.6-luna", false);
         assert_eq!(cfg.provider, Provider::OpenAiCodex);
-        assert_eq!(cfg.base_url, Provider::OpenAiCodex.default_base_url());
+        assert_eq!(
+            cfg.base_url,
+            Provider::OpenAiCodex.default_base_url().unwrap()
+        );
         assert_eq!(cfg.model, "gpt-5.6-luna");
         // Switch back via alias "openai"
         cfg.apply_model("openai/gpt-4o", false);
         assert_eq!(cfg.provider, Provider::OpenCode);
-        assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url());
+        assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url().unwrap());
         assert_eq!(cfg.model, "gpt-4o");
         // Provider + endpoint: opencode/go/kimi -> go endpoint
         cfg.apply_model("opencode/go/kimi-k2", false);
@@ -1705,7 +1958,7 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("dex-missing-{}", std::process::id())),
         );
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
-        assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url());
+        assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url().unwrap());
         assert!(cfg.endpoints.contains_key("go"));
         assert!(cfg.endpoints.contains_key("zen"));
     }
@@ -2054,6 +2307,163 @@ pub(crate) mod tests {
         assert_eq!(cfg.model, "m-go-only");
         // The pin holds even though the catalog says m-go-only lives on go.
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Synthetic catalog with a third-party OpenAI-compatible provider
+    /// ("zai") so the generic provider layer can be exercised end to end.
+    fn write_generic_catalog(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("dex/models.dev.json"),
+            serde_json::json!({
+                "zai": {
+                    "api": "https://api.zai.example/v4",
+                    "env": { "ZAI_TEST_KEY": "z.ai api key" },
+                    "models": {
+                        "glm-x": {
+                            "limit": { "context": 1 },
+                            "reasoning_options": [
+                                { "type": "effort", "values": ["low", "high"] }
+                            ]
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn generic_config(dir: &std::path::Path, providers_yaml: &str) -> std::path::PathBuf {
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, format!("provider: zai\n{providers_yaml}")).unwrap();
+        path
+    }
+
+    #[test]
+    fn generic_provider_resolves_endpoint_key_and_routing() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENAI_MODEL",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+            "ZAI_TEST_KEY",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-generic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_generic_catalog(&dir);
+        generic_config(&dir, "providers:\n  zai:\n    api_key: zsk-deposit\n");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENAI_MODEL", "glm-x");
+        for key in [
+            "DEX_PROVIDER",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "ZAI_TEST_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+        // Endpoint + key from the deposit place; catalog supplies the URL.
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.provider.name(), "zai");
+        assert_eq!(cfg.base_url, "https://api.zai.example/v4");
+        assert_eq!(cfg.api_key, "zsk-deposit");
+        assert_eq!(
+            cfg.endpoints.get("zai").map(String::as_str),
+            Some("https://api.zai.example/v4")
+        );
+        // `/model zai/glm-x` is a no-op (already there); unknown prefixes
+        // must still stay plain model ids.
+        let mut cfg = cfg;
+        assert!(cfg.apply_model("unknown/m", false).is_none());
+        assert_eq!(cfg.model, "unknown/m");
+        // Key falls back to the provider's own conventional env var.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: zai\nproviders:\n  zai: {}\n",
+        )
+        .unwrap();
+        std::env::set_var("ZAI_TEST_KEY", "zsk-from-env");
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.api_key, "zsk-from-env");
+        // No key anywhere: the error names both deposit places.
+        std::env::remove_var("ZAI_TEST_KEY");
+        let err = match LlmConfig::from_env(None, None, None, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected missing-key error"),
+        };
+        assert!(err.contains("providers.zai.api_key"), "{err}");
+        assert!(err.contains("ZAI_TEST_KEY"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generic_provider_switch_and_completion_ids() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENAI_MODEL",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-gswitch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_generic_catalog(&dir);
+        generic_config(&dir, "providers:\n  zai:\n    api_key: zsk-deposit\n");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        for key in [
+            "DEX_PROVIDER",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENAI_MODEL",
+        ] {
+            std::env::remove_var(key);
+        }
+        // Completion list offers the configured provider's qualified ids.
+        let ids = load_dex_models_cache().unwrap();
+        assert!(ids.contains(&"glm-x".to_string()));
+        assert!(ids.contains(&"zai/glm-x".to_string()));
+        // Provider-qualified pick switches to the generic provider.
+        let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert!(cfg.apply_model("zai/glm-x", false).is_none()); // already on zai
+        assert_eq!(cfg.model, "glm-x");
+        // From opencode, the same pick switches provider AND endpoint.
+        let mut cfg = test_cfg();
+        cfg.provider_entries = load_provider_entries(&load_config_file());
+        assert_eq!(cfg.apply_model("zai/glm-x", false), None);
+        assert_eq!(cfg.provider.name(), "zai");
+        assert_eq!(cfg.base_url, "https://api.zai.example/v4");
+        // Thinking options come from the catalog for the selected model.
+        assert_eq!(
+            reasoning_options_for("glm-x"),
+            Some(vec!["low".to_string(), "high".to_string()])
+        );
+        assert_eq!(reasoning_options_for("m-unknown"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

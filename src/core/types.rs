@@ -288,10 +288,15 @@ impl ApiProtocol {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Provider {
     OpenCode,
     OpenAiCodex,
+    /// Any configured OpenAI-compatible provider (`providers:` map in
+    /// config.yaml); the string is the catalog/config key ("zai",
+    /// "openrouter", …). Auth is a bearer key; endpoint, models, pricing and
+    /// protocol all come from the models.dev catalog entry of the same key.
+    Generic(String),
 }
 
 impl Provider {
@@ -300,16 +305,40 @@ impl Provider {
             "opencode" | "openai" => Ok(Self::OpenCode),
             "openai-codex" | "codex" => Ok(Self::OpenAiCodex),
             other => Err(format!(
-                "unsupported provider '{}'; use opencode or openai-codex",
+                "unsupported provider '{}'; use opencode, openai-codex or a configured providers: entry",
                 other
             )),
         }
     }
 
-    pub(crate) fn name(self) -> &'static str {
+    /// Strict parse that also accepts known configured generic providers.
+    /// Returns None for unknown names — call sites that route model-id
+    /// prefixes must keep those as part of the model id.
+    pub(crate) fn parse_known(
+        value: &str,
+        known: &std::collections::BTreeSet<String>,
+    ) -> Option<Self> {
+        let lowered = value.trim().to_ascii_lowercase();
+        Self::parse(&lowered).ok().or_else(|| {
+            known
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(&lowered))
+                .then_some(Self::Generic(lowered))
+        })
+    }
+
+    /// Display-only parse (daemon echo of an already-resolved provider):
+    /// unknown names still become `Generic` so the name survives round-trips.
+    pub(crate) fn from_display(value: &str) -> Self {
+        let lowered = value.trim().to_ascii_lowercase();
+        Self::parse(&lowered).unwrap_or_else(|_| Self::Generic(lowered.clone()))
+    }
+
+    pub(crate) fn name(&self) -> &str {
         match self {
             Self::OpenCode => "opencode",
             Self::OpenAiCodex => "openai-codex",
+            Self::Generic(name) => name,
         }
     }
 }

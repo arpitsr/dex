@@ -124,6 +124,33 @@ needs configuring. Manual overrides are escape hatches only:
 everything. Do NOT set a global `api:` in the config file to fix one model —
 it pins every model and disables the automatic fallback.
 
+### Other OpenAI-compatible providers
+
+Any models.dev provider with an OpenAI-style endpoint works without dedicated
+integration. Deposit its key under `providers:` and pick it by name:
+
+```yaml
+provider: zai
+providers:
+  zai:
+    api_key: zsk-...       # the deposit place; or export ZHIPU_API_KEY
+    # base_url: ...        # optional; defaults to the catalog endpoint
+    # api: openai-completions  # optional protocol pin; learned otherwise
+```
+
+`/provider zai` and `/model zai/<id>` switch to it (the completion list shows
+`zai/<id>` once configured). The endpoint, model list, pricing, context
+windows and reasoning options come from the cached models.dev catalog — run
+`dex update --models` once. The key resolves per provider: config
+`providers.<name>.api_key` > the provider's own documented env var (from the
+catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`) — `OPENAI_API_KEY` is
+only opencode's. A model's advertised thinking options (e.g. `low/high/max`)
+are shown in the `/model` confirmation; `DEX_THINKING_EFFORT` picks one.
+Wire protocol resolves like opencode: responses first, one fallback to
+completions, remembered per endpoint+model. Native-protocol-only providers
+(no OpenAI-compatible endpoint in the catalog, e.g. anthropic) are not
+selectable this way.
+
 For ChatGPT-backed Codex, first run `codex --login`, then:
 
 ```sh
