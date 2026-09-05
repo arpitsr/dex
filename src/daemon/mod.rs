@@ -153,31 +153,33 @@ impl DaemonState {
 
     /// Seed `event_seqs` for a session from its persisted journal: the next
     /// allocation continues after the highest journaled seq (0 when empty).
+    /// Takes the max with any live counter: the startup rebuild now runs in
+    /// the background, so a turn may have allocated seqs before this seeds.
     fn seed_seq(&self, session_id: &str, path: &std::path::Path) {
         let max = crate::session::Session::max_event_seq(path);
         let next = if max > 0 { max + 1 } else { 0 };
         self.event_seqs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.to_string(), next);
+            .entry(session_id.to_string())
+            .and_modify(|seq| *seq = (*seq).max(next))
+            .or_insert(next);
     }
 
     /// Rebuild the session registry from disk (`Session::list_all`) after a
     /// daemon restart, seed per-session event cursors, and mark turns that
     /// were interrupted by the crash (`turn_start` with no terminal entry) as
     /// `turn_failed` so a reattaching client sees the truth instead of a ghost.
+    ///
+    /// Runs on a background thread at startup: all file IO happens lock-free
+    /// and the registry lock is held only for the final insert, so serving
+    /// (notably `POST /api/sessions`) never blocks behind the scan. Entries
+    /// use `or_insert` so sessions created while the rebuild was in flight
+    /// win over their (nonexistent) disk state.
     pub fn rebuild(&self) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = Vec::new();
         for (path, header) in crate::session::Session::list_all().unwrap_or_default() {
             let id = header.id().to_string();
-            sessions.insert(
-                id.clone(),
-                SessionEntry {
-                    path: path.clone(),
-                    name: header.name().map(ToOwned::to_owned),
-                    cwd: header.cwd().to_string(),
-                },
-            );
             self.seed_seq(&id, &path);
             if crate::session::Session::last_turn_state(&path) == "interrupted" {
                 // Session::from_path refuses in-memory (pathless) sessions but
@@ -191,6 +193,18 @@ impl DaemonState {
                     });
                 }
             }
+            entries.push((
+                id,
+                SessionEntry {
+                    path: path.clone(),
+                    name: header.name().map(ToOwned::to_owned),
+                    cwd: header.cwd().to_string(),
+                },
+            ));
+        }
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, entry) in entries {
+            sessions.entry(id).or_insert(entry);
         }
     }
 }
@@ -198,9 +212,13 @@ impl DaemonState {
 /// Start the daemon HTTP server on an already-bound listener.
 pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
     let state = std::sync::Arc::new(DaemonState::new());
-    // Rebuild in-memory state from the persisted JSONL before serving: the
-    // registry and per-session event cursors survive restarts (P8/P10).
-    state.rebuild();
+    // Rebuild in-memory state from the persisted JSONL on a background thread:
+    // scanning every session (headers, event seqs, turn state) costs ~0.5s
+    // with a few thousand sessions and would delay /health and TUI first
+    // paint. Fresh sessions use uuid ids so they never collide with rebuilt
+    // ones; `seed_seq` takes the max so a racing turn can't rewind a counter.
+    let warm = state.clone();
+    tokio::task::spawn_blocking(move || warm.rebuild());
 
     let app = server::router(state.clone());
 
