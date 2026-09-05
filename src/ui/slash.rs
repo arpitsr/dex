@@ -442,7 +442,13 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             let m = line["/model ".len()..].trim().to_string();
             if !m.is_empty() {
                 let old_provider = app.config.provider.clone();
-                let endpoint = app.config.apply_model(&m, true);
+                let endpoint = match app.config.apply_model(&m, true) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        push_info(app, format!("could not switch model: {error}"));
+                        return false;
+                    }
+                };
                 if !app
                     .config
                     .available_models
@@ -558,7 +564,13 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
     }
     if let Some(model) = state.get("model") {
         if app.config.model != *model {
-            let endpoint = app.config.apply_model(model, false);
+            let endpoint = match app.config.apply_model(model, false) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    push_info(app, format!("could not restore model '{model}': {error}"));
+                    return;
+                }
+            };
             if !app
                 .config
                 .available_models

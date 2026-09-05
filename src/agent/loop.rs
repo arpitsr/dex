@@ -505,6 +505,8 @@ mod tests {
             extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
             provider_entries: Default::default(),
+            provider_headers: Default::default(),
+            api_pinned: false,
         }
     }
 

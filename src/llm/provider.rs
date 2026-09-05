@@ -1,14 +1,14 @@
-//! Per-provider wiring. Behavior that differs between builtin providers is a
-//! method here; configured generic providers (`providers:` map in config.yaml)
-//! resolve everything wire-shape-specific through `LlmConfig` + the models.dev
-//! catalog instead — bearer auth, catalog `api` endpoint, empirical protocol.
-//! Identity (`parse`/`name`) stays on the enum in `core::types`.
+//! Per-provider wiring. What differs by provider *kind* is a method here
+//! (builtin tables); what differs by provider *configuration* (endpoint,
+//! key, protocol pin, headers) is derived once into
+//! `config::ResolvedProvider` from the `providers:` map + models.dev
+//! catalog. Identity (`parse`/`name`) stays on the enum in `core::types`.
 
 use std::collections::BTreeMap;
 
 use crate::core::types::Provider;
 
-/// Model used when `OPENAI_MODEL`, config file and `--model` are all unset.
+/// Model used when `--model` and config file `model:` are both unset.
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 /// Context-window fallback when `DEX_CONTEXT_WINDOW` is unset and the
@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
 impl Provider {
-    /// Base URL when `OPENAI_BASE_URL`, `--base-url` and config-file
+    /// Base URL when `--base-url` and config-file
     /// `base_url` are all unset. Bare model picks route themselves to the
     /// right endpoint via the models.dev catalog (see `apply_model`), so
     /// this is just the landing endpoint, not a per-model decision. Generic
@@ -50,6 +50,8 @@ impl Provider {
     }
 
     /// models.dev catalog keys that can serve this provider (pricing lookup).
+    /// These are the catalog's own provider ids — `"openai"` here is
+    /// OpenAI proper in models.dev, not a dex provider alias (there is none).
     pub(crate) fn catalog_keys(&self) -> Vec<String> {
         match self {
             Self::OpenCode => ["opencode", "opencode-go", "openai"]
@@ -78,19 +80,47 @@ impl Provider {
         matches!(self, Self::OpenAiCodex)
     }
 
-    /// Extra headers for every request (codex backend-api wants the
-    /// originator marker and the account id; generic providers are plain
-    /// bearer — no per-provider header table until one is actually needed).
-    pub(crate) fn auth_headers(&self, account_id: Option<&str>) -> Vec<(&'static str, String)> {
+    /// How this provider authenticates HTTP requests. One match arm is the
+    /// whole seam: a new scheme (e.g. an `api-key` header for Azure-style
+    /// endpoints) is a new `AuthScheme` variant + one `apply` arm — request
+    /// call sites never change.
+    pub(crate) fn auth_scheme(&self) -> AuthScheme {
         match self {
-            Self::OpenAiCodex => {
-                let mut headers = vec![("originator", "codex_cli_rs".to_string())];
+            Self::OpenAiCodex => AuthScheme::Codex,
+            _ => AuthScheme::Bearer,
+        }
+    }
+}
+
+/// Request authentication scheme, resolved per provider by
+/// [`Provider::auth_scheme`] and applied in exactly one place
+/// (`client::authenticated_request`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AuthScheme {
+    /// `Authorization: Bearer <key>` — every provider except codex.
+    Bearer,
+    /// Bearer key plus the codex backend-api originator marker and
+    /// account id.
+    Codex,
+}
+
+impl AuthScheme {
+    pub(crate) fn apply(
+        self,
+        request: reqwest::blocking::RequestBuilder,
+        api_key: &str,
+        account_id: Option<&str>,
+    ) -> reqwest::blocking::RequestBuilder {
+        let request = request.bearer_auth(api_key);
+        match self {
+            Self::Bearer => request,
+            Self::Codex => {
+                let mut request = request.header("originator", "codex_cli_rs");
                 if let Some(account_id) = account_id {
-                    headers.push(("ChatGPT-Account-ID", account_id.to_string()));
+                    request = request.header("ChatGPT-Account-ID", account_id);
                 }
-                headers
+                request
             }
-            _ => Vec::new(),
         }
     }
 }
@@ -110,14 +140,45 @@ mod tests {
         assert!(!Provider::OpenAiCodex.has_protocol_fallback());
         assert!(Provider::OpenAiCodex.credentials_refreshable());
         assert!(!Provider::OpenCode.credentials_refreshable());
+        assert!(matches!(
+            Provider::OpenCode.auth_scheme(),
+            AuthScheme::Bearer
+        ));
+        assert!(matches!(
+            Provider::OpenAiCodex.auth_scheme(),
+            AuthScheme::Codex
+        ));
+        assert!(matches!(
+            Provider::Generic("zai".into()).auth_scheme(),
+            AuthScheme::Bearer
+        ));
+        // The scheme is the single application point: bearer sets the key,
+        // codex adds its originator marker and account id.
+        let req = Provider::OpenAiCodex
+            .auth_scheme()
+            .apply(
+                reqwest::blocking::Client::new().get("http://localhost/v1"),
+                "tok",
+                Some("acct"),
+            )
+            .build()
+            .unwrap();
         assert_eq!(
-            Provider::OpenAiCodex.auth_headers(Some("acct")),
-            vec![
-                ("originator", "codex_cli_rs".to_string()),
-                ("ChatGPT-Account-ID", "acct".to_string())
-            ]
+            req.headers()
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer tok")
         );
-        assert!(Provider::OpenCode.auth_headers(Some("acct")).is_empty());
+        assert_eq!(
+            req.headers().get("originator").map(|v| v.to_str().unwrap()),
+            Some("codex_cli_rs")
+        );
+        assert_eq!(
+            req.headers()
+                .get("chatgpt-account-id")
+                .map(|v| v.to_str().unwrap()),
+            Some("acct")
+        );
         assert_eq!(
             Provider::OpenCode.default_base_url(),
             Some("https://opencode.ai/zen/v1")
