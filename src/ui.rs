@@ -40,9 +40,6 @@ pub(super) const TAB_WIDTH: usize = 8;
 
 /// Raised-surface colors are resolved in `ui/theme.rs` from the terminal's
 /// own palette / detected background, so they follow the terminal theme.
-/// Braille spinner frames, matching the headless console spinner.
-const UI_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
 /// Max markdown re-parse rate while streaming (`markdown_lines` +
 /// tree-sitter runs once per window, not once per token). Wall-clock, not
 /// tick-based, so it stays constant when the frame rate changes.
@@ -183,7 +180,6 @@ pub(crate) struct App {
     pub(crate) git_branch: Option<String>,
     pub(crate) git_dirty: bool,
     pub(crate) turn_started: Option<Instant>,
-    pub(crate) active_tool: Option<String>,
     pub(crate) last_activity: Option<String>,
     pub(crate) steering_rx: Option<mpsc::Receiver<String>>,
     pub(crate) followup_rx: Option<mpsc::Receiver<String>>,
@@ -738,7 +734,6 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let mut it = s.splitn(2, ' ');
             let name = it.next().unwrap_or("").to_string();
             let arg = it.next().unwrap_or("").to_string();
-            app.active_tool = Some(name.clone());
             let input = indent_transcript_line(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Yellow)),
                 Span::styled(name, Style::default().fg(Color::Yellow)),
@@ -943,7 +938,6 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
     app.assistant_pending.clear();
     app.assistant_open = false;
     app.thinking_open = false;
-    app.active_tool = None;
     let msgs = app.messages.clone();
     for msg in msgs.iter().skip(1) {
         match msg.role {
@@ -1036,7 +1030,6 @@ mod tests {
             git_branch: None,
             git_dirty: false,
             turn_started: None,
-            active_tool: None,
             last_activity: None,
             steering_rx: None,
             followup_rx: None,
@@ -1480,7 +1473,6 @@ mod tests {
         app.pending_followups.push("follow".into());
         app.plan.steps.push(("step".into(), false));
         app.turn_start = 3;
-        app.active_tool = Some("read".into());
         app.last_activity = Some("worked".into());
         app.scroll = 9;
         app.autoscroll = false;
@@ -1499,7 +1491,6 @@ mod tests {
         assert!(app.pending_followups.is_empty());
         assert!(app.plan.is_empty());
         assert_eq!(app.turn_start, 0);
-        assert!(app.active_tool.is_none());
         assert!(app.last_activity.is_none());
     }
 

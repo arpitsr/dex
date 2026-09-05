@@ -432,12 +432,19 @@ fn thinking_indicator_text(thinking_open: bool, tick: u16) -> String {
     if !thinking_open {
         return "Thinking ...".to_string();
     }
-    let dots = match (tick / 2) % 3 {
+    let dots = dots_for_tick(tick);
+    format!("Thinking {dots}")
+}
+
+/// Shared dot cadence: cycles 1→3 every other animation frame (~0.24s at
+/// the ~8 fps busy heartbeat) — deliberately slower than the stream flush
+/// so the dots read as a calm pulse.
+fn dots_for_tick(tick: u16) -> &'static str {
+    match (tick / 2) % 3 {
         0 => ".",
         1 => "..",
         _ => "...",
-    };
-    format!("Thinking {dots}")
+    }
 }
 
 fn thinking_indicator_line(thinking_open: bool, tick: u16, width: u16) -> Line<'static> {
@@ -670,25 +677,21 @@ impl ActivityView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         // Always clear the rect first: ratatui only repaints cells the
         // widget writes, so a shorter "worked for …" line would otherwise
-        // leave trailing chars from the previous spinner text.
+        // leave trailing chars from a longer previous status text.
         f.render_widget(Clear, area);
         if !(app.busy || app.last_activity.is_some()) {
             return;
         }
         let content_width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
         let (activity_text, activity_color) = if app.busy {
-            // One spinner frame per animation draw (~0.12s at the busy
-            // heartbeat); the heartbeat caps the rate, not this divisor.
-            let frame = super::UI_SPINNER[app.tick as usize % super::UI_SPINNER.len()];
-            let tool = app
-                .active_tool
-                .as_ref()
-                .map(|name| format!(" · {name}"))
-                .unwrap_or_default();
+            // Dots cycle 1→3 on the shared cadence, matching the
+            // "Thinking .." indicator. The tool itself already shows in
+            // the transcript's ▸ block.
             (
-                // Spinner sits to the right of the text, matching the
-                // "Thinking .." indicator; one frame per animation draw.
-                truncate_display(&format!("Working {}{}", frame, tool), content_width),
+                truncate_display(
+                    &format!("Working {}", dots_for_tick(app.tick)),
+                    content_width,
+                ),
                 theme::muted_fg(),
             )
         } else {
@@ -1491,7 +1494,6 @@ mod tests {
             git_branch: None,
             git_dirty: false,
             turn_started: None,
-            active_tool: None,
             last_activity: None,
             steering_rx: None,
             followup_rx: None,

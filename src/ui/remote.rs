@@ -268,7 +268,6 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         git_branch: info.git_branch.clone(),
         git_dirty: info.git_dirty,
         turn_started: None,
-        active_tool: None,
         last_activity: None,
         steering_rx: None,
         followup_rx: None,
@@ -397,7 +396,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         // rebuilds the whole view + ratatui buffer diff (unicode widths per
         // cell), the top CPU cost in the flamegraph. Draw on state change
         // (worker message / input event); while busy also redraw at animation
-        // rate for the spinner + thinking dots, capped well below 60 fps.
+        // rate for the thinking/working dots, capped well below 60 fps.
         let mut dirty = true;
         let mut last_busy_draw = Instant::now();
         loop {
@@ -438,7 +437,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             let now = Instant::now();
             let anim_due = busy && now.duration_since(last_busy_draw) >= Duration::from_millis(120);
             if dirty || streamed || anim_due {
-                // Advance the animation frame so the spinner + status update.
+                // Advance the animation frame so the dots + status update.
                 remote.app.tick = remote.app.tick.wrapping_add(1);
                 terminal.draw(|f| view(f, &mut remote.app))?;
                 dirty = false;
@@ -735,7 +734,6 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     }
     app.busy = false;
     app.cancel_requested = false;
-    app.active_tool = None;
     // A turn can end right after thinking (cancel, failure before any text);
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);
@@ -1213,7 +1211,6 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let app = &mut remote.app;
     app.busy = true;
     app.cancel_requested = false;
-    app.active_tool = None;
     app.last_activity = None;
     app.turn_started = Some(std::time::Instant::now());
     remote.cancel_flag.store(false, Ordering::SeqCst);
@@ -1571,7 +1568,6 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             remote.app.transcript.clear();
             remote.app.assistant_pending.clear();
             remote.app.assistant_open = false;
-            remote.app.active_tool = None;
             match remote.client.reattach(&sid) {
                 Ok(resp) => {
                     remote.session_id = resp.session_id.clone();
