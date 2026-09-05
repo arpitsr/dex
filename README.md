@@ -26,6 +26,8 @@ sessions and can be resumed.
 - **History compaction** — when the context window is exceeded, older turns are summarized deterministically (no LLM call) to keep requests bounded. Set `DEX_COMPACTION_LLM=1` for model summarization.
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
+- **No telemetry** — dex makes network calls only to the LLM providers you
+  configure (plus `models.dev` for the model catalog). Nothing else.
 
 ## Install
 
@@ -34,7 +36,7 @@ on any distro, no libssl or glibc constraints), `x86_64`/`aarch64` macOS, and
 `x86_64` Windows, and attaches them to the GitHub release.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/HEAD/scripts/install.sh | sh
 ```
 
 - Pin a version: `curl -fsSL .../install.sh | sh -s -- 0.2.0`
@@ -457,4 +459,7 @@ round-tripped over `POST .../approve` and `POST .../cancel`. The local TUI
 
 ## License
 
-See the repository for license information.
+`dex` is dual-licensed under the [MIT](LICENSE) and
+[Apache-2.0](LICENSE-APACHE) licenses, at your option (`SPDX: MIT OR
+Apache-2.0`). See [CONTRIBUTING.md](CONTRIBUTING.md) and
+[SECURITY.md](SECURITY.md) for how to contribute and report security issues.

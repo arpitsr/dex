@@ -1,7 +1,7 @@
 #!/bin/sh
 # dex installer (Linux / macOS).
 #
-#   curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/HEAD/scripts/install.sh | sh
 #   curl -fsSL ... | sh -s -- 0.2.0                    # pin a version
 #   DEX_INSTALL_DIR=/usr/local/bin curl -fsSL ... | sh # custom directory
 #
