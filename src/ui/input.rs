@@ -60,6 +60,31 @@ impl InputField {
         self.col += c.len_utf8();
     }
 
+    /// Insert a whole pasted chunk: tabs expand to four spaces (they would
+    /// render as tab stops and desync the frame), CR / LF / CRLF each become
+    /// one composer newline, and other control characters are dropped.
+    pub(super) fn insert_paste(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    self.insert_char('\n');
+                }
+                '\n' => self.insert_char('\n'),
+                '\t' => {
+                    for _ in 0..4 {
+                        self.insert_char(' ');
+                    }
+                }
+                c if !c.is_control() => self.insert_char(c),
+                _ => {}
+            }
+        }
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c)
@@ -187,6 +212,34 @@ mod tests {
             f.text().contains("10;rgb:"),
             "plain is inserted when it reaches input"
         );
+    }
+
+    #[test]
+    fn paste_becomes_multiline_and_expands_tabs() {
+        let mut f = InputField::new();
+        // CRLF, CR and LF each count as exactly one newline; a tab widens to
+        // four spaces so the frame never desyncs on tab stops.
+        f.insert_paste("a\r\nb\rc\nd\t!");
+        assert_eq!(
+            f.lines,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d    !".to_string()
+            ]
+        );
+        // Cursor rests at the end of the pasted text.
+        assert_eq!(f.row, 3);
+        assert_eq!(f.col, f.lines[3].len());
+        // Other control characters (ESC etc.) are dropped, not typed.
+        let mut g = InputField::new();
+        g.insert_paste("\x1b[31mred");
+        assert_eq!(g.text(), "[31mred");
+        // Empty paste is a no-op.
+        let mut h = InputField::new();
+        h.insert_paste("");
+        assert_eq!(h.lines, vec![String::new()]);
     }
 
     #[test]

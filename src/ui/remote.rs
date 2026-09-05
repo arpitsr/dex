@@ -5,8 +5,8 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -268,7 +268,6 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         git_branch: info.git_branch.clone(),
         git_dirty: info.git_dirty,
         turn_started: None,
-        active_tool: None,
         last_activity: None,
         steering_rx: None,
         followup_rx: None,
@@ -292,6 +291,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         show_thinking: false,
         thinking_open: false,
         assistant_pending: String::new(),
+        stream_last_flush: Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
         display_cache: Vec::new(),
@@ -378,7 +378,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         stdout,
         DisableMouseCapture,
         EnterAlternateScreen,
-        EnableMouseScroll
+        EnableMouseScroll,
+        // DECSET 2004: the terminal wraps pastes in `ESC[200~ … ESC[201~` so
+        // crossterm delivers them as one `Event::Paste`. Without it a paste is
+        // typed through as individual keys and every embedded newline arrives
+        // as a real Enter — submitting the first line of a multi-line paste.
+        EnableBracketedPaste
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -388,11 +393,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         // iterations of the loop.
         let mut pending: VecDeque<Event> = VecDeque::new();
         // ponytail: draw on change, not on a 60 fps heartbeat — every frame
-        // rebuilds the whole view (O(transcript)), which showed up as the top
-        // idle CPU cost. Draw when state changed (worker message / input
-        // event) or while a turn is animating (spinner + thinking dots);
-        // otherwise just park in event::poll.
+        // rebuilds the whole view + ratatui buffer diff (unicode widths per
+        // cell), the top CPU cost in the flamegraph. Draw on state change
+        // (worker message / input event); while busy also redraw at animation
+        // rate for the thinking/working dots, capped well below 60 fps.
         let mut dirty = true;
+        let mut last_busy_draw = Instant::now();
         loop {
             // Drain worker messages: the transcript updates live while the
             // turn streams in on the worker thread.
@@ -426,16 +432,23 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             if remote.app.tick_notice() {
                 dirty = true;
             }
-            if dirty || streamed || busy {
-                // Advance the animation frame so the spinner + status update.
+            // Animation heartbeat while a turn runs: at most ~8 fps, and
+            // streaming/input draws reset the clock so they don't double up.
+            let now = Instant::now();
+            let anim_due = busy && now.duration_since(last_busy_draw) >= Duration::from_millis(120);
+            if dirty || streamed || anim_due {
+                // Advance the animation frame so the dots + status update.
                 remote.app.tick = remote.app.tick.wrapping_add(1);
                 terminal.draw(|f| view(f, &mut remote.app))?;
                 dirty = false;
+                if busy {
+                    last_busy_draw = Instant::now();
+                }
             }
 
             let next = if let Some(event) = pending.pop_front() {
                 event
-            } else if event::poll(Duration::from_millis(if busy { 16 } else { 250 }))? {
+            } else if event::poll(Duration::from_millis(if busy { 100 } else { 250 }))? {
                 event::read()?
             } else {
                 continue;
@@ -452,21 +465,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                     handle_key(&mut remote, key);
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut remote, mouse),
-                Event::Paste(s) => {
-                    // Tabs would render as tab stops and desync the frame;
-                    // expand them and drop other control characters.
-                    for c in s.chars() {
-                        match c {
-                            '\t' => {
-                                for _ in 0..4 {
-                                    remote.app.input.insert_char(' ');
-                                }
-                            }
-                            c if !c.is_control() => remote.app.input.insert_char(c),
-                            _ => {}
-                        }
-                    }
-                }
+                Event::Paste(s) => remote.app.input.insert_paste(&s),
                 Event::Resize(..) => {} // frame recomputed each draw
                 _ => {}
             }
@@ -483,7 +482,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let res = run();
     // Always restore the terminal, even if the loop returned early via `?`.
     disable_raw_mode().ok();
-    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     res
 }
 
@@ -730,7 +734,6 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     }
     app.busy = false;
     app.cancel_requested = false;
-    app.active_tool = None;
     // A turn can end right after thinking (cancel, failure before any text);
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);
@@ -1208,7 +1211,6 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let app = &mut remote.app;
     app.busy = true;
     app.cancel_requested = false;
-    app.active_tool = None;
     app.last_activity = None;
     app.turn_started = Some(std::time::Instant::now());
     remote.cancel_flag.store(false, Ordering::SeqCst);
@@ -1566,7 +1568,6 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             remote.app.transcript.clear();
             remote.app.assistant_pending.clear();
             remote.app.assistant_open = false;
-            remote.app.active_tool = None;
             match remote.client.reattach(&sid) {
                 Ok(resp) => {
                     remote.session_id = resp.session_id.clone();

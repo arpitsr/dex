@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 use serde_json::Value;
 use std::process::Command;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Per-line character budget: protects against minified/binary-ish content
 /// whose single lines would dominate the context window.
@@ -81,6 +82,11 @@ pub(crate) const TRANSCRIPT_PREVIEW_LINES: usize = 6;
 
 /// Compact single-line summary of a tool's arguments for the REPL transcript.
 /// Pulls the primary arg (path/command/pattern) instead of dumping raw JSON.
+///
+/// The transcript word-wraps this row, so the preview is capped generously
+/// (a few rows at typical widths) instead of chopped at one line — a silent
+/// mid-word cut both loses the command's tail and leaves an awkwardly
+/// overflowing row on narrow terminals. `…` marks any remaining cut.
 pub(crate) fn short_arg(name: &str, input: &str) -> String {
     let obj = serde_json::from_str::<Value>(input)
         .ok()
@@ -114,8 +120,31 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
         .unwrap_or_else(|| input.to_string());
     let s = s.lines().next().unwrap_or(&s).trim();
     let s = strip_ansi(s);
-    let limit = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
-    s[..limit].to_string()
+    truncate_cols(&s, ARG_PREVIEW_COLS)
+}
+
+/// Display-column budget for the transcript's tool-input preview row. Long
+/// bash commands wrap across rows in the transcript (the TUI word-wraps);
+/// this cap only bounds the damage for pathological inputs.
+const ARG_PREVIEW_COLS: usize = 320;
+
+/// Truncate to `max_cols` display columns, appending `…` when clipped.
+fn truncate_cols(s: &str, max_cols: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_cols {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max_cols.saturating_sub(1) {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
 }
 
 /// Compact read target for the transcript input line, in editor goto style
@@ -1006,6 +1035,21 @@ mod tests {
         assert_eq!(one_line_summary("progress\r\r\x07done"), "progressdone");
         // Fallback path: unparseable input JSON is sanitized too.
         assert_eq!(short_arg("x", "'\x1b[1mevil\x1b[0m\r"), "'evil");
+    }
+
+    #[test]
+    fn short_arg_keeps_full_command_and_marks_any_cut() {
+        // A long bash command must not be silently chopped at one line: the
+        // transcript wraps the row, so only pathological length is capped —
+        // with a visible `…`, never a silent cut.
+        let cmd = format!("echo {}", "a".repeat(500));
+        let arg = short_arg("bash", &format!(r#"{{"command":"{cmd}"}}"#));
+        assert_eq!(arg, format!("echo {}…", "a".repeat(314)));
+        // Ordinary-length commands survive whole.
+        assert_eq!(
+            short_arg("bash", r#"{"command":"cargo test"}"#),
+            "cargo test"
+        );
     }
 
     #[test]
