@@ -583,17 +583,18 @@ impl Session {
         Ok(out)
     }
 
-    /// Highest event seq recorded for a session (0 when none).
-    pub(crate) fn max_event_seq(path: &Path) -> u64 {
+    /// Highest event seq recorded for a session (`None` when no seq is
+    /// journaled yet — distinct from a journal holding exactly seq 0).
+    pub(crate) fn max_event_seq(path: &Path) -> Option<u64> {
         let events_path = path.with_extension("events.jsonl");
         // Stream line by line; the journal is the hot file (one line per
         // stream delta) and replay only needs the max seq, not the text.
         let Ok(file) = File::open(&events_path) else {
-            return 0;
+            return None;
         };
         let mut reader = BufReader::new(file);
         let mut line = String::new();
-        let mut max = 0;
+        let mut max: Option<u64> = None;
         loop {
             line.clear();
             match reader.read_line(&mut line) {
@@ -606,7 +607,7 @@ impl Session {
             }
             if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
                 if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
-                    max = max.max(seq);
+                    max = Some(max.map_or(seq, |m| m.max(seq)));
                 }
             }
         }
@@ -1033,7 +1034,7 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![2, 3]);
         assert_eq!(texts.len(), 2);
-        assert_eq!(Session::max_event_seq(&path), 3);
+        assert_eq!(Session::max_event_seq(&path), Some(3));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("events.jsonl"));
     }
