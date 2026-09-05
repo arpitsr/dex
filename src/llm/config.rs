@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::sync::{Mutex, OnceLock};
@@ -408,13 +407,6 @@ fn persist_selection(selection: &str, provider: &Provider, base_url: &str) {
     }
 }
 
-pub(crate) fn dex_models_cache_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/models.json"));
-    }
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.json"))
-}
-
 fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
         return Some(std::path::PathBuf::from(dir).join("dex/models.dev.json"));
@@ -784,22 +776,6 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
             }
         }
     }
-    // fallback: dex cache array
-    if let Some(p) = dex_models_cache_path() {
-        if let Ok(text) = std::fs::read_to_string(&p) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(arr) = v.as_array() {
-                    let ids: Vec<String> = arr
-                        .iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect();
-                    if !ids.is_empty() {
-                        return Some(ids);
-                    }
-                }
-            }
-        }
-    }
     None
 }
 
@@ -838,69 +814,10 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         // 4MB catalog parse.
         if let Some(catalog) = load_dex_catalog() {
             write_ctx_index(&build_ctx_map(&catalog));
-            if let Some(ids) = load_dex_models_cache() {
-                let _ = ids; // already derived from catalog
-            }
         }
         return Ok(());
     }
-    // Fallback: opencode /models (needs auth) — old behavior
-    let provider_name = std::env::var("DEX_PROVIDER")
-        .ok()
-        .unwrap_or_else(|| "opencode".to_string());
-    let provider = Provider::parse(&provider_name)?;
-    if provider != Provider::OpenCode {
-        return Err("models.dev fetch failed and provider is not opencode".into());
-    }
-    let env_base_url = std::env::var("OPENAI_BASE_URL")
-        .ok()
-        .filter(|v| !v.is_empty());
-    let base_url = env_base_url
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| provider.default_base_url().unwrap_or_default().to_string());
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .ok_or("models.dev unavailable and OPENAI_API_KEY not set for fallback")?;
-    let endpoints: BTreeMap<String, String> = if base_url.starts_with("https://opencode.ai/") {
-        provider.endpoints()
-    } else {
-        BTreeMap::new()
-    };
-    let mut all: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let extra_headers = custom_headers_config_and_env();
-    for id in fetch_provider_models(&client, &provider, &base_url, &api_key, &extra_headers) {
-        if seen.insert(id.clone()) {
-            all.push(id);
-        }
-    }
-    for (name, url) in &endpoints {
-        for id in fetch_provider_models(&client, &provider, url, &api_key, &extra_headers) {
-            let prefixed = format!("{name}/{id}");
-            if seen.insert(prefixed.clone()) {
-                all.push(prefixed);
-            }
-            if seen.insert(id.clone()) {
-                all.push(id);
-            }
-        }
-    }
-    if all.is_empty() {
-        return Err("no models fetched — check network".into());
-    }
-    all.sort();
-    all.dedup();
-    let path = dex_models_cache_path().ok_or("could not determine cache path")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&all)?)?;
-    println!(
-        "cached {} models to {} (fallback)",
-        all.len(),
-        path.display()
-    );
-    Ok(())
+    Err("could not fetch models.dev catalog — check network".into())
 }
 
 /// Auto-detect a verification command (P9) when none is configured: a
@@ -920,55 +837,6 @@ pub(crate) fn detect_verify_command() -> Option<String> {
         return Some("npm test".into());
     }
     None
-}
-
-#[derive(Deserialize)]
-struct ModelsResponse {
-    #[serde(default)]
-    data: Vec<ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    id: String,
-}
-
-/// Fetch the provider's model list from its OpenAI-compatible `/models`
-/// endpoint. Best-effort: any failure (unknown endpoint, no network, bad
-/// auth) returns an empty list and the caller falls back to the configured
-/// model alone.
-fn fetch_provider_models(
-    client: &reqwest::blocking::Client,
-    provider: &Provider,
-    base_url: &str,
-    api_key: &str,
-    extra_headers: &BTreeMap<String, String>,
-) -> Vec<String> {
-    if !provider.has_model_listing() {
-        return Vec::new();
-    }
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let mut request = client.get(url).bearer_auth(api_key);
-    for (name, value) in extra_headers {
-        if name.eq_ignore_ascii_case("authorization") {
-            continue;
-        }
-        if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(value),
-        ) {
-            request = request.header(name, value);
-        }
-    }
-    let parsed: Result<ModelsResponse, _> = request
-        .timeout(Duration::from_secs(5))
-        .send()
-        .and_then(|resp| resp.error_for_status())
-        .and_then(|resp| resp.json());
-    match parsed {
-        Ok(response) => response.data.into_iter().map(|m| m.id).collect(),
-        Err(_) => Vec::new(),
-    }
 }
 
 /// Dex-owned per-model table (`DEX_MODEL_APIS="id=api,..."`, e.g.
@@ -1171,16 +1039,6 @@ pub(crate) fn custom_headers_from_env() -> BTreeMap<String, String> {
                 insert_extra_header(&mut out, &k, &v);
             }
         }
-    }
-    out
-}
-
-/// Config-file + env headers (file < env), for paths without a full
-/// `LlmConfig` (e.g. the `/models` refresh). Case-insensitive later-wins.
-pub(crate) fn custom_headers_config_and_env() -> BTreeMap<String, String> {
-    let mut out = load_config_headers(&load_config_file());
-    for (k, v) in custom_headers_from_env() {
-        insert_extra_header(&mut out, &k, &v);
     }
     out
 }
@@ -1599,7 +1457,7 @@ pub(crate) mod tests {
     use super::{
         build_ctx_map, detect_verify_command, load_config_file, load_dex_models_cache,
         load_provider_entries, model_api_from_env, reasoning_options_for, remember_learned_api,
-        usage_cost, ApiProtocol, LlmConfig, ModelsResponse, PermissionMode, Provider,
+        usage_cost, ApiProtocol, LlmConfig, PermissionMode, Provider,
     };
     use crate::core::types::Usage;
     use std::env;
@@ -1875,13 +1733,14 @@ pub(crate) mod tests {
     #[test]
     fn provider_parse_accepts_aliases() {
         assert_eq!(Provider::parse("opencode").unwrap(), Provider::OpenCode);
-        assert_eq!(Provider::parse("openai").unwrap(), Provider::OpenCode);
         assert_eq!(Provider::parse("codex").unwrap(), Provider::OpenAiCodex);
         assert_eq!(
             Provider::parse("openai-codex").unwrap(),
             Provider::OpenAiCodex
         );
         assert!(Provider::parse("unknown").is_err());
+        // "openai" is no longer an alias: configure providers.openai instead
+        assert!(Provider::parse("openai").is_err());
         assert_eq!(
             Provider::OpenCode.default_base_url(),
             Some("https://opencode.ai/zen/v1")
@@ -1917,8 +1776,8 @@ pub(crate) mod tests {
             Provider::OpenAiCodex.default_base_url().unwrap()
         );
         assert_eq!(cfg.model, "gpt-5.6-luna");
-        // Switch back via alias "openai"
-        cfg.apply_model("openai/gpt-4o", false);
+        // Switch back via the provider prefix
+        cfg.apply_model("opencode/gpt-4o", false);
         assert_eq!(cfg.provider, Provider::OpenCode);
         assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url().unwrap());
         assert_eq!(cfg.model, "gpt-4o");
@@ -2142,14 +2001,6 @@ pub(crate) mod tests {
         // `current_dir()` return None for them.
         std::env::set_current_dir(prev).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn models_response_parses_openai_shape() {
-        let json = r#"{"object":"list","data":[{"id":"a"},{"id":"b"}]}"#;
-        let parsed: ModelsResponse = serde_json::from_str(json).unwrap();
-        let ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
-        assert_eq!(ids, ["a".to_string(), "b".to_string()]);
     }
 
     #[test]

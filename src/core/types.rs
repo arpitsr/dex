@@ -302,7 +302,7 @@ pub(crate) enum Provider {
 impl Provider {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "opencode" | "openai" => Ok(Self::OpenCode),
+            "opencode" => Ok(Self::OpenCode),
             "openai-codex" | "codex" => Ok(Self::OpenAiCodex),
             other => Err(format!(
                 "unsupported provider '{}'; use opencode, openai-codex or a configured providers: entry",
