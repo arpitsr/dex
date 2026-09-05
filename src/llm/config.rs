@@ -21,10 +21,33 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 
 /// Raw config file as YAML. Parsed as an untyped `Value` so unknown keys
 /// survive the `/model` write-back. Missing/invalid file → None (env rules).
+/// Cached process-wide and invalidated by file identity (path + mtime +
+/// length): `from_env` runs per chat turn on the daemon, and each call was
+/// re-reading + re-parsing the file (plus once more via `api_pinned`).
+struct CachedConfigFile {
+    path: std::path::PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    value: Option<serde_yaml::Value>,
+}
+
+static CONFIG_CACHE: OnceLock<Mutex<Option<CachedConfigFile>>> = OnceLock::new();
+
 fn load_config_file() -> Option<serde_yaml::Value> {
     let path = config_file_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    if let Some(hit) = CONFIG_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
+    {
+        return hit.value.clone();
+    }
     let text = std::fs::read_to_string(&path).ok()?;
-    match serde_yaml::from_str::<serde_yaml::Value>(&text) {
+    let value = match serde_yaml::from_str::<serde_yaml::Value>(&text) {
         Ok(value) => Some(value),
         Err(e) => {
             // A typo'd file must not silently disable every user setting.
@@ -32,6 +55,23 @@ fn load_config_file() -> Option<serde_yaml::Value> {
             WARNED.call_once(|| eprintln!("dex: ignoring invalid config {}: {e}", path.display()));
             None
         }
+    };
+    CONFIG_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(CachedConfigFile {
+            path,
+            mtime,
+            len,
+            value: value.clone(),
+        });
+    value
+}
+
+fn invalidate_config_cache() {
+    if let Some(cache) = CONFIG_CACHE.get() {
+        cache.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
@@ -68,10 +108,57 @@ fn learned_apis_path() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".cache/dex/learned-apis.json"))
 }
 
+/// Learned wire protocols, cached process-wide and invalidated by file
+/// identity. `from_env` consulted this file on every turn (one read + parse
+/// per turn); hits are now a mutex bump.
+struct CachedLearnedApis {
+    path: std::path::PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    map: serde_json::Map<String, serde_json::Value>,
+}
+
+static LEARNED_CACHE: OnceLock<Mutex<Option<CachedLearnedApis>>> = OnceLock::new();
+
+fn learned_api_map() -> serde_json::Map<String, serde_json::Value> {
+    let Some(path) = learned_apis_path() else {
+        return Default::default();
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Default::default();
+    };
+    let (Ok(mtime), len) = (meta.modified(), meta.len()) else {
+        return Default::default();
+    };
+    if let Some(hit) = LEARNED_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
+    {
+        return hit.map.clone();
+    }
+    let map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    LEARNED_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(CachedLearnedApis {
+            path,
+            mtime,
+            len,
+            map: map.clone(),
+        });
+    map
+}
+
 fn learned_api(base_url: &str, model: &str) -> Option<ApiProtocol> {
-    let text = std::fs::read_to_string(learned_apis_path()?).ok()?;
-    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
-    map.get(format!("{base_url}|{model}").as_str())?
+    learned_api_map()
+        .get(format!("{base_url}|{model}").as_str())?
         .as_str()
         .and_then(ApiProtocol::parse)
 }
@@ -94,6 +181,11 @@ pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol
     }
     if let Ok(text) = serde_json::to_string_pretty(&map) {
         let _ = std::fs::write(path, text);
+        // The file changed under us; drop the cached map so the next
+        // lookup re-reads instead of serving the pre-write copy.
+        if let Some(cache) = LEARNED_CACHE.get() {
+            cache.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
     }
 }
 
@@ -126,6 +218,7 @@ fn persist_selection(selection: &str, provider: Provider, base_url: &str) {
     }
     if let Ok(text) = serde_yaml::to_string(&root) {
         let _ = std::fs::write(path, text);
+        invalidate_config_cache();
     }
 }
 
@@ -141,6 +234,107 @@ fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(dir).join("dex/models.dev.json"));
     }
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.dev.json"))
+}
+
+/// Slim cross-process context index (`models.ctx.json`): `lowercased model
+/// id → context window`. The full catalog is 4+ MB, so every fresh process
+/// paid a full read + parse (~180ms) just to look up one model. The index is
+/// KBs; warm launches (and every daemon turn) hit it and skip the catalog.
+/// Written by `refresh_models_cache` and lazily rebuilt whenever the catalog
+/// is newer than the index.
+fn dex_ctx_index_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+        return Some(std::path::PathBuf::from(dir).join("dex/models.ctx.json"));
+    }
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.ctx.json"))
+}
+
+fn ctx_from_index(model: &str) -> Option<u64> {
+    // KB-sized file: one small read + parse instead of the 4MB catalog.
+    let path = dex_ctx_index_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
+    map.get(model.to_ascii_lowercase().as_str())?
+        .as_u64()
+        .filter(|ctx| *ctx > 0)
+}
+
+/// Collect every known `model id → context` pair from the catalog (both the
+/// `api.json` providers shape and the `catalog.json` models shape) so the
+/// slim index answers without the 4MB parse.
+fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
+    fn context_of(entry: &serde_json::Value) -> Option<u64> {
+        entry
+            .get("limit")
+            .and_then(|l| l.get("context"))
+            .and_then(|c| c.as_u64())
+            .filter(|ctx| *ctx > 0)
+    }
+    let mut map = BTreeMap::new();
+    if let Some(providers) = catalog.as_object() {
+        for (_prov, entry) in providers {
+            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+                for (id, m) in models {
+                    if let Some(ctx) = context_of(m) {
+                        map.insert(id.to_ascii_lowercase(), ctx);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
+        for (id, m) in models {
+            if let Some(ctx) = context_of(m) {
+                map.insert(id.to_ascii_lowercase(), ctx);
+            }
+        }
+    }
+    map
+}
+
+/// Best-effort index write; failures just mean the next launch re-parses.
+/// Atomic (tmp file + rename) so a concurrent `refresh` never leaves a torn
+/// `models.ctx.json` for a reader mid-turn; a stale reader just falls back to
+/// the full catalog parse on JSON error.
+fn write_ctx_index(map: &BTreeMap<String, u64>) {
+    let Some(path) = dex_ctx_index_path() else {
+        return;
+    };
+    if map.is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string(map) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Rebuild the slim index when it is missing or older than the catalog.
+/// Runs only on the slow path (right after the full catalog parse), so warm
+/// launches never pay for it.
+fn ensure_ctx_index(catalog: &serde_json::Value) {
+    let (Some(index_path), Some(catalog_path)) = (dex_ctx_index_path(), dex_catalog_cache_path())
+    else {
+        return;
+    };
+    let catalog_mtime = std::fs::metadata(&catalog_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    let index_mtime = std::fs::metadata(&index_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    let stale = match (catalog_mtime, index_mtime) {
+        (Some(c), Some(i)) => c > i,
+        _ => true,
+    };
+    if stale {
+        write_ctx_index(&build_ctx_map(catalog));
+    }
 }
 
 /// Parsed `models.dev.json` catalog, cached process-wide and invalidated by
@@ -398,12 +592,13 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if fetched {
-        // also refresh legacy ids cache for fast autocomplete
+        // Refresh the slim context index too so the next launch skips the
+        // 4MB catalog parse.
         if let Some(catalog) = load_dex_catalog() {
+            write_ctx_index(&build_ctx_map(&catalog));
             if let Some(ids) = load_dex_models_cache() {
                 let _ = ids; // already derived from catalog
             }
-            let _ = catalog; // keep file
         }
         return Ok(());
     }
@@ -856,7 +1051,16 @@ impl LlmConfig {
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
-            .or_else(|| load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)))
+            // Slim cross-process index first (KBs); the 4MB catalog parse
+            // is the cold-path fallback, which then refreshes the index.
+            .or_else(|| ctx_from_index(&model))
+            .or_else(|| {
+                load_dex_catalog().and_then(|c| {
+                    let ctx = catalog_context_window(&model, &c);
+                    ensure_ctx_index(&c);
+                    ctx
+                })
+            })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         // Pi: reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env::var("DEX_RESERVE_TOKENS")
@@ -867,23 +1071,28 @@ impl LlmConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20_000);
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(
-                env::var("DEX_HTTP_CONNECT_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(10),
-            ))
-            // Note: for the blocking client this deadline applies to the
-            // connect and to each individual body read (not to the whole
-            // streamed response), so long-lived SSE streams are safe.
-            .timeout(Duration::from_secs(
-                env::var("DEX_HTTP_REQUEST_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(300),
-            ))
-            .build()?;
+        let connect_secs: u64 = env::var("DEX_HTTP_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let request_secs: u64 = env::var("DEX_HTTP_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        // The default-timeouts path (every daemon turn + TUI launch) reuses
+        // the process-wide client instead of re-initializing TLS + pool.
+        // Custom timeouts still build a dedicated client.
+        let client = if connect_secs == 10 && request_secs == 300 {
+            crate::client::http::shared_blocking_client()
+        } else {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(connect_secs))
+                // Note: for the blocking client this deadline applies to the
+                // connect and to each individual body read (not to the whole
+                // streamed response), so long-lived SSE streams are safe.
+                .timeout(Duration::from_secs(request_secs))
+                .build()?
+        };
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
@@ -1047,8 +1256,8 @@ impl LlmConfig {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        detect_verify_command, model_api_from_env, remember_learned_api, usage_cost, ApiProtocol,
-        LlmConfig, ModelsResponse, PermissionMode, Provider,
+        build_ctx_map, detect_verify_command, model_api_from_env, remember_learned_api, usage_cost,
+        ApiProtocol, LlmConfig, ModelsResponse, PermissionMode, Provider,
     };
     use crate::core::types::Usage;
     use std::env;
@@ -1651,5 +1860,24 @@ pub(crate) mod tests {
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctx_map_covers_both_catalog_shapes_lowercased() {
+        let catalog = serde_json::json!({
+            "opencode": { "models": {
+                "GPT-5": { "limit": { "context": 128000 } },
+                "zero": { "limit": { "context": 0 } },
+                "nodoc": {},
+            } },
+            "models": {
+                "Claude-X": { "limit": { "context": 200000 } },
+            },
+        });
+        let map = build_ctx_map(&catalog);
+        assert_eq!(map.get("gpt-5"), Some(&128000));
+        assert_eq!(map.get("claude-x"), Some(&200000));
+        assert!(!map.contains_key("zero"));
+        assert!(!map.contains_key("nodoc"));
     }
 }
