@@ -184,8 +184,9 @@ fn endpoints_for(
 /// except codex (which reads its own credential file):
 /// 1. `providers.<name>.api_key` in config.yaml,
 /// 2. the provider's own conventional env var from the catalog `env` map
-///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …),
-/// then a loud error naming the deposit places.
+///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …).
+///
+/// Then a loud error naming the deposit places.
 pub(crate) fn resolve_credentials(
     provider: &Provider,
     entries: &BTreeMap<String, ProviderEntry>,
