@@ -42,6 +42,10 @@ Requires Rust edition 2021. Config: `~/.config/dex/config.yaml` (or `$DEX_CONFIG
 - Permissions default `trusted` (`read-only`/`ask-writes`/`ask-shell`/`trusted`); `bash` is mutating. `DEX_EXTRA_TOOLS=1` adds `git`/`chain`.
 - Compaction is deterministic by default (`DEX_COMPACTION_LLM=1` for LLM). Keep `tokens > contextWindow - reserveTokens` logic intact.
 
+## Release
+
+- `scripts/release.sh [major|minor|patch|X.Y.Z]` — cuts a release; the only manual step is this tag+push. Never bump `Cargo.toml` yourself: CI does the version bump on the default branch after the tag lands. Working tree must be clean and the default branch up to date.
+
 ## Before submitting
 
 Run the three checks above. Keep diffs minimal, reuse existing helpers, don't add scaffolding for later.
