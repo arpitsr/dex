@@ -501,6 +501,7 @@ mod tests {
             keep_recent_tokens: 20_000,
             permission: PermissionMode::Trusted,
             verify_command: None,
+            extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
         }
     }

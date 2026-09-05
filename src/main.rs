@@ -27,8 +27,12 @@ use std::env;
 use std::io::{self, Write};
 
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config =
-        LlmConfig::from_env(args.base_url.clone(), args.model.clone(), args.permission)?;
+    let mut config = LlmConfig::from_env(
+        args.base_url.clone(),
+        args.model.clone(),
+        args.permission,
+        &args.headers,
+    )?;
     // Verification opt-in only — see daemon/server.rs.
     if config.verify_command.is_none() && std::env::var("DEX_VERIFY").as_deref() == Ok("1") {
         config.verify_command = crate::llm::config::detect_verify_command();
@@ -183,6 +187,7 @@ fn print_help() {
         \n\
         Options:\n  \
         --model <name>            --base-url <url>  --permission <mode>\n  \
+        -H/--header <\"Name: Value\">  (repeatable) extra provider headers\n  \
         -s/--session <path>  --no-session  -n/--new  --name <name>  --skill <dir>\n  \
         -h/--help  -V/--version",
         version = env!("CARGO_PKG_VERSION")
