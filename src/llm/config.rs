@@ -1544,9 +1544,11 @@ impl LlmConfig {
 
     /// Reasoning effort for the current model: a stored `/thinking` choice
     /// wins, then `DEX_THINKING_EFFORT`, then file `thinking_effort:`, else
-    /// unset. Warns once per model+effort when the effective level isn't
-    /// advertised for the model (the catalog scan is skipped entirely when
-    /// no effort is set, so the common case stays free).
+    /// unset. Never prints: this runs on daemon threads while the TUI owns
+    /// the terminal (alternate screen + raw mode + OSC theme query), where
+    /// an `eprintln!` corrupts the display and leaks into the composer.
+    /// Callers surface `thinking_mismatch_warning()` through the transcript
+    /// (`DaemonInfo.thinking_warning`) or stderr when no TUI is active.
     pub(crate) fn refresh_thinking_effort(&mut self) {
         let effort = stored_thinking_effort(&self.base_url, &self.model)
             .or_else(|| {
@@ -1555,28 +1557,24 @@ impl LlmConfig {
                     .filter(|v| !v.is_empty())
             })
             .or_else(|| load_config_str(&load_config_file(), "thinking_effort"));
-        if let Some(effort) = &effort {
-            if let Some(options) = reasoning_options_for(&self.model) {
-                if !options.iter().any(|o| o == effort) {
-                    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> =
-                        OnceLock::new();
-                    let key = format!("{}|{effort}", self.model);
-                    if WARNED
-                        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(key)
-                    {
-                        eprintln!(
-                            "dex: thinking effort '{effort}' not advertised for model '{}' (options: {}); the API may reject it",
-                            self.model,
-                            options.join(", ")
-                        );
-                    }
-                }
-            }
-        }
         self.thinking_effort = effort;
+    }
+
+    /// Warning when the effective effort isn't advertised for the model
+    /// (catalog scan skipped when no effort is set). Pure data, no I/O, so
+    /// daemon threads stay silent on the TUI's terminal; the caller decides
+    /// where it surfaces (transcript vs. stderr).
+    pub(crate) fn thinking_mismatch_warning(&self) -> Option<String> {
+        let effort = self.thinking_effort.as_ref()?;
+        let options = reasoning_options_for(&self.model)?;
+        if options.iter().any(|o| o == effort) {
+            return None;
+        }
+        Some(format!(
+            "thinking effort '{effort}' not advertised for model '{}' (options: {}); the API may reject it",
+            self.model,
+            options.join(", ")
+        ))
     }
 
     /// Base wire protocol + baked pin from an entry pin, re-reading the
@@ -3048,6 +3046,36 @@ pub(crate) mod tests {
             validate_thinking_effort("m-unknown", "whatever"),
             Ok("whatever".to_string())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thinking_mismatch_warning_is_data_not_stderr() {
+        // The mismatch hint must be returnable data (transcript line), never
+        // an `eprintln!` from config code: the daemon shares the TUI's
+        // terminal, where stderr corrupts the alternate screen / OSC query.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+        let dir = std::env::temp_dir().join(format!("dex-thinkwarn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_generic_catalog(&dir);
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let mut cfg = test_cfg();
+        cfg.model = "glm-x".into();
+        cfg.thinking_effort = None;
+        assert!(cfg.thinking_mismatch_warning().is_none());
+        cfg.thinking_effort = Some("high".into());
+        assert!(cfg.thinking_mismatch_warning().is_none());
+        cfg.thinking_effort = Some("ultra".into());
+        let warning = cfg.thinking_mismatch_warning().expect("mismatch warns");
+        assert!(
+            warning.contains("ultra") && warning.contains("low, high"),
+            "{warning}"
+        );
+        cfg.model = "m-unknown".into();
+        assert!(cfg.thinking_mismatch_warning().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
