@@ -20,6 +20,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/name", "Rename the current session"),
     ("/model", "Show or switch the model"),
     ("/provider", "Show or switch the provider"),
+    ("/thinking", "Show or set reasoning effort"),
     ("/waive <reason>", "Waive verification with a reason"),
     ("/undo", "Undo the last recorded file change"),
     ("/help", "Show available commands"),
@@ -393,6 +394,68 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 "available providers: opencode, openai-codex".to_string(),
             );
         }
+        "/thinking" => {
+            let advertised = crate::llm::config::reasoning_options_for(&app.config.model);
+            push_info(
+                app,
+                match (&app.config.thinking_effort, advertised) {
+                    (Some(effort), Some(options)) => format!(
+                        "thinking effort: {effort} (options: {})",
+                        options.join(", ")
+                    ),
+                    (Some(effort), None) => format!("thinking effort: {effort}"),
+                    (None, Some(options)) => {
+                        format!("thinking effort: unset (options: {})", options.join(", "))
+                    }
+                    (None, None) => "thinking effort: unset".to_string(),
+                },
+            );
+        }
+        _ if line.starts_with("/thinking ") => {
+            let arg = line["/thinking ".len()..].trim();
+            if arg.is_empty() {
+                push_info(app, "usage: /thinking <level>|clear".to_string());
+            } else if ["clear", "auto", "off"]
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case(arg))
+            {
+                crate::llm::config::remember_thinking_effort(
+                    &app.config.base_url,
+                    &app.config.model,
+                    None,
+                );
+                app.config.refresh_thinking_effort();
+                push_info(
+                    app,
+                    match &app.config.thinking_effort {
+                        Some(effort) => {
+                            format!("thinking effort cleared (env default: {effort})")
+                        }
+                        None => "thinking effort cleared".to_string(),
+                    },
+                );
+            } else {
+                let model = app.config.model.clone();
+                match crate::llm::config::validate_thinking_effort(&model, arg) {
+                    Ok(level) => {
+                        crate::llm::config::remember_thinking_effort(
+                            &app.config.base_url,
+                            &model,
+                            Some(&level),
+                        );
+                        app.config.refresh_thinking_effort();
+                        push_info(app, format!("thinking effort: {level} for {model}"));
+                    }
+                    Err(options) => push_info(
+                        app,
+                        format!(
+                            "unknown thinking effort '{arg}' for {model} (options: {})",
+                            options.join(", ")
+                        ),
+                    ),
+                }
+            }
+        }
         _ if line.starts_with("/waive ") => {
             let reason = line["/waive ".len()..].trim().to_string();
             if reason.is_empty() {
@@ -424,7 +487,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         "/help" => {
             push_info(
                 app,
-                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>]"
+                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>] /thinking [<level>|clear]"
                     .to_string(),
             );
             push_info(
