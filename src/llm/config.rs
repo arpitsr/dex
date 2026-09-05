@@ -393,13 +393,14 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut all: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for id in fetch_provider_models(&client, provider, &base_url, &api_key) {
+    let extra_headers = custom_headers_from_env();
+    for id in fetch_provider_models(&client, provider, &base_url, &api_key, &extra_headers) {
         if seen.insert(id.clone()) {
             all.push(id);
         }
     }
     for (name, url) in &endpoints {
-        for id in fetch_provider_models(&client, provider, url, &api_key) {
+        for id in fetch_provider_models(&client, provider, url, &api_key, &extra_headers) {
             let prefixed = format!("{name}/{id}");
             if seen.insert(prefixed.clone()) {
                 all.push(prefixed);
@@ -466,14 +467,25 @@ fn fetch_provider_models(
     provider: Provider,
     base_url: &str,
     api_key: &str,
+    extra_headers: &BTreeMap<String, String>,
 ) -> Vec<String> {
     if !provider.has_model_listing() {
         return Vec::new();
     }
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let parsed: Result<ModelsResponse, _> = client
-        .get(url)
-        .bearer_auth(api_key)
+    let mut request = client.get(url).bearer_auth(api_key);
+    for (name, value) in extra_headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            request = request.header(name, value);
+        }
+    }
+    let parsed: Result<ModelsResponse, _> = request
         .timeout(Duration::from_secs(5))
         .send()
         .and_then(|resp| resp.error_for_status())
@@ -513,6 +525,149 @@ pub(crate) fn permission_from_env() -> Result<PermissionMode, Box<dyn std::error
     PermissionMode::parse(&value).map_err(Into::into)
 }
 
+/// Parse one custom-header value into `name -> value` pairs.
+///
+/// Accepts a JSON object (`{"X-Foo":"bar"}` — pi's `headers` map / codex
+/// `http_headers` shape) or `Name: Value` / `Name=Value` pairs separated by
+/// commas or newlines (Claude Code's `ANTHROPIC_CUSTOM_HEADERS` shape).
+/// Entries without a name, without a separator, or with an empty value are
+/// skipped; later entries win on duplicate names.
+pub(crate) fn parse_headers_str(raw: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return out;
+    }
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            for (key, value) in map {
+                let name = key.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let val = match &value {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string(),
+                    _ => continue,
+                };
+                if val.is_empty() {
+                    continue;
+                }
+                out.insert(name, val);
+            }
+        }
+        return out;
+    }
+    // Newline-separated values may themselves contain commas, so only split
+    // on commas when the value is a single line.
+    let pieces: Vec<&str> = if trimmed.contains('\n') {
+        trimmed.split('\n').collect()
+    } else {
+        trimmed.split(',').collect()
+    };
+    for piece in pieces {
+        let piece = piece.trim().trim_end_matches(',').trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let split = piece.split_once(':').or_else(|| piece.split_once('='));
+        let Some((name, value)) = split else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        let value = value.trim().to_string();
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        out.insert(name, value);
+    }
+    out
+}
+
+/// Scalar YAML value as a header value string (`"abc"`, `42`, `true`).
+/// Empty strings yield `None` so blank entries are skipped.
+fn yaml_scalar_str(v: &serde_yaml::Value) -> Option<String> {
+    v.as_str()
+        .map(str::trim)
+        .map(str::to_string)
+        .or_else(|| v.as_u64().map(|n| n.to_string()))
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+        .or_else(|| v.as_f64().map(|n| n.to_string()))
+        .or_else(|| v.as_bool().map(|b| b.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+fn insert_config_header(out: &mut BTreeMap<String, String>, name: &str, value: &str) {
+    let name = name.trim();
+    let value = value.trim();
+    if !name.is_empty() && !value.is_empty() {
+        out.insert(name.to_string(), value.to_string());
+    }
+}
+
+fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml::Mapping) {
+    for (k, v) in map {
+        let name = k.as_str().unwrap_or_default();
+        if let Some(val) = yaml_scalar_str(v) {
+            insert_config_header(out, name, &val);
+        }
+    }
+}
+
+/// Custom headers from one config file key. Accepts a mapping (pi/codex
+/// style), a text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as
+/// the env vars / `--header`), or a list mixing both. Later entries win.
+fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<String, String> {
+    let Some(value) = file.as_ref().and_then(|f| f.get(key)) else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    if let Some(map) = value.as_mapping() {
+        merge_config_headers_map(&mut out, map);
+    } else if let Some(text) = value.as_str() {
+        for (k, v) in parse_headers_str(text) {
+            out.insert(k, v);
+        }
+    } else if let Some(items) = value.as_sequence() {
+        for item in items {
+            if let Some(map) = item.as_mapping() {
+                merge_config_headers_map(&mut out, map);
+            } else if let Some(text) = item.as_str() {
+                for (k, v) in parse_headers_str(text) {
+                    out.insert(k, v);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Custom headers from the config file. `headers:` (pi) wins per-key over
+/// `http_headers:` (codex) when both set the same name.
+fn load_config_headers(file: &Option<serde_yaml::Value>) -> BTreeMap<String, String> {
+    let mut out = config_headers_map(file, "http_headers");
+    for (k, v) in config_headers_map(file, "headers") {
+        out.insert(k, v);
+    }
+    out
+}
+
+/// Custom headers from the environment. Later sources win per-key:
+/// `ANTHROPIC_CUSTOM_HEADERS` (claude) < `OPENAI_HEADERS` < `DEX_HEADERS`.
+pub(crate) fn custom_headers_from_env() -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for key in ["ANTHROPIC_CUSTOM_HEADERS", "OPENAI_HEADERS", "DEX_HEADERS"] {
+        if let Ok(raw) = env::var(key) {
+            for (k, v) in parse_headers_str(&raw) {
+                out.insert(k, v);
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub(crate) struct LlmConfig {
     pub(crate) provider: Provider,
@@ -531,6 +686,12 @@ pub(crate) struct LlmConfig {
     pub(crate) keep_recent_tokens: u64,
     pub(crate) permission: PermissionMode,
     pub(crate) verify_command: Option<String>,
+    /// Extra HTTP headers sent on every provider request (gateway auth,
+    /// routing, attribution). Config `headers:`/`http_headers:` < env
+    /// (`ANTHROPIC_CUSTOM_HEADERS`/`OPENAI_HEADERS`/`DEX_HEADERS`) <
+    /// `--header` / per-request overrides. Never carries `authorization`
+    /// (the api key owns that) — it is dropped at send time.
+    pub(crate) extra_headers: BTreeMap<String, String>,
     pub(crate) client: reqwest::blocking::Client,
 }
 
@@ -539,6 +700,7 @@ impl LlmConfig {
         base_url_override: Option<String>,
         model_override: Option<String>,
         permission_override: Option<PermissionMode>,
+        header_overrides: &[String],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         crate::tools::set_output_limit(
             env::var("DEX_TOOL_OUTPUT_BYTES")
@@ -551,6 +713,16 @@ impl LlmConfig {
             None => permission_from_env()?,
         };
         let file = load_config_file();
+        // Custom provider headers: config file < env < CLI flags.
+        let mut extra_headers = load_config_headers(&file);
+        for (k, v) in custom_headers_from_env() {
+            extra_headers.insert(k, v);
+        }
+        for raw in header_overrides {
+            for (k, v) in parse_headers_str(raw) {
+                extra_headers.insert(k, v);
+            }
+        }
         let provider_name = env::var("DEX_PROVIDER")
             .ok()
             .or_else(|| load_config_str(&file, "provider"))
@@ -662,6 +834,7 @@ impl LlmConfig {
             keep_recent_tokens,
             verify_command: env::var("DEX_VERIFY").ok(),
             permission,
+            extra_headers,
             client,
             endpoints,
         };
@@ -825,6 +998,7 @@ pub(crate) mod tests {
             keep_recent_tokens: 20_000,
             permission: PermissionMode::AskWrites,
             verify_command: None,
+            extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
         };
         // Bare id keeps the current base_url.
@@ -977,6 +1151,7 @@ pub(crate) mod tests {
             keep_recent_tokens: 20_000,
             permission: PermissionMode::AskWrites,
             verify_command: None,
+            extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -1146,10 +1321,128 @@ pub(crate) mod tests {
             "DEX_CONFIG",
             std::env::temp_dir().join(format!("dex-missing-{}", std::process::id())),
         );
-        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.base_url, Provider::OpenCode.default_base_url());
         assert!(cfg.endpoints.contains_key("go"));
         assert!(cfg.endpoints.contains_key("zen"));
+    }
+
+    #[test]
+    fn custom_headers_parse_json_and_pairs() {
+        use super::parse_headers_str;
+        let json = parse_headers_str(r#"{"X-Gateway-Key":"abc","X-Empty":"","num":42}"#);
+        assert_eq!(json.get("X-Gateway-Key").map(String::as_str), Some("abc"));
+        assert_eq!(json.get("num").map(String::as_str), Some("42"));
+        assert!(!json.contains_key("X-Empty"), "empty values are skipped");
+        assert!(parse_headers_str("  ").is_empty());
+
+        let pairs = parse_headers_str("X-Foo: bar, X-Baz=qux");
+        assert_eq!(pairs.get("X-Foo").map(String::as_str), Some("bar"));
+        assert_eq!(pairs.get("X-Baz").map(String::as_str), Some("qux"));
+
+        // Newline-separated pairs may contain commas in values.
+        let multi = parse_headers_str("X-A: one, two\nX-B: three");
+        assert_eq!(multi.get("X-A").map(String::as_str), Some("one, two"));
+        assert_eq!(multi.get("X-B").map(String::as_str), Some("three"));
+
+        // Malformed entries are skipped, later duplicates win.
+        let messy = parse_headers_str("no-separator, : novalue, X-K: 1, X-K: 2");
+        assert_eq!(messy.len(), 1);
+        assert_eq!(messy.get("X-K").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn custom_headers_layer_file_env_cli() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = EnvRestore::take(&[
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_MODEL",
+            "OPENAI_API",
+            "DEX_PROVIDER",
+            "DEX_MODELS",
+            "DEX_CONFIG",
+            "DEX_HEADERS",
+            "OPENAI_HEADERS",
+            "ANTHROPIC_CUSTOM_HEADERS",
+        ]);
+        // Config file: `headers:` (pi) wins per-key over `http_headers:` (codex).
+        let dir = std::env::temp_dir().join(format!("dex-headers-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("config.yaml");
+        std::fs::write(
+            &cfg_path,
+            "provider: opencode\nmodel: m-h\nhttp_headers:\n  X-File: file\n  X-Shared: codex\nheaders:\n  X-Shared: pi\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", &cfg_path);
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("DEX_MODELS");
+        std::env::set_var("DEX_HEADERS", "X-Env: env");
+        std::env::set_var("OPENAI_HEADERS", "X-Env2: openai");
+        std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "X-Env3: claude");
+        let cfg = LlmConfig::from_env(
+            None,
+            None,
+            None,
+            &["X-Cli: cli".to_string(), "X-Shared: cli".to_string()],
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "m-h");
+        assert_eq!(
+            cfg.extra_headers.get("X-File").map(String::as_str),
+            Some("file")
+        );
+        assert_eq!(
+            cfg.extra_headers.get("X-Env").map(String::as_str),
+            Some("env")
+        );
+        assert_eq!(
+            cfg.extra_headers.get("X-Env2").map(String::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            cfg.extra_headers.get("X-Env3").map(String::as_str),
+            Some("claude")
+        );
+        assert_eq!(
+            cfg.extra_headers.get("X-Cli").map(String::as_str),
+            Some("cli")
+        );
+        // CLI wins over both config-file spellings.
+        assert_eq!(
+            cfg.extra_headers.get("X-Shared").map(String::as_str),
+            Some("cli")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_headers_config_text_and_list_shapes() {
+        use super::load_config_headers;
+        // Text-header block (same syntax as env vars / `--header`).
+        let file: Option<serde_yaml::Value> =
+            Some(serde_yaml::from_str("headers: \"X-A: one\\nX-B: two, three\"\n").unwrap());
+        let out = load_config_headers(&file);
+        assert_eq!(out.get("X-A").map(String::as_str), Some("one"));
+        assert_eq!(out.get("X-B").map(String::as_str), Some("two, three"));
+        // List mixing text entries and one-key maps; later entries win.
+        let file: Option<serde_yaml::Value> = Some(
+            serde_yaml::from_str("http_headers:\n  - \"X-A: 1\"\n  - X-A: 2\n  - X-C: 3\n")
+                .unwrap(),
+        );
+        let out = load_config_headers(&file);
+        assert_eq!(out.get("X-A").map(String::as_str), Some("2"));
+        assert_eq!(out.get("X-C").map(String::as_str), Some("3"));
+        // Non-string scalars and blank entries are skipped.
+        let file: Option<serde_yaml::Value> =
+            Some(serde_yaml::from_str("headers:\n  X-N: 42\n  X-E: \"\"\n").unwrap());
+        let out = load_config_headers(&file);
+        assert_eq!(out.get("X-N").map(String::as_str), Some("42"));
+        assert!(!out.contains_key("X-E"));
     }
 
     #[test]
@@ -1234,16 +1527,16 @@ pub(crate) mod tests {
         std::env::set_var("DEX_CONFIG", &path);
         std::env::set_var("OPENAI_API_KEY", "env-key");
         // No OPENAI_MODEL: file model + file base_url + file api apply.
-        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "file-model");
         assert_eq!(cfg.base_url, "https://file.example/v1");
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         // Env model beats the file.
         std::env::set_var("OPENAI_MODEL", "env-model");
-        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "env-model");
         // Write-back: selection lands in the file, unknown keys survive.
-        let mut cfg = LlmConfig::from_env(None, None, None).unwrap();
+        let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         cfg.apply_model("go/new-model", true);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("model: go/new-model"));
@@ -1260,7 +1553,7 @@ pub(crate) mod tests {
             ApiProtocol::ChatCompletions,
         );
         assert!(cache.join("dex/learned-apis.json").exists());
-        let cfg = LlmConfig::from_env(None, None, None).unwrap();
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         let _ = std::fs::remove_dir_all(&dir);
     }

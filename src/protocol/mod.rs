@@ -56,6 +56,10 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub permission: Option<String>,
+    /// Extra HTTP headers for the provider request (client `--header`
+    /// flags). Merged over the daemon's own configured headers.
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub plan: Option<String>,
 }
@@ -334,6 +338,7 @@ mod tests {
         assert!(req.skill_dirs.is_empty());
         assert!(req.base_url.is_none());
         assert!(req.permission.is_none());
+        assert!(req.headers.is_none());
     }
 
     #[test]
