@@ -431,6 +431,56 @@ fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u6
     None
 }
 
+/// Endpoint URL serving `model` per the models.dev catalog, for bare model
+/// picks (`/model kimi-k2.6` with no `endpoint/` prefix). The catalog entry's
+/// `api` URL is matched against the provider's endpoint table, so a catalog
+/// rename can't silently misroute. Returns `None` (keep the current URL)
+/// when the current endpoint already serves the model, the model is unknown,
+/// or the current URL is custom (not a known endpoint — explicit wins).
+/// ponytail: linear scan of a cached 4MB parse; only runs on `/model`
+/// switches and startup, never per turn.
+fn catalog_endpoint_for_model(
+    catalog: &serde_json::Value,
+    model: &str,
+    endpoints: &BTreeMap<String, String>,
+    current_base_url: &str,
+) -> Option<String> {
+    if !endpoints.values().any(|url| url == current_base_url) {
+        return None;
+    }
+    let needle = model.to_ascii_lowercase();
+    let serves = |entry: &serde_json::Value| {
+        entry
+            .get("models")
+            .and_then(|m| m.as_object())
+            .is_some_and(|models| models.keys().any(|id| id.to_ascii_lowercase() == needle))
+    };
+    let mut fallback = None;
+    // api.json shape nests providers at the top level; catalog.json shape
+    // nests them under `providers` (a top-level `models` dict has no
+    // `models` child per entry, so it is skipped by `serves`).
+    let mut entries: Vec<&serde_json::Value> = Vec::new();
+    if let Some(obj) = catalog.as_object() {
+        entries.extend(obj.values());
+    }
+    if let Some(obj) = catalog.get("providers").and_then(|p| p.as_object()) {
+        entries.extend(obj.values());
+    }
+    for entry in entries {
+        let url = entry.get("api").and_then(|v| v.as_str()).unwrap_or("");
+        if !endpoints.values().any(|known| known == url) || !serves(entry) {
+            continue;
+        }
+        if url == current_base_url {
+            return None;
+        }
+        if fallback.is_none() {
+            fallback = Some(url.to_string());
+        }
+    }
+    fallback
+}
+
 /// First `cost` object for `needle` among catalog providers accepted by
 /// `pick`, in the catalog's provider order.
 fn catalog_cost<'a>(
@@ -615,7 +665,7 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|v| !v.is_empty());
     let base_url = env_base_url
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        .unwrap_or_else(|| provider.default_base_url().to_string());
     let api_key = std::env::var("OPENAI_API_KEY")
         .ok()
         .ok_or("models.dev unavailable and OPENAI_API_KEY not set for fallback")?;
@@ -1040,12 +1090,9 @@ impl LlmConfig {
             }
         };
         // The model carries its own wire protocol; the global `api` above is
-        // only the default. `OPENAI_API` pins everything.
-        let api = if env::var("OPENAI_API").is_ok() {
-            api
-        } else {
-            model_api_from_env(&model, &model).unwrap_or(api)
-        };
+        // only the default. `OPENAI_API` pins everything, otherwise the
+        // `apply_model` call below resolves the selection-aware protocol
+        // (full `endpoint/id` key, then bare id, then learned fallback).
         let (api_key, account_id) =
             provider.load_credentials(load_config_str(&file, "api_key").as_deref())?;
         let context_window = env::var("DEX_CONTEXT_WINDOW")
@@ -1136,12 +1183,33 @@ impl LlmConfig {
         Ok(this)
     }
 
+    /// Wire protocol for a fresh model selection: an explicit per-model
+    /// table entry wins, otherwise a previously learned fallback for this
+    /// `(base_url, model)`, otherwise the configured default is kept
+    /// (`None`). `OPENAI_API` pins everything and skips this entirely — the
+    /// caller keeps `self.api` untouched then.
+    fn resolve_model_api(&self, selection: &str) -> Option<ApiProtocol> {
+        if env::var("OPENAI_API").is_ok() {
+            return None;
+        }
+        if let Some(api) = model_api_from_env(selection, &self.model) {
+            return Some(api);
+        }
+        learned_api(&self.base_url, &self.model)
+    }
+
     /// Apply a `/model` selection. `provider/model` switches provider (and its
     /// base_url) when `provider` parses as a known provider; `endpoint/model`
-    /// routes to the named endpoint's base_url. Provider prefix is stripped
-    /// first, then endpoint routing runs on the remainder. Returns the endpoint
-    /// name when an endpoint route was taken. With `persist`, the selection is
-    /// written back to the config file (it becomes the new default).
+    /// routes to the named endpoint's base_url; a bare id keeps the current
+    /// endpoint when it serves the model (per the models.dev catalog) and
+    /// moves to the serving endpoint otherwise — so the pick, not the user,
+    /// owns the base_url. The wire protocol follows the same way
+    /// (`DEX_MODEL_APIS`, then learned, then the global default) with the
+    /// empirical responses→completions fallback as the last resort.
+    /// Provider prefix is stripped first, then endpoint routing runs on the
+    /// remainder. Returns the endpoint name when an endpoint route was
+    /// taken. With `persist`, the selection is written back to the config
+    /// file (it becomes the new default).
     pub(crate) fn apply_model(&mut self, selection: &str, persist: bool) -> Option<String> {
         let prev_model = self.model.clone();
         let prev_provider = self.provider;
@@ -1164,27 +1232,40 @@ impl LlmConfig {
                 sel = rest;
             }
         }
-        let result = if let Some((name, rest)) = sel.split_once('/') {
+        let mut result = None;
+        let mut routed = false;
+        if let Some((name, rest)) = sel.split_once('/') {
             if let Some(url) = self.endpoints.get(name).cloned() {
-                self.base_url = url.clone();
+                self.base_url = url;
                 self.model = rest.to_string();
-                Some(name.to_string())
-            } else {
-                self.model = sel.to_string();
-                None
+                result = Some(name.to_string());
+                routed = true;
             }
-        } else {
+        }
+        if !routed {
+            // Bare id (possibly with provider-native slashes like
+            // `moonshotai/kimi-k2.6`): stay unless the catalog shows the
+            // model lives on another known endpoint.
             self.model = sel.to_string();
-            None
-        };
+            if let Some(catalog) = load_dex_catalog() {
+                if let Some(url) = catalog_endpoint_for_model(
+                    &catalog,
+                    &self.model,
+                    &self.endpoints,
+                    &self.base_url,
+                ) {
+                    result = self
+                        .endpoints
+                        .iter()
+                        .find_map(|(name, known)| (*known == url).then(|| name.clone()));
+                    self.base_url = url;
+                }
+            }
+        }
         // The model carries its wire protocol; the global `api` is the
         // fallback and `OPENAI_API` pins it.
-        if env::var("OPENAI_API").is_err() {
-            if let Some(api) = model_api_from_env(selection, &self.model) {
-                self.api = api;
-            } else if let Some(learned) = learned_api(&self.base_url, &self.model) {
-                self.api = learned;
-            }
+        if let Some(api) = self.resolve_model_api(selection) {
+            self.api = api;
         }
         if persist && (self.model != prev_model || self.provider != prev_provider) {
             persist_selection(selection, self.provider, &self.base_url);
@@ -1234,17 +1315,18 @@ impl LlmConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| provider.default_base_url().to_string());
         self.endpoints = provider.endpoints();
-        let api_name = env::var("OPENAI_API").ok();
+        let api_name = env::var("OPENAI_API")
+            .ok()
+            .or_else(|| load_config_str(&load_config_file(), "api"));
         self.api = api_name
             .as_deref()
             .and_then(ApiProtocol::parse)
             .unwrap_or(ApiProtocol::Responses);
         // Keep the current model's own protocol when the global `api` is not
         // explicitly pinned via `OPENAI_API`.
-        if env::var("OPENAI_API").is_err() {
-            if let Some(api) = model_api_from_env(&self.model, &self.model) {
-                self.api = api;
-            }
+        let current = self.model.clone();
+        if let Some(api) = self.resolve_model_api(&current) {
+            self.api = api;
         }
         if persist {
             persist_selection(&self.model, provider, &self.base_url);
@@ -1540,7 +1622,7 @@ pub(crate) mod tests {
         assert!(Provider::parse("unknown").is_err());
         assert_eq!(
             Provider::OpenCode.default_base_url(),
-            "https://api.openai.com/v1"
+            "https://opencode.ai/zen/v1"
         );
         assert_eq!(
             Provider::OpenAiCodex.default_base_url(),
@@ -1858,6 +1940,104 @@ pub(crate) mod tests {
         );
         assert!(cache.join("dex/learned-apis.json").exists());
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Synthetic catalog where each model lives on exactly one endpoint,
+    /// so bare picks must move `base_url` without any prefix knowledge.
+    fn write_routing_catalog(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("dex/models.dev.json"),
+            serde_json::json!({
+                "opencode": {
+                    "api": "https://opencode.ai/zen/v1",
+                    "models": { "m-zen-only": { "limit": { "context": 1 } } }
+                },
+                "opencode-go": {
+                    "api": "https://go.example/v1",
+                    "models": { "m-go-only": { "limit": { "context": 1 } } }
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bare_model_auto_routes_to_serving_endpoint() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME", "DEX_MODEL_APIS", "OPENAI_API"]);
+        let dir = std::env::temp_dir().join(format!("dex-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_routing_catalog(&dir);
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::remove_var("DEX_MODEL_APIS");
+        std::env::remove_var("OPENAI_API");
+        let mut cfg = test_cfg();
+        cfg.endpoints
+            .insert("go".to_string(), "https://go.example/v1".to_string());
+        // Bare pick living on another endpoint moves base_url by itself.
+        assert_eq!(cfg.apply_model("m-go-only", false).as_deref(), Some("go"));
+        assert_eq!(cfg.base_url, "https://go.example/v1");
+        assert_eq!(cfg.model, "m-go-only");
+        // Back to a zen-only model.
+        assert_eq!(cfg.apply_model("m-zen-only", false).as_deref(), Some("zen"));
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        // Unknown models and custom URLs stay put.
+        assert_eq!(cfg.apply_model("m-unknown", false), None);
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        cfg.base_url = "https://custom.example/v1".to_string();
+        assert_eq!(cfg.apply_model("m-go-only", false), None);
+        assert_eq!(cfg.base_url, "https://custom.example/v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefixed_selection_restores_protocol_on_restart() {
+        // `model: go/<id>` in the config file must honor a bare-id
+        // `DEX_MODEL_APIS` entry: the full selection key is tried first,
+        // then the stripped id (previously both lookups used the raw
+        // `go/<id>` string, so bare entries never matched after restart).
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENAI_MODEL",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "provider: opencode\nmodel: go/m-z9\n",
+        )
+        .unwrap();
+        // Empty catalog dir: no routing interference, unknown model stays.
+        std::fs::create_dir_all(dir.join("cache/dex")).unwrap();
+        std::fs::write(dir.join("cache/dex/models.dev.json"), "{}").unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("DEX_MODEL_APIS", "m-z9=openai-completions");
+        std::env::remove_var("OPENAI_API");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("OPENAI_MODEL");
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.model, "m-z9");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         let _ = std::fs::remove_dir_all(&dir);
     }

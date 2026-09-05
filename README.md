@@ -99,9 +99,7 @@ A minimal `~/.config/dex/config.yaml`:
 ```yaml
 provider: opencode
 api_key: sk-...
-base_url: https://opencode.ai/zen/go/v1
 model: glm-5.3-flash
-api: openai-completions
 headers:
   X-Gateway-Key: abc123
 ```
@@ -109,19 +107,21 @@ headers:
 Or without a file:
 
 ```sh
-export OPENAI_API_KEY=sk-...                    # the only required setting
-# OpenCode Zen instead of api.openai.com:
-export OPENAI_BASE_URL=https://opencode.ai/zen/v1
-# which talks completions for some models:
-export DEX_MODEL_APIS=kimi-k2.6=openai-completions
-dex
+export OPENAI_API_KEY=sk-...   # the only required setting
+dex                           # model/base_url/protocol resolve themselves
 ```
 
-The model carries its own wire protocol: `/model` switches it automatically
-(e.g. `kimi-k2.6` speaks `openai-completions` while `gpt-5.6-luna` speaks
-`openai-responses` on the same provider), resolved from `DEX_MODEL_APIS` by bare
-id or full `endpoint/id` selection (full selection wins). `OPENAI_API` pins one
-protocol for everything when set.
+Pick a provider and a model — the rest follows. A bare `/model <id>` moves
+`base_url` to the endpoint serving that id (via the cached models.dev
+catalog; `go/<id>`/`zen/<id>` prefixes still force an endpoint, and an
+explicit `--base-url`/`OPENAI_BASE_URL`/file `base_url` always wins). The
+wire protocol follows the same way: a first `/responses` failure falls back
+to chat-completions once and is remembered, so per-model knowledge never
+needs configuring. Manual overrides are escape hatches only:
+`DEX_MODEL_APIS="id=openai-completions,..."` seeds a model's protocol
+(full `endpoint/id` key beats bare id), `OPENAI_API` pins one protocol for
+everything. Do NOT set a global `api:` in the config file to fix one model —
+it pins every model and disables the automatic fallback.
 
 For ChatGPT-backed Codex, first run `codex --login`, then:
 
@@ -357,7 +357,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | Variable             | Description                                              |
 | -------------------- | -------------------------------------------------------- |
 | `OPENAI_API_KEY`     | API key (required for `opencode`; export it in your shell profile). |
-| `OPENAI_BASE_URL`    | API base URL (default `https://api.openai.com/v1`; e.g. `https://opencode.ai/zen/v1`). |
+| `OPENAI_BASE_URL`    | API base URL (default `https://opencode.ai/zen/v1`; usually left unset — model picks own endpoint). |
 | `OPENAI_MODEL`       | Model selection (default: config file `model:` or `gpt-5.6-luna`).          |
 | `OPENAI_API`         | Wire protocol default (`openai-completions` or `openai-responses`); pins one protocol for everything. |
 | `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. |

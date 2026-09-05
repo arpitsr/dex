@@ -18,10 +18,12 @@ pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
 impl Provider {
     /// Base URL when `OPENAI_BASE_URL`, `--base-url` and config-file
-    /// `base_url` are all unset.
+    /// `base_url` are all unset. Bare model picks route themselves to the
+    /// right endpoint via the models.dev catalog (see `apply_model`), so
+    /// this is just the landing endpoint, not a per-model decision.
     pub(crate) fn default_base_url(self) -> &'static str {
         match self {
-            Self::OpenCode => "https://api.openai.com/v1",
+            Self::OpenCode => "https://opencode.ai/zen/v1",
             Self::OpenAiCodex => "https://chatgpt.com/backend-api/codex",
         }
     }
@@ -130,7 +132,7 @@ mod tests {
         assert!(Provider::OpenCode.auth_headers(Some("acct")).is_empty());
         assert_eq!(
             Provider::OpenCode.default_base_url(),
-            "https://api.openai.com/v1"
+            "https://opencode.ai/zen/v1"
         );
         assert_eq!(
             Provider::OpenAiCodex.default_base_url(),
