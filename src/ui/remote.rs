@@ -88,6 +88,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         keep_recent_tokens: 20_000,
         permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::AskWrites),
         verify_command: None,
+        extra_headers: Default::default(),
         client: reqwest::blocking::Client::new(),
     }
 }
@@ -191,6 +192,17 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             PermissionMode::AskShell => "ask-shell".to_string(),
             PermissionMode::Trusted => "trusted".to_string(),
         }),
+        headers: if args.headers.is_empty() {
+            None
+        } else {
+            let mut merged = std::collections::BTreeMap::new();
+            for raw in &args.headers {
+                for (k, v) in crate::llm::config::parse_headers_str(raw) {
+                    merged.insert(k, v);
+                }
+            }
+            Some(merged)
+        },
         plan: None,
         idempotency_key: None,
     };

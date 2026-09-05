@@ -62,7 +62,7 @@ fn resolve_daemon_info() -> DaemonInfo {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let (git_branch, git_dirty) = git_context(&cwd);
-    match LlmConfig::from_env(None, None, None) {
+    match LlmConfig::from_env(None, None, None, &[]) {
         Ok(config) => DaemonInfo {
             provider: config.provider.name().to_string(),
             model: config.model.clone(),
@@ -727,8 +727,16 @@ fn run_turn_inner(
             .as_deref()
             .map(crate::core::types::PermissionMode::parse)
             .transpose()?,
+        &[],
     )
     .map_err(|e| format!("failed to build config: {e}"))?;
+    // Per-request custom headers from the client (`--header` flags) win
+    // over the daemon's own configured headers for this turn only.
+    if let Some(headers) = req.headers.as_ref() {
+        for (k, v) in headers {
+            config.extra_headers.insert(k.clone(), v.clone());
+        }
+    }
     // Persist provider/model overrides so /resume restores the same provider/base_url without env
     if let Some(raw) = &req.model {
         if !raw.is_empty() {
@@ -1415,6 +1423,7 @@ mod handler_tests {
             base_url: None,
             model: None,
             permission: None,
+            headers: None,
             plan: None,
         };
         // unknown session -> 404
@@ -1776,6 +1785,7 @@ mod permission_gate_tests {
             base_url: None,
             model: None,
             permission: permission.map(String::from),
+            headers: None,
             plan: plan.map(String::from),
         };
 

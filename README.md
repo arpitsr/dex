@@ -47,8 +47,11 @@ Defaults come from a config file, layered under env vars and CLI flags:
 | Config file               | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
 | Built-in defaults         | provider `opencode`, model `gpt-5.6-luna` |
 
-Supported file keys: `provider`, `api_key`, `base_url`, `model`, `api` (other
-keys are preserved untouched). `/model` and `/provider` selections are written
+  Supported file keys: `provider`, `api_key`, `base_url`, `model`, `api`, `headers`
+  (also `http_headers`, codex-style; `headers` wins per-key — other
+  keys are preserved untouched). Each headers key accepts a mapping, a
+  text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as the env
+  vars / `--header`), or a list mixing both. `/model` and `/provider` selections are written
 back to the file's `model:`/`provider:`/`base_url:` keys, so a switch becomes
 the new default for later runs. Session state still re-applies the exact
 provider/model on `/resume`.
@@ -61,6 +64,8 @@ api_key: sk-...
 base_url: https://opencode.ai/zen/go/v1
 model: glm-5.3-flash
 api: openai-completions
+headers:
+  X-Gateway-Key: abc123
 ```
 
 Or without a file:
@@ -188,6 +193,7 @@ the daemon's working directory.
 | Flag               | Description                                              |
 | ------------------ | -------------------------------------------------------- |
 | `--base-url <url>` | Override the API base URL for this run.                  |
+| `-H`, `--header <"Name: Value">` | Extra provider header (repeatable; `Name=Value` or JSON object also accepted). |
 | `--model <name>`   | Override the model for this run.                         |
 | `-s`, `--session <path>` | Open/continue a specific session file.             |
 | `--no-session`     | Disable session persistence for this run.                |
@@ -316,6 +322,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `OPENAI_BASE_URL`    | API base URL (default `https://api.openai.com/v1`; e.g. `https://opencode.ai/zen/v1`). |
 | `OPENAI_MODEL`       | Model selection (default: config file `model:` or `gpt-5.6-luna`).          |
 | `OPENAI_API`         | Wire protocol default (`openai-completions` or `openai-responses`); pins one protocol for everything. |
+| `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. |
 | `DEX_PROVIDER`        | Provider selection (`opencode` or `openai-codex`, default `opencode`). |
 | `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |
 | `CODEX_ACCOUNT_ID`   | Account ID paired with `CODEX_ACCESS_TOKEN`.               |

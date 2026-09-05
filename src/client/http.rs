@@ -14,6 +14,7 @@ pub(crate) struct ChatOptions {
     pub(crate) base_url: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) permission: Option<String>,
+    pub(crate) headers: Option<std::collections::BTreeMap<String, String>>,
     pub(crate) plan: Option<String>,
     /// P10: replay-safe submission key; the daemon dedups identical keys within 60s.
     pub(crate) idempotency_key: Option<String>,
@@ -156,6 +157,7 @@ impl DaemonClient {
                 base_url: options.base_url,
                 model: options.model,
                 permission: options.permission,
+                headers: options.headers,
                 plan: options.plan,
             })
             .send()?
