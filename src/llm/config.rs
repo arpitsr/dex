@@ -1543,16 +1543,18 @@ impl LlmConfig {
     }
 
     /// Reasoning effort for the current model: a stored `/thinking` choice
-    /// wins, else `DEX_THINKING_EFFORT`, else unset. Warns once per
-    /// model+effort when the effective level isn't advertised for the model
-    /// (the catalog scan is skipped entirely when no effort is set, so the
-    /// common case stays free).
+    /// wins, then `DEX_THINKING_EFFORT`, then file `thinking_effort:`, else
+    /// unset. Warns once per model+effort when the effective level isn't
+    /// advertised for the model (the catalog scan is skipped entirely when
+    /// no effort is set, so the common case stays free).
     pub(crate) fn refresh_thinking_effort(&mut self) {
-        let effort = stored_thinking_effort(&self.base_url, &self.model).or_else(|| {
-            env::var("DEX_THINKING_EFFORT")
-                .ok()
-                .filter(|v| !v.is_empty())
-        });
+        let effort = stored_thinking_effort(&self.base_url, &self.model)
+            .or_else(|| {
+                env::var("DEX_THINKING_EFFORT")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            })
+            .or_else(|| load_config_str(&load_config_file(), "thinking_effort"));
         if let Some(effort) = &effort {
             if let Some(options) = reasoning_options_for(&self.model) {
                 if !options.iter().any(|o| o == effort) {
@@ -3069,6 +3071,55 @@ pub(crate) mod tests {
         std::env::set_var("DEX_THINKING_EFFORT", "medium");
         cfg.apply_model("m-bare", false).unwrap();
         assert_eq!(cfg.thinking_effort.as_deref(), Some("medium"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thinking_effort_reads_file_key_under_env() {
+        // File `thinking_effort:` is the default under a stored choice and
+        // the env var: stored > env > file > unset.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-thinkfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: opencode\nthinking_effort: low\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        for key in [
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+        ] {
+            std::env::remove_var(key);
+        }
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("low"));
+        std::env::set_var("DEX_THINKING_EFFORT", "medium");
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("medium"));
+        remember_thinking_effort(&cfg.base_url, &cfg.model, Some("high"));
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("high"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
