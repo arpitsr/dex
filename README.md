@@ -111,10 +111,11 @@ export OPENAI_API_KEY=sk-...   # the only required setting
 dex                           # model/base_url/protocol resolve themselves
 ```
 
-Pick a provider and a model — the rest follows. A bare `/model <id>` moves
-`base_url` to the endpoint serving that id (via the cached models.dev
-catalog; `go/<id>`/`zen/<id>` prefixes still force an endpoint, and an
-explicit `--base-url`/`OPENAI_BASE_URL`/file `base_url` always wins). The
+Pick a provider and a model — the rest follows. Run `dex update --models`
+once to cache the models.dev catalog; a bare `/model <id>` then moves
+`base_url` to the endpoint serving that id (`go/<id>`/`zen/<id>` prefixes
+still force an endpoint, and an explicit
+`--base-url`/`OPENAI_BASE_URL`/file `base_url` always wins). The
 wire protocol follows the same way: a first `/responses` failure falls back
 to chat-completions once and is remembered, so per-model knowledge never
 needs configuring. Manual overrides are escape hatches only:

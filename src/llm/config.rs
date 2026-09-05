@@ -437,8 +437,9 @@ fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u6
 /// rename can't silently misroute. Returns `None` (keep the current URL)
 /// when the current endpoint already serves the model, the model is unknown,
 /// or the current URL is custom (not a known endpoint — explicit wins).
-/// ponytail: linear scan of a cached 4MB parse; only runs on `/model`
-/// switches and startup, never per turn.
+/// ponytail: linear scan of a cached 4MB parse; runs on `/model` switches
+/// and on every config rebuild (`from_env` runs per daemon chat turn) —
+/// cheap behind the cached parse + endpoint guard.
 fn catalog_endpoint_for_model(
     catalog: &serde_json::Value,
     model: &str,
@@ -1069,10 +1070,15 @@ impl LlmConfig {
             })
             .unwrap_or_default();
         let env_base_url = env::var("OPENAI_BASE_URL").ok().filter(|v| !v.is_empty());
-        let explicit_base_url = base_url_override.is_some();
+        let file_base_url = load_config_str(&file, "base_url");
+        // Any explicit base_url (CLI flag, OPENAI_BASE_URL, file `base_url:`)
+        // pins the endpoint — routing may not silently rewire what the user
+        // set. Only the fallback default (nothing set anywhere) routes.
+        let explicit_base_url =
+            base_url_override.is_some() || env_base_url.is_some() || file_base_url.is_some();
         let base_url = base_url_override
             .or(env_base_url)
-            .or_else(|| load_config_str(&file, "base_url"))
+            .or(file_base_url)
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| provider.default_base_url().to_string());
         let api_name = env::var("OPENAI_API")
@@ -1176,7 +1182,8 @@ impl LlmConfig {
         };
         // A prefixed model override (--model go/foo or the daemon's
         // per-request model) routes to its endpoint; bare ids keep the
-        // resolved base_url. An explicit --base-url wins over routing.
+        // resolved base_url. An explicit base_url (--base-url,
+        // OPENAI_BASE_URL, file `base_url:`) wins over routing.
         if !explicit_base_url {
             this.apply_model(&model, false);
         }
@@ -1987,12 +1994,61 @@ pub(crate) mod tests {
         // Back to a zen-only model.
         assert_eq!(cfg.apply_model("m-zen-only", false).as_deref(), Some("zen"));
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        // A model the current endpoint serves never moves — dual-served ids
+        // must not ping-pong between endpoints.
+        assert_eq!(cfg.apply_model("m-zen-only", false), None);
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         // Unknown models and custom URLs stay put.
         assert_eq!(cfg.apply_model("m-unknown", false), None);
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         cfg.base_url = "https://custom.example/v1".to_string();
         assert_eq!(cfg.apply_model("m-go-only", false), None);
         assert_eq!(cfg.base_url, "https://custom.example/v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_base_url_wins_over_catalog_routing() {
+        // OPENAI_BASE_URL is a user pin even when it names a known endpoint:
+        // a go-only model stays on the pinned URL instead of being silently
+        // rerouted to the serving endpoint.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENAI_MODEL",
+            "OPENAI_API",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_routing_catalog(&dir);
+        std::fs::write(dir.join("config.yaml"), "provider: opencode\n").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENAI_BASE_URL", "https://opencode.ai/zen/v1");
+        std::env::set_var("OPENAI_MODEL", "m-go-only");
+        for key in [
+            "DEX_PROVIDER",
+            "OPENAI_API",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+        ] {
+            std::env::remove_var(key);
+        }
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.model, "m-go-only");
+        // The pin holds even though the catalog says m-go-only lives on go.
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
