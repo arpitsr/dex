@@ -3,6 +3,7 @@ pub(crate) mod server;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -62,6 +63,10 @@ pub(crate) struct DaemonState {
     /// scope as `Console::approval_key`). Lives on the daemon so a decision
     /// survives across turns; previously `Console` was per-turn and lost it.
     pub session_approvals: Mutex<HashMap<String, HashSet<String>>>,
+    /// Set once the background startup rebuild has merged the disk registry.
+    /// Surfaced via `/health` so operators can tell a partial registry apart
+    /// from an empty one.
+    pub rebuild_complete: AtomicBool,
 }
 
 /// 60-second window during which an `Idempotency-Key` replays its recorded
@@ -87,6 +92,7 @@ impl DaemonState {
             event_seqs: Mutex::new(HashMap::new()),
             idempotency: Mutex::new(HashMap::new()),
             session_approvals: Mutex::new(HashMap::new()),
+            rebuild_complete: AtomicBool::new(false),
         }
     }
 
@@ -152,12 +158,12 @@ impl DaemonState {
     }
 
     /// Seed `event_seqs` for a session from its persisted journal: the next
-    /// allocation continues after the highest journaled seq (0 when empty).
+    /// allocation continues after the highest journaled seq (0 when the
+    /// journal holds no seq yet — `None`, not a journal holding seq 0).
     /// Takes the max with any live counter: the startup rebuild now runs in
     /// the background, so a turn may have allocated seqs before this seeds.
     fn seed_seq(&self, session_id: &str, path: &std::path::Path) {
-        let max = crate::session::Session::max_event_seq(path);
-        let next = if max > 0 { max + 1 } else { 0 };
+        let next = crate::session::Session::max_event_seq(path).map_or(0, |max| max + 1);
         self.event_seqs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -178,20 +184,12 @@ impl DaemonState {
     /// win over their (nonexistent) disk state.
     pub fn rebuild(&self) {
         let mut entries = Vec::new();
+        let mut interrupted = Vec::new();
         for (path, header) in crate::session::Session::list_all().unwrap_or_default() {
             let id = header.id().to_string();
             self.seed_seq(&id, &path);
             if crate::session::Session::last_turn_state(&path) == "interrupted" {
-                // Session::from_path refuses in-memory (pathless) sessions but
-                // these all came from disk.
-                if let Ok(mut s) = crate::session::Session::from_path(&path) {
-                    let _ = s.turn_event("turn_failed").and_then(|_| {
-                        s.set_state(
-                            "last_error",
-                            "turn interrupted by daemon restart; effects may be partial — review before continuing",
-                        )
-                    });
-                }
+                interrupted.push((id.clone(), path.clone()));
             }
             entries.push((
                 id,
@@ -202,10 +200,38 @@ impl DaemonState {
                 },
             ));
         }
+        // Mark interrupted turns failed BEFORE merging the registry, skipping
+        // sessions with a turn currently in flight: a client may have
+        // reattached and started chatting while the scan ran, and appending
+        // `turn_failed` under its live `turn_start` would corrupt that turn.
+        // Registration alone (no live turn) stays markable — the marker is
+        // still the truth and no one is appending. Each liveness check is a
+        // brief lock immediately before its write.
+        for (id, path) in &interrupted {
+            let live = self
+                .active_turns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(id);
+            if live {
+                continue;
+            }
+            // Session::from_path refuses in-memory (pathless) sessions but
+            // these all came from disk.
+            if let Ok(mut s) = crate::session::Session::from_path(path) {
+                let _ = s.turn_event("turn_failed").and_then(|_| {
+                    s.set_state(
+                        "last_error",
+                        "turn interrupted by daemon restart; effects may be partial — review before continuing",
+                    )
+                });
+            }
+        }
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         for (id, entry) in entries {
             sessions.entry(id).or_insert(entry);
         }
+        self.rebuild_complete.store(true, Ordering::Relaxed);
     }
 }
 
@@ -217,8 +243,15 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
     // with a few thousand sessions and would delay /health and TUI first
     // paint. Fresh sessions use uuid ids so they never collide with rebuilt
     // ones; `seed_seq` takes the max so a racing turn can't rewind a counter.
+    // A panicking rebuild must not fail silent (the registry would stay
+    // partial behind an `ok` health check): log it, and `rebuild_complete`
+    // in `/health` stays false.
     let warm = state.clone();
-    tokio::task::spawn_blocking(move || warm.rebuild());
+    tokio::spawn(async move {
+        if let Err(e) = tokio::task::spawn_blocking(move || warm.rebuild()).await {
+            eprintln!("dex daemon: session registry rebuild failed: {e}");
+        }
+    });
 
     let app = server::router(state.clone());
 
@@ -318,6 +351,78 @@ mod tests {
         }
         // The interrupted turn is now durably failed.
         assert_eq!(crate::session::Session::last_turn_state(&path), "failed");
+        assert!(state.rebuild_complete.load(Ordering::Relaxed));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn event_seq_seed_advances_past_a_single_seq_zero() {
+        // `max_event_seq` is None when empty but Some(0) for a journal
+        // holding exactly seq 0; the seed must not reuse seq 0.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s = crate::session::Session::new("/tmp/dex-seq-zero-test".into(), None).unwrap();
+        s.append_event(0, "{\"type\":\"system\",\"data\":\"x\"}")
+            .unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        let state = DaemonState::new();
+        state.seed_seq(s.id(), &path);
+        assert_eq!(state.next_seq(s.id()), 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("events.jsonl"));
+    }
+
+    #[test]
+    fn rebuild_skips_failed_marking_for_live_turns() {
+        // A reattach + chat racing the background rebuild owns the journal:
+        // stamping `turn_failed` under its live `turn_start` would corrupt it.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s =
+            crate::session::Session::new("/tmp/dex-rebuild-live-test".into(), None).unwrap();
+        let id = s.id().to_string();
+        s.turn_event("turn_start").unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        drop(s);
+
+        let state = DaemonState::new();
+        state.active_turns.lock().unwrap().insert(id.clone());
+        state.rebuild();
+        // Still registered, but the live turn is untouched.
+        assert!(state.sessions.lock().unwrap().contains_key(&id));
+        assert_eq!(
+            crate::session::Session::last_turn_state(&path),
+            "interrupted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rebuild_registry_merge_keeps_live_entries() {
+        // Sessions claimed (reattached/created) mid-rebuild win over disk via
+        // `or_insert` — the rebuild must not clobber them.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let s = crate::session::Session::new("/tmp/dex-rebuild-wins-test".into(), None).unwrap();
+        let id = s.id().to_string();
+        let path = s.path().unwrap().to_path_buf();
+        drop(s);
+
+        let state = DaemonState::new();
+        let live = SessionEntry {
+            path: std::path::PathBuf::from("/tmp/dex-live-wins-marker"),
+            name: None,
+            cwd: "/tmp".into(),
+        };
+        state.sessions.lock().unwrap().insert(id.clone(), live);
+        state.rebuild();
+        assert_eq!(
+            state.sessions.lock().unwrap().get(&id).unwrap().path,
+            std::path::PathBuf::from("/tmp/dex-live-wins-marker")
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
