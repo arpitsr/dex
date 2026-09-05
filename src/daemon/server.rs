@@ -269,9 +269,12 @@ async fn create_session(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
+    // `Session::new` fills in the default `<workspace>-<7 chars>` name when
+    // the request carries none, so read it back from the session: the
+    // in-memory entry must match the persisted header.
     let entry = SessionEntry {
         path: path.clone().into(),
-        name: req.name,
+        name: session.name().map(ToString::to_string),
         cwd,
     };
     state
