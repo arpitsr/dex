@@ -189,6 +189,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // not wait for a daemon-side skills scan before reporting the error.
     let skills_client = client.clone();
     let skills_handle = std::thread::spawn(move || skills_client.list_skills().unwrap_or_default());
+    // Sessions default to `<workspace>-<7 chars>` (k8s-style); an explicit
+    // `--name` wins. Generated client-side so the local placeholder shows the
+    // same name the daemon persists.
+    let session_name = args
+        .session_name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| Session::default_session_name(&info.cwd));
     let session_result: Result<(String, bool), String> = if let Some(reattach) = &args.reattach {
         // P10: attach to an existing persisted session on the daemon and get
         // the replay cursor, instead of creating a fresh one.
@@ -198,7 +206,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             .map_err(|e| format!("failed to reattach session: {e}"))
     } else {
         client
-            .create_session(&info.cwd, args.session_name.as_deref())
+            .create_session(&info.cwd, Some(&session_name))
             .map(|resp| (resp.session_id, false))
             .map_err(|e| format!("failed to create session: {e}"))
     };
@@ -311,6 +319,11 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         cancel_flag,
         last_click: None,
     };
+    if !is_reattach {
+        // Keep the local placeholder's display name in sync with the daemon
+        // record (a reattach overwrites `app.session` from disk below).
+        remote.app.session.set_name(session_name).ok();
+    }
 
     // P10: reconstruct the transcript for a reattached session. Prefer the
     // persisted JSONL messages (complete, includes user prompts the events
@@ -1375,12 +1388,15 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     "new session started."
                 };
                 let cwd = remote.app.cwd.clone();
-                match remote.client.create_session(&cwd, None) {
+                let name = Session::default_session_name(&cwd);
+                match remote.client.create_session(&cwd, Some(&name)) {
                     Ok(session) => {
                         remote.session_id = session.session_id;
                         reset_session_state(&mut remote.app);
                         remote.options.plan = None;
-                        remote.app.session = Session::in_memory(cwd);
+                        let mut fresh = Session::in_memory(cwd);
+                        fresh.set_name(name).ok();
+                        remote.app.session = fresh;
                         push_info(&mut remote.app, label.to_string());
                         push_skills_listing(&mut remote.app);
                     }
