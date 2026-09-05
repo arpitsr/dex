@@ -18,11 +18,12 @@ extern "C" fn handle_sigint(_: i32) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
+/// Unix: `sigaction` (not `signal`) WITHOUT SA_RESTART, so a SIGINT
+/// arriving while blocked in read(2) returns EINTR instead of restarting
+/// the syscall — the flag is then observed promptly.
+#[cfg(unix)]
 pub(crate) fn install_sigint_handler() {
-    // Minimal libc binding so we don't need the libc crate. We must use
-    // `sigaction` (not `signal`) WITHOUT SA_RESTART: otherwise a SIGINT
-    // arriving while blocked in read(2) on the tty restarts the syscall
-    // and the flag is never observed until another key is pressed.
+    // Minimal libc binding so we don't need the libc crate.
     #[repr(C)]
     struct SigAction {
         handler: extern "C" fn(i32),
@@ -41,6 +42,18 @@ pub(crate) fn install_sigint_handler() {
     };
     unsafe {
         sigaction(2, &action, std::ptr::null_mut());
+    }
+}
+
+/// Windows: CRT `signal()` for SIGINT. The handler runs on a console
+/// control thread; the flag is consumed by `take_interrupt()` polling.
+#[cfg(windows)]
+pub(crate) fn install_sigint_handler() {
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+    unsafe {
+        signal(2, handle_sigint);
     }
 }
 
