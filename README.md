@@ -81,24 +81,26 @@ Defaults come from a config file, layered under env vars and CLI flags:
 | Layer (wins first)        | Example                              |
 | ------------------------- | ------------------------------------ |
 | CLI flags                 | `--model`, `--base-url`              |
-| Environment variables     | `OPENAI_MODEL`, `OPENAI_BASE_URL`    |
+| Environment variables     | `OPENCODE_API_KEY`, `DEX_PROVIDER`    |
 | Config file               | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
 | Built-in defaults         | provider `opencode`, model `gpt-5.6-luna` |
 
-Supported file keys: `provider`, `api_key`, `base_url`, `model`, `api`, `headers`
+Supported file keys: `active_provider`, `providers`, `base_url`, `model`, `api`, `thinking_effort`, `headers`
 (also `http_headers`, codex-style; `headers` wins per-key — other
   keys are preserved untouched). Each headers key accepts a mapping, a
   text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as the env
   vars / `--header`), or a list mixing both. `/model` and `/provider` selections are written
-back to the file's `model:`/`provider:`/`base_url:` keys, so a switch becomes
+back to the file's `model:`/`active_provider:`/`base_url:` keys, so a switch becomes
 the new default for later runs. Session state still re-applies the exact
 provider/model on `/resume`.
 
 A minimal `~/.config/dex/config.yaml`:
 
 ```yaml
-provider: opencode
-api_key: sk-...
+active_provider: opencode
+providers:
+  opencode:
+    api_key: sk-...        # the deposit place for this provider's key
 model: glm-5.3-flash
 headers:
   X-Gateway-Key: abc123
@@ -107,21 +109,55 @@ headers:
 Or without a file:
 
 ```sh
-export OPENAI_API_KEY=sk-...   # the only required setting
-dex                           # model/base_url/protocol resolve themselves
+export OPENCODE_API_KEY=sk-...   # the only required setting
+dex                             # model/base_url/protocol resolve themselves
 ```
 
-Pick a provider and a model — the rest follows. A bare `/model <id>` moves
-`base_url` to the endpoint serving that id (via the cached models.dev
-catalog; `go/<id>`/`zen/<id>` prefixes still force an endpoint, and an
-explicit `--base-url`/`OPENAI_BASE_URL`/file `base_url` always wins). The
+Pick a provider and a model — the rest follows. Run `dex update --models`
+once to cache the models.dev catalog; a bare `/model <id>` then moves
+`base_url` to the endpoint serving that id (`go/<id>`/`zen/<id>` prefixes
+still force an endpoint, and an explicit
+`--base-url`/file `base_url` always wins). The
 wire protocol follows the same way: a first `/responses` failure falls back
 to chat-completions once and is remembered, so per-model knowledge never
 needs configuring. Manual overrides are escape hatches only:
 `DEX_MODEL_APIS="id=openai-completions,..."` seeds a model's protocol
-(full `endpoint/id` key beats bare id), `OPENAI_API` pins one protocol for
-everything. Do NOT set a global `api:` in the config file to fix one model —
+(full `endpoint/id` key beats bare id). Do NOT set a global `api:` in the config file to fix one model —
 it pins every model and disables the automatic fallback.
+
+### Other OpenAI-compatible providers
+
+Any models.dev provider with an OpenAI-style endpoint works without dedicated
+integration. Deposit its key under `providers:` and pick it by name:
+
+```yaml
+active_provider: zai
+providers:
+  zai:
+    api_key: zsk-...       # the deposit place; or export ZHIPU_API_KEY
+    # headers: {X-Custom: ...}  # optional; sent only to this provider
+    # base_url: ...        # optional; defaults to the catalog endpoint
+    # api: openai-completions  # optional protocol pin; learned otherwise
+```
+
+`/provider zai` and `/model zai/<id>` switch to it (the completion list shows
+`zai/<id>` once configured). The endpoint, model list, pricing, context
+windows and reasoning options come from the cached models.dev catalog — run
+`dex update --models` once. The key resolves per provider: config
+`providers.<name>.api_key` > the provider's own documented env var (from the
+catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`); opencode's is
+`OPENCODE_API_KEY`. There is no per-provider default key var outside the
+catalog — one provider's key never leaks into another. A model's advertised thinking options (e.g. `low/high/max`)
+are shown in the `/model` confirmation; `/thinking <level>` pins one per model
+(remembered per endpoint+model and validated against the advertised list —
+unknown models accept anything, a stale catalog never blocks).
+`DEX_THINKING_EFFORT` is the fallback when nothing is pinned, and an effort no
+model advertises warns once instead of failing opaquely at the API. A file
+`thinking_effort:` default sits under both (stored choice > env > file).
+Wire protocol resolves like opencode: responses first, one fallback to
+completions, remembered per endpoint+model. Native-protocol-only providers
+(no OpenAI-compatible endpoint in the catalog, e.g. anthropic) are not
+selectable this way.
 
 For ChatGPT-backed Codex, first run `codex --login`, then:
 
@@ -133,9 +169,6 @@ DEX_PROVIDER=openai-codex dex
 `CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or `$CODEX_HOME/auth.json`
 (default `~/.codex/auth.json`). Run `codex --login` again when the local token
 expires.
-
-If a legacy `~/.config/dex/config.yaml` exists, dex prints a warning and
-ignores it — translate its fields to the variables below and delete it.
 
 ## Usage
 
@@ -356,10 +389,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 
 | Variable             | Description                                              |
 | -------------------- | -------------------------------------------------------- |
-| `OPENAI_API_KEY`     | API key (required for `opencode`; export it in your shell profile). |
-| `OPENAI_BASE_URL`    | API base URL (default `https://opencode.ai/zen/v1`; usually left unset — model picks own endpoint). |
-| `OPENAI_MODEL`       | Model selection (default: config file `model:` or `gpt-5.6-luna`).          |
-| `OPENAI_API`         | Wire protocol default (`openai-completions` or `openai-responses`); pins one protocol for everything. |
+| `OPENCODE_API_KEY`   | API key for the opencode gateway (required for `opencode`; export it in your shell profile). |
 | `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. |
 | `DEX_PROVIDER`        | Provider selection (`opencode` or `openai-codex`, default `opencode`). |
 | `CODEX_ACCESS_TOKEN` | Optional Codex OAuth access-token override.                |
@@ -370,7 +400,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
-| `DEX_THINKING_EFFORT` | Reasoning effort passed to the API (e.g. `medium`). |
+| `DEX_THINKING_EFFORT` | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback). |
 | `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`). |
 | `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |

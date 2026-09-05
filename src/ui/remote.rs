@@ -76,9 +76,9 @@ struct RemoteApp {
 /// client never talks to the model provider itself; this only feeds the
 /// status footer and slash-command suggestions.
 fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
-    let provider = Provider::parse(&info.provider).unwrap_or(Provider::OpenCode);
+    let provider = Provider::from_display(&info.provider);
     crate::llm::config::LlmConfig {
-        provider,
+        provider: provider.clone(),
         api_key: String::new(),
         base_url: String::new(),
         model: info.model.clone(),
@@ -100,6 +100,9 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::AskWrites),
         verify_command: None,
         extra_headers: Default::default(),
+        provider_entries: Default::default(),
+        provider_headers: Default::default(),
+        api_pinned: false,
         // Display-only copy never talks to a provider; share the
         // process-wide client instead of initializing TLS + pool.
         client: crate::client::http::shared_blocking_client(),

@@ -31,12 +31,12 @@ pub(crate) fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<MidStreamError>().is_some()
 }
 
-/// Wire protocol for this call: an explicit pin (`OPENAI_API` or config-file
-/// `api:`) or a `DEX_MODEL_APIS` entry always wins (all baked into
-/// `config.api`); otherwise a learned fallback overrides the configured
+/// Wire protocol for this call: an explicit pin (config-file `api:` or the
+/// provider entry's, baked into `config.api_pinned`) or a `DEX_MODEL_APIS`
+/// entry always wins; otherwise a learned fallback overrides the configured
 /// default (`openai-responses`).
 fn effective_api(config: &LlmConfig) -> ApiProtocol {
-    if crate::llm::config::api_pinned()
+    if config.api_pinned
         || crate::llm::config::model_api_from_env(&config.model, &config.model).is_some()
     {
         return config.api;
@@ -53,7 +53,7 @@ fn effective_api(config: &LlmConfig) -> ApiProtocol {
 /// chat-completions? Only when nothing explicitly pinned the protocol, the
 /// provider exposes both wire shapes, and the failure isn't a cancellation.
 fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
-    if crate::llm::config::api_pinned() {
+    if config.api_pinned {
         return false; // user pinned one protocol for everything
     }
     if crate::llm::config::model_api_from_env(&config.model, &config.model).is_some() {
@@ -181,30 +181,20 @@ mod tests {
         {
             // Hermetic: no real env pins and no developer config.yaml.
             let absent = std::env::temp_dir().join("dex-gate-test-absent.yaml");
-            let _env =
-                EnvGuard::clear(&["OPENAI_API", "DEX_MODEL_APIS"]).set("DEX_CONFIG", &absent);
+            let _env = EnvGuard::clear(&["DEX_MODEL_APIS"]).set("DEX_CONFIG", &absent);
             // Unpinned opencode model: fallback allowed.
             assert!(try_responses_fallback(&cfg, "500 Internal server error"));
             // Never on cancellation.
             assert!(!try_responses_fallback(&cfg, "cancelled"));
-            // OPENAI_API pins the protocol — no inference.
-            std::env::set_var("OPENAI_API", "openai-responses");
-            assert!(!try_responses_fallback(&cfg, "500 boom"));
-            std::env::remove_var("OPENAI_API");
             // Explicit DEX_MODEL_APIS entry — user already decided.
             std::env::set_var("DEX_MODEL_APIS", "m-r=openai-responses");
             assert!(!try_responses_fallback(&cfg, "500 boom"));
             std::env::remove_var("DEX_MODEL_APIS");
-            // A config-file `api:` pin counts too.
-            let pin_dir =
-                std::env::temp_dir().join(format!("dex-gate-test-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&pin_dir);
-            std::fs::create_dir_all(&pin_dir).unwrap();
-            std::fs::write(pin_dir.join("config.yaml"), "api: openai-responses\n").unwrap();
-            std::env::set_var("DEX_CONFIG", pin_dir.join("config.yaml"));
+            // A baked-in pin (config-file `api:` / provider entry `api:`,
+            // computed once by `LlmConfig::from_env`) blocks inference too.
+            cfg.api_pinned = true;
             assert!(!try_responses_fallback(&cfg, "500 boom"));
-            std::env::set_var("DEX_CONFIG", &absent);
-            let _ = std::fs::remove_dir_all(&pin_dir);
+            cfg.api_pinned = false;
             // Codex backend has no /chat/completions.
             cfg.provider = Provider::OpenAiCodex;
             assert!(!try_responses_fallback(&cfg, "500 boom"));

@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::agent::state::CancellationSource;
 use crate::core::console::with_console;
 use crate::core::types::{ChatMessage, ChatRequest, SinkLine, StreamOptions};
-use crate::llm::config::LlmConfig;
+use crate::llm::config::{insert_extra_header, LlmConfig};
 use crate::llm::protocol::{responses_input, responses_tools, tools_schema};
 use crate::llm::stream::{read_responses_stream, read_stream, Turn};
 
@@ -40,18 +40,21 @@ pub(crate) fn authenticated_request(
     request: reqwest::blocking::RequestBuilder,
     config: &LlmConfig,
 ) -> reqwest::blocking::RequestBuilder {
-    let request = request.bearer_auth(&config.api_key);
-    let request = config
-        .provider
-        .auth_headers(config.account_id.as_deref())
-        .into_iter()
-        .fold(request, |req, (name, value)| req.header(name, value));
-    // Custom headers (gateway auth, routing, attribution) go last so a
-    // proxy that keys on them sees the final value. `authorization` is
+    let request =
+        config
+            .provider
+            .auth_scheme()
+            .apply(request, &config.api_key, config.account_id.as_deref());
+    // Provider-scoped file headers apply first; the global/env/CLI extras
+    // win on collision (explicit always beats file). `authorization` is
     // never overridable here — the api key owns it. Malformed names or
     // values are skipped so one bad header can't fail the turn.
-    let mut request = request;
+    let mut merged = config.provider_headers.clone();
     for (name, value) in &config.extra_headers {
+        insert_extra_header(&mut merged, name, value);
+    }
+    let mut request = request;
+    for (name, value) in &merged {
         if name.eq_ignore_ascii_case("authorization") {
             continue;
         }
@@ -128,7 +131,10 @@ fn post_with_retry(
                 && active_config.provider.credentials_refreshable()
                 && attempt < MAX_RETRIES
             {
-                if let Ok((token, account)) = active_config.provider.load_credentials(None) {
+                if let Ok((token, account)) = crate::llm::config::resolve_credentials(
+                    &active_config.provider,
+                    &active_config.provider_entries,
+                ) {
                     active_config.api_key = token;
                     active_config.account_id = account;
                     continue;
@@ -151,7 +157,7 @@ fn post_with_retry(
             // nothing about the protocol, and a pinned `api:` means the user
             // already decided.
             if url.ends_with("/responses")
-                && !crate::llm::config::api_pinned()
+                && !config.api_pinned
                 && (status == reqwest::StatusCode::NOT_FOUND || status.is_server_error())
             {
                 return Err(format!(
@@ -299,6 +305,37 @@ mod tests {
             Some("Bearer secret")
         );
         assert!(!req.headers().contains_key("not a header"));
+    }
+
+    #[test]
+    fn provider_headers_apply_under_global_extras() {
+        // Provider-scoped file headers ride along; an explicit global /
+        // env / CLI extra wins on collision.
+        let mut config = crate::llm::config::tests::test_cfg();
+        config.api_key = "secret".to_string();
+        config
+            .provider_headers
+            .insert("X-Prov".to_string(), "prov".to_string());
+        config
+            .provider_headers
+            .insert("X-Both".to_string(), "prov".to_string());
+        config
+            .extra_headers
+            .insert("X-Both".to_string(), "global".to_string());
+        let req = authenticated_request(
+            config.client.get("http://localhost/v1/chat/completions"),
+            &config,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            req.headers().get("x-prov").map(|v| v.to_str().unwrap()),
+            Some("prov")
+        );
+        assert_eq!(
+            req.headers().get("x-both").map(|v| v.to_str().unwrap()),
+            Some("global")
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@ pub(crate) struct Skill {
 
 /// Durable task contract: goal, constraints, acceptance criteria, plan steps
 /// with done flags, and a derived completion state. Persisted as JSON in
-/// `session_state "plan"`; `#[serde(default)]` on new fields keeps older
-/// JSONL loadable.
+/// `session_state "plan"`; `#[serde(default)]` keeps partial state loadable
+/// (missing keys default instead of failing the whole session load).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Plan {
     pub goal: Option<String>,
@@ -44,7 +44,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_round_trip_keeps_contract_and_loads_legacy_json() {
+    fn plan_round_trip_keeps_contract() {
         let plan = Plan {
             goal: Some("g".into()),
             constraints: vec!["c1".into()],
@@ -52,19 +52,18 @@ mod tests {
             acceptance: vec![("a1".into(), true)],
         };
         assert_eq!(Plan::from_json(&plan.to_json()), plan);
-        // Pre-level-2 JSONL (no constraints/acceptance keys) still loads.
-        let legacy = r#"{"goal":"g","steps":[["s",false]]}"#;
-        let parsed = Plan::from_json(legacy);
+        // Missing keys default instead of failing the load.
+        let parsed = Plan::from_json(r#"{"goal":"g","steps":[["s",false]]}"#);
         assert!(parsed.constraints.is_empty() && parsed.acceptance.is_empty());
         assert_eq!(parsed.steps, vec![("s".to_string(), false)]);
     }
 
     #[test]
-    fn chat_message_round_trips_legacy_wire_shape() {
-        // Older session JSONL wrote `role` as a plain string; the typed
-        // enum must deserialize it and serialize back to the same bytes.
-        let legacy = r#"{"role":"assistant","content":"hi","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}],"name":"skill"}"#;
-        let msg: ChatMessage = serde_json::from_str(legacy).expect("legacy line loads");
+    fn chat_message_round_trips_wire_shape() {
+        // Session JSONL stores `role` as a plain string; the typed enum
+        // must deserialize it and serialize back to the same bytes.
+        let line = r#"{"role":"assistant","content":"hi","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}],"name":"skill"}"#;
+        let msg: ChatMessage = serde_json::from_str(line).expect("line loads");
         assert_eq!(msg.role, Role::Assistant);
         assert_eq!(msg.name.as_deref(), Some("skill"));
         let round: ChatMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap())
@@ -288,28 +287,50 @@ impl ApiProtocol {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Provider {
     OpenCode,
     OpenAiCodex,
+    /// Any configured OpenAI-compatible provider (`providers:` map in
+    /// config.yaml); the string is the catalog/config key ("zai",
+    /// "openrouter", …). Auth is a bearer key; endpoint, models, pricing and
+    /// protocol all come from the models.dev catalog entry of the same key.
+    Generic(String),
 }
 
 impl Provider {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "opencode" | "openai" => Ok(Self::OpenCode),
-            "openai-codex" | "codex" => Ok(Self::OpenAiCodex),
-            other => Err(format!(
-                "unsupported provider '{}'; use opencode or openai-codex",
-                other
-            )),
+    /// Resolve a provider name: builtins plus configured generic providers
+    /// (`known`). Returns None for unknown names — call sites that route
+    /// model-id prefixes must keep those as part of the model id. The only
+    /// constructor used for real resolution; `from_display` covers the
+    /// display-only echo path.
+    pub(crate) fn parse_known(
+        value: &str,
+        known: &std::collections::BTreeSet<String>,
+    ) -> Option<Self> {
+        let lowered = value.trim().to_ascii_lowercase();
+        match lowered.as_str() {
+            "opencode" => Some(Self::OpenCode),
+            "openai-codex" | "codex" => Some(Self::OpenAiCodex),
+            _ => known
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(&lowered))
+                .then_some(Self::Generic(lowered)),
         }
     }
 
-    pub(crate) fn name(self) -> &'static str {
+    /// Display-only parse (daemon echo of an already-resolved provider):
+    /// unknown names still become `Generic` so the name survives round-trips.
+    pub(crate) fn from_display(value: &str) -> Self {
+        Self::parse_known(value, &std::collections::BTreeSet::new())
+            .unwrap_or_else(|| Self::Generic(value.trim().to_ascii_lowercase()))
+    }
+
+    pub(crate) fn name(&self) -> &str {
         match self {
             Self::OpenCode => "opencode",
             Self::OpenAiCodex => "openai-codex",
+            Self::Generic(name) => name,
         }
     }
 }

@@ -133,20 +133,14 @@ fn resolve_daemon_info() -> DaemonInfo {
                 .ok()
                 .filter(|v| crate::core::types::PermissionMode::parse(v).is_ok())
                 .unwrap_or_else(|| "ask-writes".to_string());
-            let model = std::env::var("OPENAI_MODEL")
-                .ok()
-                .unwrap_or_else(|| "unknown".to_string());
+            let model = "unknown".to_string();
             let provider_name = std::env::var("DEX_PROVIDER")
                 .ok()
                 .unwrap_or_else(|| "opencode".to_string());
             DaemonInfo {
                 provider: provider_name,
                 model,
-                api: std::env::var("OPENAI_API")
-                    .ok()
-                    .and_then(|name| crate::core::types::ApiProtocol::parse(&name))
-                    .map(|api| api.name().to_string())
-                    .unwrap_or_else(|| "openai-responses".to_string()),
+                api: "openai-responses".to_string(),
                 available_models: Vec::new(),
                 context_window: 128_000,
                 permission,
@@ -1793,9 +1787,7 @@ mod permission_gate_tests {
             "XDG_DATA_HOME",
             "DEX_PERMISSION",
             "DEX_PROVIDER",
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "OPENAI_API",
+            "OPENCODE_API_KEY",
         ]
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
@@ -1821,29 +1813,23 @@ mod permission_gate_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let cancel = CancellationToken::new();
 
-        // Deterministic provider config for the pass-through case: fake key,
-        // unroutable local base URL (connection refused, no network).
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
-            "DEX_PERMISSION",
-            "DEX_PROVIDER",
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "OPENAI_API",
-        ]
-        .iter()
-        .map(|k| (*k, std::env::var_os(k)))
-        .collect();
+        // Deterministic provider config for the pass-through case: fake key
+        // plus a per-request unroutable base URL (connection refused, no
+        // network) — endpoint overrides are per-request/file, never env.
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["DEX_PERMISSION", "DEX_PROVIDER", "OPENCODE_API_KEY"]
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
         let _env2 = crate::session::EnvGuard(saved);
         std::env::set_var("DEX_PERMISSION", "read-only");
         std::env::set_var("DEX_PROVIDER", "opencode");
-        std::env::set_var("OPENAI_API_KEY", "test-key");
-        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:9");
-        std::env::set_var("OPENAI_API", "chat");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
 
         let mk_req = |permission: Option<&str>, plan: Option<&str>| ChatRequest {
             prompt: "go".into(),
             skill_dirs: vec![],
-            base_url: None,
+            base_url: Some("http://127.0.0.1:9".to_string()),
             model: None,
             permission: permission.map(String::from),
             headers: None,
@@ -1983,10 +1969,7 @@ mod e2e_tests {
             "DEX_CONFIG",
             "DEX_PERMISSION",
             "DEX_PROVIDER",
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "OPENAI_API",
-            "OPENAI_MODEL",
+            "OPENCODE_API_KEY",
             "DEX_MODELS",
             "DEX_MODEL_APIS",
             "DEX_CONTEXT_WINDOW",
@@ -1998,18 +1981,23 @@ mod e2e_tests {
         .collect();
         let _env = crate::session::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
-        // No real user config may leak in: a machine's config.yaml can pin a
-        // provider-prefixed model that re-routes base_url away from the mock.
-        std::env::set_var("DEX_CONFIG", data_dir.join("absent-config.yaml"));
+        // No real user config may leak in: point the daemon at the fake
+        // provider through a real config file (a machine's config.yaml
+        // could pin a provider-prefixed model that re-routes base_url away
+        // from the mock; a file base_url pins the endpoint instead).
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("config.yaml"),
+            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
         std::env::set_var("DEX_PERMISSION", "ask-writes");
         std::env::set_var("DEX_PROVIDER", "opencode");
-        std::env::set_var("OPENAI_API_KEY", "test-key");
-        std::env::set_var("OPENAI_BASE_URL", &llm_base);
-        std::env::set_var("OPENAI_API", "chat");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_VERIFY", "true");
-        // No file override exists anymore; clear the rest for hermeticity.
+        // Clear the rest for hermeticity.
         for v in [
-            "OPENAI_MODEL",
             "DEX_MODELS",
             "DEX_MODEL_APIS",
             "DEX_CONTEXT_WINDOW",

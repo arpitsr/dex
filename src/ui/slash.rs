@@ -20,6 +20,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/name", "Rename the current session"),
     ("/model", "Show or switch the model"),
     ("/provider", "Show or switch the provider"),
+    ("/thinking", "Show or set reasoning effort"),
     ("/waive <reason>", "Waive verification with a reason"),
     ("/undo", "Undo the last recorded file change"),
     ("/help", "Show available commands"),
@@ -393,6 +394,68 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 "available providers: opencode, openai-codex".to_string(),
             );
         }
+        "/thinking" => {
+            let advertised = crate::llm::config::reasoning_options_for(&app.config.model);
+            push_info(
+                app,
+                match (&app.config.thinking_effort, advertised) {
+                    (Some(effort), Some(options)) => format!(
+                        "thinking effort: {effort} (options: {})",
+                        options.join(", ")
+                    ),
+                    (Some(effort), None) => format!("thinking effort: {effort}"),
+                    (None, Some(options)) => {
+                        format!("thinking effort: unset (options: {})", options.join(", "))
+                    }
+                    (None, None) => "thinking effort: unset".to_string(),
+                },
+            );
+        }
+        _ if line.starts_with("/thinking ") => {
+            let arg = line["/thinking ".len()..].trim();
+            if arg.is_empty() {
+                push_info(app, "usage: /thinking <level>|clear".to_string());
+            } else if ["clear", "auto", "off"]
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case(arg))
+            {
+                crate::llm::config::remember_thinking_effort(
+                    &app.config.base_url,
+                    &app.config.model,
+                    None,
+                );
+                app.config.refresh_thinking_effort();
+                push_info(
+                    app,
+                    match &app.config.thinking_effort {
+                        Some(effort) => {
+                            format!("thinking effort cleared (env default: {effort})")
+                        }
+                        None => "thinking effort cleared".to_string(),
+                    },
+                );
+            } else {
+                let model = app.config.model.clone();
+                match crate::llm::config::validate_thinking_effort(&model, arg) {
+                    Ok(level) => {
+                        crate::llm::config::remember_thinking_effort(
+                            &app.config.base_url,
+                            &model,
+                            Some(&level),
+                        );
+                        app.config.refresh_thinking_effort();
+                        push_info(app, format!("thinking effort: {level} for {model}"));
+                    }
+                    Err(options) => push_info(
+                        app,
+                        format!(
+                            "unknown thinking effort '{arg}' for {model} (options: {})",
+                            options.join(", ")
+                        ),
+                    ),
+                }
+            }
+        }
         _ if line.starts_with("/waive ") => {
             let reason = line["/waive ".len()..].trim().to_string();
             if reason.is_empty() {
@@ -424,7 +487,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         "/help" => {
             push_info(
                 app,
-                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>]"
+                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>] /thinking [<level>|clear]"
                     .to_string(),
             );
             push_info(
@@ -441,8 +504,14 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         _ if line.starts_with("/model ") => {
             let m = line["/model ".len()..].trim().to_string();
             if !m.is_empty() {
-                let old_provider = app.config.provider;
-                let endpoint = app.config.apply_model(&m, true);
+                let old_provider = app.config.provider.clone();
+                let endpoint = match app.config.apply_model(&m, true) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        push_info(app, format!("could not switch model: {error}"));
+                        return false;
+                    }
+                };
                 if !app
                     .config
                     .available_models
@@ -462,26 +531,33 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 } else {
                     String::new()
                 };
+                // Surface the thinking knob when the picked model advertises
+                // reasoning options (models.dev reasoning_options).
+                let thinking_suffix = crate::llm::config::reasoning_options_for(&app.config.model)
+                    .map(|options| format!(" (thinking: {})", options.join(", ")))
+                    .unwrap_or_default();
                 match endpoint {
                     Some(name) => push_info(
                         app,
                         format!(
-                            "switched to model: {} @ {} ({}, {}){}",
+                            "switched to model: {} @ {} ({}, {}){}{}",
                             app.config.model,
                             name,
                             app.config.base_url,
                             app.config.api.name(),
-                            provider_suffix
+                            provider_suffix,
+                            thinking_suffix
                         ),
                     ),
                     None => push_info(
                         app,
                         format!(
-                            "switched to model: {} ({}, {}){}",
+                            "switched to model: {} ({}, {}){}{}",
                             app.config.model,
                             app.config.api.name(),
                             app.config.base_url,
-                            provider_suffix
+                            provider_suffix,
+                            thinking_suffix
                         ),
                     ),
                 }
@@ -489,21 +565,28 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         }
         _ if line.starts_with("/provider ") => {
             let name = line["/provider ".len()..].trim();
-            match Provider::parse(name) {
-                Ok(provider) if provider == app.config.provider => {
+            let known: std::collections::BTreeSet<String> =
+                app.config.provider_entries.keys().cloned().collect();
+            match Provider::parse_known(name, &known) {
+                Some(provider) if provider == app.config.provider => {
                     push_info(
                         app,
                         format!("provider already selected: {}", provider.name()),
                     );
                 }
-                Ok(provider) => match app.config.switch_provider(provider, true) {
+                Some(provider) => match app.config.switch_provider(&provider, true) {
                     Ok(()) => {
                         let _ = app.session.set_state("provider", provider.name());
                         push_info(app, format!("switched to provider: {}", provider.name()));
                     }
                     Err(error) => push_info(app, format!("could not switch provider: {}", error)),
                 },
-                Err(error) => push_info(app, error),
+                None => push_info(
+                    app,
+                    format!(
+                        "unknown provider: {name}; use opencode, openai-codex or a providers: entry"
+                    ),
+                ),
             }
         }
         _ => push_info(app, format!("unknown command: {}", line)),
@@ -527,9 +610,11 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
         Err(_) => return,
     };
     if let Some(name) = state.get("provider") {
-        match Provider::parse(name) {
-            Ok(provider) if provider != app.config.provider => {
-                match app.config.switch_provider(provider, false) {
+        let known: std::collections::BTreeSet<String> =
+            app.config.provider_entries.keys().cloned().collect();
+        match Provider::parse_known(name, &known) {
+            Some(provider) if provider != app.config.provider => {
+                match app.config.switch_provider(&provider, false) {
                     Ok(()) => push_info(app, format!("restored provider: {}", provider.name())),
                     Err(error) => push_info(
                         app,
@@ -542,7 +627,13 @@ pub(super) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
     }
     if let Some(model) = state.get("model") {
         if app.config.model != *model {
-            let endpoint = app.config.apply_model(model, false);
+            let endpoint = match app.config.apply_model(model, false) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    push_info(app, format!("could not restore model '{model}': {error}"));
+                    return;
+                }
+            };
             if !app
                 .config
                 .available_models

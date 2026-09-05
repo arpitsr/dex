@@ -55,18 +55,19 @@ pub(crate) fn persist_pending(
 fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u: Usage) {
     state.last_usage = Some(u.prompt_tokens);
     state.last_cached = u.cached_tokens;
-    let cost = crate::llm::config::usage_cost(&config.model, config.provider, &config.base_url, &u)
-        .unwrap_or_else(|| {
-            #[allow(clippy::cast_precision_loss)]
-            let rate_per_1k = std::env::var("DEX_COST_PER_1K")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.002);
-            #[allow(clippy::cast_precision_loss)]
-            {
-                (u.prompt_tokens + u.completion_tokens) as f64 * rate_per_1k / 1000.0
-            }
-        });
+    let cost =
+        crate::llm::config::usage_cost(&config.model, &config.provider, &config.base_url, &u)
+            .unwrap_or_else(|| {
+                #[allow(clippy::cast_precision_loss)]
+                let rate_per_1k = std::env::var("DEX_COST_PER_1K")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.002);
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    (u.prompt_tokens + u.completion_tokens) as f64 * rate_per_1k / 1000.0
+                }
+            });
     if let Some(sink) = console.sink() {
         let _ = sink.send(SinkLine::Usage {
             tokens: u.prompt_tokens,
@@ -503,6 +504,9 @@ mod tests {
             verify_command: None,
             extra_headers: Default::default(),
             client: reqwest::blocking::Client::new(),
+            provider_entries: Default::default(),
+            provider_headers: Default::default(),
+            api_pinned: false,
         }
     }
 
