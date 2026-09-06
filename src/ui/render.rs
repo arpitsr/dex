@@ -122,6 +122,25 @@ pub(super) fn compute_layout(
     })
 }
 
+/// Fence info-string -> tree-sitter key (`ratatui-markdown::get_lang` only
+/// matches exact lowercase tags). Strips our legacy trailing `:`, drops
+/// params (`rust ignore`, `js linenums`), lowercases, and maps the common
+/// `rs` shorthand the CLI highlighter already accepts.
+fn normalize_code_lang(info: &str) -> String {
+    let token = info
+        .trim()
+        .trim_end_matches(':')
+        .split([' ', '\t', ',', ';', '{', '}'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(':');
+    let lower = token.to_ascii_lowercase();
+    match lower.as_str() {
+        "rs" => "rust".to_string(),
+        _ => lower,
+    }
+}
+
 pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     let lines: Vec<&str> = s.lines().collect();
     let mut blocks = Vec::new();
@@ -129,7 +148,7 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     while i < lines.len() {
         let t = lines[i].trim_start();
         if t.starts_with("```") {
-            let lang = t.trim_start_matches('`').trim().to_string();
+            let lang = normalize_code_lang(t.trim_start_matches('`'));
             let mut body = String::new();
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with("```") {
@@ -2596,6 +2615,28 @@ mod tests {
             matches!(blocks[0], MarkdownBlock::Paragraph(_)),
             "{blocks:?}"
         );
+    }
+
+    #[test]
+    fn split_markdown_normalizes_code_lang_for_highlighter() {
+        // `ratatui-markdown::get_lang` only matches exact lowercase tags, so
+        // the legacy `rust:` sink suffix, case variants, info-string params,
+        // and the `rs` shorthand must all normalize to `rust`.
+        for info in [
+            "rust:",
+            "Rust",
+            "Rust:",
+            "rs",
+            "rust ignore",
+            "RUST linenums",
+        ] {
+            let blocks = split_markdown(&format!("```{info}\nfn main() {{}}\n```\n"));
+            assert_eq!(blocks.len(), 1, "{info}: {blocks:?}");
+            assert!(
+                matches!(&blocks[0], MarkdownBlock::CodeBlock { lang, .. } if lang == "rust"),
+                "{info}: {blocks:?}"
+            );
+        }
     }
 
     #[test]
