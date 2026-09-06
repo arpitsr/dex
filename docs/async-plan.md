@@ -1,6 +1,8 @@
 # Async plan — where `dex` should be async, and in what order
 
-Status: plan only. No code changed. Conventions from `AGENTS.md` apply:
+Status: implemented (`feat/async-runtime` branch — Phases 1–6 done).
+Kept as a record of what was changed and why; the phase details below are
+historical. Conventions from `AGENTS.md` apply:
 minimal diffs, reuse helpers, no new deps without need, `cargo fmt --check`,
 `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`.
 
