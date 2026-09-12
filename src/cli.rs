@@ -18,8 +18,10 @@ pub(crate) struct Args {
     /// repeatable). Same `Name: Value` / `Name=Value` / JSON-object syntax as
     /// `DEX_HEADERS`.
     pub headers: Vec<String>,
-    /// P10: attach to an existing daemon session (replay its event journal)
-    /// instead of creating a fresh one. `dex connect <url> --reattach <id>`.
+    /// Attach to an existing daemon session (replay its event journal) instead
+    /// of creating a fresh one: `dex --reattach <id>` (this process owns the
+    /// daemon) or `dex connect <url> --reattach <id>` (it does not).
+    /// `check_reattach_mode` rejects the flag everywhere else.
     pub reattach: Option<String>,
     pub rest: Vec<String>,
 }
@@ -194,9 +196,25 @@ pub(crate) fn check_reattach_mode(args: &Args, mode: &Mode) -> Result<(), String
     let Some(id) = args.reattach.as_deref() else {
         return Ok(());
     };
+    // Informational modes win before any session is touched.
+    if matches!(mode, Mode::Help | Mode::Version) {
+        return Ok(());
+    }
+    // These pick or disable a session; `--reattach` already picked one, so
+    // accepting both would silently drop the selection.
+    let conflict = if args.session_path.is_some() {
+        Some("--session")
+    } else if args.new_session {
+        Some("--new")
+    } else if args.no_session {
+        Some("--no-session")
+    } else {
+        None
+    };
+    if let Some(flag) = conflict {
+        return Err(format!("--reattach {id} cannot be combined with {flag}"));
+    }
     let ok = match mode {
-        // Informational modes win before any session is touched.
-        Mode::Help | Mode::Version => true,
         Mode::Default => true,
         Mode::Connect { .. } => args
             .rest
@@ -316,6 +334,23 @@ mod tests {
         let mut help = args_with_rest(&["--help"]);
         help.reattach = Some("dex-k3m9x2qp7w4n8t5v".to_string());
         assert!(check_reattach_mode(&help, &resolve_mode(&help)).is_ok());
+    }
+
+    #[test]
+    fn reattach_rejects_contradictory_session_flags() {
+        // `--reattach` picks the session, so a second selector would be
+        // silently dropped: refuse instead.
+        let setters: [fn(&mut Args); 3] = [
+            |a| a.session_path = Some(std::path::PathBuf::from("/tmp/s.jsonl")),
+            |a| a.new_session = true,
+            |a| a.no_session = true,
+        ];
+        for set in setters {
+            let mut args = args_with_rest(&[]);
+            args.reattach = Some("dex-k3m9x2qp7w4n8t5v".to_string());
+            set(&mut args);
+            assert!(check_reattach_mode(&args, &resolve_mode(&args)).is_err());
+        }
     }
 
     #[test]

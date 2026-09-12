@@ -361,7 +361,7 @@ the daemon's working directory.
 | `-n`, `--new`      | Start a new session (the default).                       |
 | `--permission <mode>` | Tool permissions: `read-only`, `ask-writes`, `ask-shell`, or `trusted` (default `trusted`). |
 | `--name <name>`    | Name the session (default `<workspace>-<7 chars>`, e.g. `dex-k3m9x2q`).                                    |
-| `--reattach <id>`  | Attach to an existing daemon session and replay its event journal. |
+| `--reattach <id>`  | Attach to an existing daemon session and replay its event journal (bare `dex` or `dex connect <url>`, no prompt). |
 | `--skill <dir>`    | Add an extra skill directory to discover skills from.    |
 | `--tool`           | Run raw JSON tool mode (read JSON lines from stdin).     |
 
