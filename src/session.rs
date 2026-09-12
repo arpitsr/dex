@@ -251,10 +251,27 @@ impl Session {
             Some(n) if !n.is_empty() => Some(n),
             _ => Some(Self::default_session_name(&cwd)),
         };
-        let id = Self::new_id(&cwd);
         let dir = Self::session_dir().join(Self::cwd_slug(&cwd));
         fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.jsonl", id));
+        // The id is both the filename and the daemon registry key, so
+        // uniqueness rests on its 16 random chars (see `new_id`). `create_new`
+        // refuses a name that is already taken instead of appending a second
+        // header to someone else's session; a collision just draws a new id.
+        let mut attempts = 0;
+        let (id, path, mut file) = loop {
+            attempts += 1;
+            let id = Self::new_id(&cwd);
+            let path = dir.join(format!("{}.jsonl", id));
+            match fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(file) => break (id, path, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts < 8 => continue,
+                Err(e) => return Err(e),
+            }
+        };
         let header = SessionHeader {
             entry_type: "session".to_string(),
             version: SESSION_VERSION,
@@ -264,10 +281,6 @@ impl Session {
             name,
         };
         let line = serde_json::to_string(&header).map_err(io::Error::other)?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
         writeln!(file, "{}", line)?;
         let mut session = Self {
             header,
