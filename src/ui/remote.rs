@@ -21,6 +21,7 @@ use ratatui::Terminal;
 
 use crate::cli::Args;
 use crate::client::http::{ChatOptions, ChatStream, DaemonClient};
+use crate::core::console::{DIM, RESET};
 use crate::core::types::{
     ApiProtocol, ApprovalDecision as CoreApprovalDecision, PermissionMode, Provider, SinkLine,
 };
@@ -598,7 +599,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
     // from the theme query above or from anything else querying this tty,
     // at any time — are swallowed whole by `strip_osc_report` in the event
     // loop below.
-    let _cleanup = TerminalCleanup;
+    let cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
     // Wheel reporting (DECSET 1000 + SGR 1006): scroll events arrive as real
     // `Event::Mouse` input instead of the terminal synthesizing Up/Down arrow
@@ -773,10 +774,6 @@ pub(crate) fn run_ratatui_repl_with_remote(
     // error) — otherwise a stale agent row lingers in the Herdr sidebar.
     herdr.release();
     // Always restore the terminal, even if the loop returned early via `?`.
-    // The Kitty disambiguate pop is intentionally left to `TerminalCleanup`'s
-    // Drop: enhancement flags are a push/pop stack, so popping here *and* in
-    // Drop would pop twice and unbalance a terminal we don't own (e.g. when
-    // nested in another Kitty-aware app). Drop runs on every path.
     disable_raw_mode().ok();
     let _ = execute!(
         io::stdout(),
@@ -784,10 +781,24 @@ pub(crate) fn run_ratatui_repl_with_remote(
         DisableBracketedPaste,
         DisableMouseCapture
     );
+    // Drop `TerminalCleanup` here rather than at the end of the function. Its
+    // Drop writes `CSI ?1049l` / the Kitty pop, and `CSI ?1049l` also *restores
+    // the cursor* to where it sat before the TUI (xterm's `srm_OPT_ALTBUF_CURSOR`,
+    // followed by DECRC). Left to the end, that lands after the resume hint, the
+    // shell redraws its prompt on the restored line, and the prompt overwrites
+    // the hint's prefix — leaving just the tail (the session id) visible.
+    // Drop runs on every path, so the early returns above stay covered. The
+    // Kitty disambiguate pop stays there (not in the `execute!` above): the
+    // flags are a push/pop stack, so popping in both places would unbalance a
+    // terminal we don't own (e.g. nested in another Kitty-aware app).
+    drop(cleanup);
+    // ratatui's `Terminal` Drop re-shows the cursor; nothing may follow the hint.
+    drop(terminal);
     // The session outlives the TUI (the daemon persisted it), so hand the user
     // the exact command to come back instead of making them hunt `/resume`.
     // Printed on every quit, reattach included: the id and the daemon URL are
-    // what the user needs, and they are not always the ones they typed.
+    // what the user needs, and they are not always the ones they typed. Nothing
+    // may be written to the terminal after this point.
     print_resume_hint(
         daemon_url,
         &remote.session_id,
@@ -1477,12 +1488,20 @@ fn resume_command(
 }
 
 /// Show the resume command after the alternate screen is gone so it lands in
-/// the shell's scrollback next to the prompt.
+/// the shell's scrollback next to the prompt. Must be the last write to the
+/// terminal: any escape sequence after it (a stray `CSI ?1049l`) restores the
+/// cursor onto this line and the shell's next prompt overwrites it. The one
+/// exception is the SGR pair around the text, which neither moves the cursor
+/// nor ends the line — and `RESET` before the closing newline keeps the
+/// shell's next prompt in its own colors.
 fn print_resume_hint(daemon_url: &str, session_id: &str, session_cwd: &str, daemon_is_local: bool) {
-    eprintln!(
-        "\nTo resume this session: {}",
-        resume_command(daemon_url, session_id, session_cwd, daemon_is_local)
-    );
+    let command = resume_command(daemon_url, session_id, session_cwd, daemon_is_local);
+    // Dim only on a terminal: redirected stderr should stay greppable.
+    if io::stderr().is_terminal() {
+        eprintln!("\n{DIM}To resume this session: {command}{RESET}");
+    } else {
+        eprintln!("\nTo resume this session: {command}");
+    }
 }
 
 /// Body grammar of an OSC 10/11 color report: `10;rgb:` / `11;rgb:` plus at
