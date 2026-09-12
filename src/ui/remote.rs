@@ -351,7 +351,14 @@ fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
     )])
 }
 
-pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std::io::Result<()> {
+/// `daemon_is_local` says whether this process owns the daemon it talks to
+/// (`Mode::Default`) rather than connecting to one it does not (`Mode::Connect`).
+/// It decides the quit-time resume command — see `resume_command`.
+pub(crate) fn run_ratatui_repl_with_remote(
+    args: &Args,
+    daemon_url: &str,
+    daemon_is_local: bool,
+) -> std::io::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(std::io::Error::other(
             "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
@@ -545,6 +552,22 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             &mut remote.app,
             format!("reattached to session {session_id}"),
         );
+        // The daemon resolves the tool workspace from its own cwd, not the
+        // session header (`create_session` records the daemon cwd for exactly
+        // that reason). Reattaching across directories therefore replays this
+        // session while `read`/`write`/`bash` land in *this* tree — say so
+        // instead of surprising them mid-turn.
+        let session_cwd = remote.app.session.cwd().to_string();
+        let workspace_cwd = remote.app.cwd.clone();
+        if !same_workspace(&session_cwd, &workspace_cwd) {
+            push_info(
+                &mut remote.app,
+                format!(
+                    "dex: this session came from {session_cwd}; tools run in {workspace_cwd} \
+                     (the daemon workspace) — `cd {session_cwd}` to reattach there"
+                ),
+            );
+        }
     }
 
     // Detect the terminal background before raw mode / the alternate screen
@@ -763,7 +786,15 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     );
     // The session outlives the TUI (the daemon persisted it), so hand the user
     // the exact command to come back instead of making them hunt `/resume`.
-    print_resume_hint(daemon_url, &remote.session_id);
+    // Skipped for a reattach: they already know the command they used.
+    if !is_reattach {
+        print_resume_hint(
+            daemon_url,
+            &remote.session_id,
+            remote.app.session.cwd(),
+            daemon_is_local,
+        );
+    }
     res
 }
 
@@ -1390,23 +1421,68 @@ fn is_loopback(host: &str) -> bool {
     octets.len() == 4 && octets[0] == "127" && octets[1..].iter().all(|o| o.parse::<u8>().is_ok())
 }
 
-/// Command that brings the user back to this session. A loopback daemon is
-/// reachable by a bare `dex --reattach <id>`; a remote one needs the same
-/// `connect <url>` the user typed, since the session lives on that daemon.
-fn resume_command(daemon_url: &str, session_id: &str) -> String {
-    if is_loopback(url_host(daemon_url)) {
+/// True when both strings name the same directory. Best-effort: a path that no
+/// longer exists (deleted checkout) falls back to a literal comparison.
+fn same_workspace(left: &str, right: &str) -> bool {
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    canon(left) == canon(right)
+}
+
+/// Quote a value for the shell only when it needs it, so the common case stays
+/// copy-pasteable (`--reattach sess-1`, not `'sess-1'`).
+fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | ':' | '@' | '_' | '-' | '+' | '=' | ',' | '~')
+        });
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Command that brings the user back to this session.
+///
+/// Locality comes from how the client was invoked, never from the URL host: a
+/// loopback URL is still remote when it is an SSH port-forward or a daemon in
+/// another container, and a bare local `dex --reattach` against it would 404.
+///
+/// A locally owned daemon resolves its workspace from its own cwd, so when the
+/// session came from a different directory the command has to `cd` back first —
+/// the id carries the workspace *name*, never its path.
+fn resume_command(
+    daemon_url: &str,
+    session_id: &str,
+    session_cwd: &str,
+    daemon_is_local: bool,
+) -> String {
+    if !daemon_is_local {
+        return format!(
+            "dex connect {} --reattach {session_id}",
+            shell_quote(daemon_url)
+        );
+    }
+    let client_cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if same_workspace(session_cwd, &client_cwd) {
         format!("dex --reattach {session_id}")
     } else {
-        format!("dex connect {daemon_url} --reattach {session_id}")
+        format!(
+            "cd {} && dex --reattach {session_id}",
+            shell_quote(session_cwd)
+        )
     }
 }
 
 /// Show the resume command after the alternate screen is gone so it lands in
 /// the shell's scrollback next to the prompt.
-fn print_resume_hint(daemon_url: &str, session_id: &str) {
+fn print_resume_hint(daemon_url: &str, session_id: &str, session_cwd: &str, daemon_is_local: bool) {
     eprintln!(
         "\nTo resume this session: {}",
-        resume_command(daemon_url, session_id)
+        resume_command(daemon_url, session_id, session_cwd, daemon_is_local)
     );
 }
 
@@ -2627,20 +2703,56 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_matches_daemon_locality() {
-        // Loopback: the daemon restarts alongside `dex`, so the id is enough.
+    fn resume_command_matches_invocation_not_url_host() {
+        let here = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // Locally owned daemon, same workspace: the id alone is enough.
         assert_eq!(
-            resume_command("http://127.0.0.1:4113", "k3m9x2qp7w4n8t5v"),
-            "dex --reattach k3m9x2qp7w4n8t5v"
+            resume_command("http://127.0.0.1:4113", "dex-k3m9x2qp7w4n8t5v", &here, true),
+            "dex --reattach dex-k3m9x2qp7w4n8t5v"
+        );
+        // Locally owned daemon but a session from elsewhere: its tools are
+        // confined to the daemon cwd, so the command must cd back first.
+        assert_eq!(
+            resume_command(
+                "http://127.0.0.1:4113",
+                "dex-k3m9x2qp7w4n8t5v",
+                "/srv/other-repo",
+                true
+            ),
+            "cd /srv/other-repo && dex --reattach dex-k3m9x2qp7w4n8t5v"
+        );
+        // A loopback URL can still be remote (SSH port-forward, container):
+        // `connect` means this process does not own that daemon.
+        assert_eq!(
+            resume_command("http://127.0.0.1:4113", "sess-1", "/srv/other-repo", false),
+            "dex connect http://127.0.0.1:4113 --reattach sess-1"
         );
         assert_eq!(
-            resume_command("http://localhost:8420", "sess-1"),
-            "dex --reattach sess-1"
-        );
-        // Remote: the session lives on the daemon, so keep its URL.
-        assert_eq!(
-            resume_command("https://agent.example.com", "sess-1"),
+            resume_command(
+                "https://agent.example.com",
+                "sess-1",
+                "/srv/other-repo",
+                false
+            ),
             "dex connect https://agent.example.com --reattach sess-1"
+        );
+        // Shell metacharacters (globs, separators, spaces) get quoted.
+        assert_eq!(
+            resume_command(
+                "http://user:pw@host:8420/x?t=1",
+                "sess-1",
+                "/srv/other-repo",
+                false
+            ),
+            "dex connect 'http://user:pw@host:8420/x?t=1' --reattach sess-1"
+        );
+        assert_eq!(
+            shell_quote("/srv/my repo"),
+            "'/srv/my repo'",
+            "a cwd with a space must survive one shell round trip"
         );
     }
 

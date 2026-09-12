@@ -188,8 +188,8 @@ impl Session {
 
     /// The cwd basename, lowercased, anything outside `[a-z0-9]` folded to `-`,
     /// runs collapsed and trimmed, capped at 32 chars, `session` when nothing
-    /// survives. Shared by the session name and id so both say which workspace
-    /// they came from.
+    /// survives. Shared by the session name and id so both carry the workspace
+    /// *name* — the basename, not the path, so `/srv/dex` and `~/dex` agree.
     fn workspace_slug(cwd: &str) -> String {
         let base = std::path::Path::new(cwd)
             .file_name()
@@ -219,7 +219,9 @@ impl Session {
     }
 
     /// `n` random `[a-z0-9]` chars (`n <= 16`) sourced from a v4 UUID (OS RNG,
-    /// already a dependency): 36^n combinations, no coordination needed.
+    /// already a dependency). `% 36` per byte is mildly biased and a v4 UUID
+    /// pins the version/variant bits (bytes 6 and 8), so 16 chars is ~78 bits
+    /// rather than 36^16 — still far past collision-free for one sessions dir.
     fn random_suffix(n: usize) -> String {
         const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
         debug_assert!(n <= 16, "a v4 UUID only carries 16 bytes");
@@ -231,12 +233,13 @@ impl Session {
     }
 
     /// Session id: `<workspace>-<16 k8s-style [a-z0-9] chars>`, e.g.
-    /// `dex-k3m9x2qp7w4n8t5v`. The workspace prefix keeps the id
-    /// self-describing wherever it is shown without its header (the quit-time
-    /// resume hint, daemon logs); uniqueness still rests on the 16 random
-    /// chars, which must cover every sessions directory at once because the id
-    /// is both the JSONL filename and the daemon registry key. Creation order
-    /// comes from the header `timestamp`, not the id.
+    /// `dex-k3m9x2qp7w4n8t5v`. The workspace prefix is the workspace *name*
+    /// (basename, not path), so an id shown without its header hints where it
+    /// came from — the quit-time resume hint, daemon logs. Uniqueness still
+    /// rests on the 16 random chars, which must cover every sessions directory
+    /// at once because the id is both the JSONL filename and the daemon
+    /// registry key. Creation order comes from the header `timestamp`, not the
+    /// id.
     fn new_id(cwd: &str) -> String {
         format!("{}-{}", Self::workspace_slug(cwd), Self::random_suffix(16))
     }
@@ -662,6 +665,12 @@ impl Session {
     }
     pub(crate) fn id(&self) -> &str {
         &self.header.id
+    }
+    /// The workspace the session was recorded from (its header cwd). The tool
+    /// workspace is the daemon's cwd, so the two differ after a cross-directory
+    /// reattach.
+    pub(crate) fn cwd(&self) -> &str {
+        &self.header.cwd
     }
     pub(crate) fn name(&self) -> Option<&str> {
         self.header.name.as_deref()
@@ -1508,7 +1517,7 @@ mod tests {
         let header: SessionHeader = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert_eq!(header.name(), Some(name.as_str()));
         // The id is `<workspace>-<16 chars>`: self-describing so the resume
-        // hint and daemon logs say which workspace a session belongs to.
+        // hint and daemon logs say which workspace *name* a session belongs to.
         let id = s.id().to_string();
         let (id_slug, id_suffix) = id.rsplit_once('-').unwrap();
         assert_eq!(id_slug, "dex-name-default", "got: {id}");
@@ -1530,6 +1539,21 @@ mod tests {
         assert_eq!(s.name(), Some("mine"));
         let path = s.path().unwrap().to_path_buf();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_ids_are_unique_within_a_workspace() {
+        // The id is both the JSONL filename and the daemon registry key, and
+        // the old epoch prefix is gone: distinctness rests entirely on the 16
+        // random chars, so two sessions in one workspace must never collide.
+        let ids: std::collections::HashSet<String> = (0..256)
+            .map(|_| Session::new_id("/tmp/dex-unique-workspace"))
+            .collect();
+        assert_eq!(ids.len(), 256);
+        assert_ne!(
+            Session::new_id("/tmp/dex-unique-workspace"),
+            Session::new_id("/tmp/dex-unique-workspace")
+        );
     }
 
     #[tokio::test]

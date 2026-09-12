@@ -187,6 +187,34 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
     }
 }
 
+/// `--reattach` names an existing interactive session. Only a bare `dex` and
+/// `dex connect <url>` (no prompt — a prompt takes the one-shot path) can act
+/// on one; everywhere else the flag was silently dropped.
+pub(crate) fn check_reattach_mode(args: &Args, mode: &Mode) -> Result<(), String> {
+    let Some(id) = args.reattach.as_deref() else {
+        return Ok(());
+    };
+    let ok = match mode {
+        // Informational modes win before any session is touched.
+        Mode::Help | Mode::Version => true,
+        Mode::Default => true,
+        Mode::Connect { .. } => args
+            .rest
+            .get(2..)
+            .unwrap_or_default()
+            .iter()
+            .all(|arg| arg.trim().is_empty()),
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "--reattach {id} only applies to `dex` and `dex connect <url>` without a prompt"
+        ))
+    }
+}
+
 /// Parse `run` arguments: either a single JSON object string
 /// (`'{"path":"a.rs"}'`) or key=value pairs (`path=a.rs limit=5`).
 /// Values that parse as JSON numbers/booleans are coerced, so `limit=5` and
@@ -262,6 +290,32 @@ mod tests {
             reattach: None,
             rest: rest.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn reattach_only_parses_for_interactive_modes() {
+        let mut args = args_with_rest(&[]);
+        args.reattach = Some("dex-k3m9x2qp7w4n8t5v".to_string());
+        // Bare `dex` and `dex connect <url>` are the modes that can act on it.
+        assert!(check_reattach_mode(&args, &resolve_mode(&args)).is_ok());
+        let mut connect = args_with_rest(&["connect", "http://127.0.0.1:8420"]);
+        connect.reattach = args.reattach.clone();
+        assert!(check_reattach_mode(&connect, &resolve_mode(&connect)).is_ok());
+        // A prompt sends `connect` down the one-shot path, which never
+        // reattaches; other modes would drop the id entirely.
+        let mut one_shot = args_with_rest(&["connect", "http://127.0.0.1:8420", "hi"]);
+        one_shot.reattach = args.reattach.clone();
+        assert!(check_reattach_mode(&one_shot, &resolve_mode(&one_shot)).is_err());
+        let mut prompt = args_with_rest(&["explain this"]);
+        prompt.reattach = args.reattach.clone();
+        assert!(check_reattach_mode(&prompt, &resolve_mode(&prompt)).is_err());
+        let mut run = args_with_rest(&["run", "read", "path=a.rs"]);
+        run.reattach = args.reattach;
+        assert!(check_reattach_mode(&run, &resolve_mode(&run)).is_err());
+        // Informational modes still win: `dex --reattach x --help` prints help.
+        let mut help = args_with_rest(&["--help"]);
+        help.reattach = Some("dex-k3m9x2qp7w4n8t5v".to_string());
+        assert!(check_reattach_mode(&help, &resolve_mode(&help)).is_ok());
     }
 
     #[test]
