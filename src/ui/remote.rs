@@ -761,6 +761,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         DisableBracketedPaste,
         DisableMouseCapture
     );
+    // The session outlives the TUI (the daemon persisted it), so hand the user
+    // the exact command to come back instead of making them hunt `/resume`.
+    print_resume_hint(daemon_url, &remote.session_id);
     res
 }
 
@@ -1343,9 +1346,9 @@ fn strip_osc_report(ev: Event, pending: &mut VecDeque<Event>) -> std::io::Result
     Ok(Some(lead_in_ev))
 }
 
-/// How the engine is reached: loopback daemons are "local", everything else
-/// is reported by host. Used by the status bar instead of a startup banner.
-pub(crate) fn connection_label(daemon_url: &str) -> String {
+/// Host part of a daemon URL with any userinfo/port/path stripped; a bracketed
+/// IPv6 literal keeps its brackets.
+fn url_host(daemon_url: &str) -> &str {
     let authority = daemon_url
         .split_once("://")
         .map_or(daemon_url, |(_, rest)| rest);
@@ -1357,14 +1360,20 @@ pub(crate) fn connection_label(daemon_url: &str) -> String {
     };
     // Bracketed IPv6 literals: everything through `]` is the host, the rest
     // (if any) is the port. Otherwise a trailing `:digits` is a port.
-    let host = if let Some(close) = authority.find(']') {
+    if let Some(close) = authority.find(']') {
         &authority[..=close]
     } else {
         match authority.rsplit_once(':') {
             Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
             _ => authority,
         }
-    };
+    }
+}
+
+/// How the engine is reached: loopback daemons are "local", everything else
+/// is reported by host. Used by the status bar instead of a startup banner.
+pub(crate) fn connection_label(daemon_url: &str) -> String {
+    let host = url_host(daemon_url);
     if is_loopback(host) {
         format!("[L] {host}")
     } else {
@@ -1379,6 +1388,26 @@ fn is_loopback(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let octets: Vec<_> = bare.split('.').collect();
     octets.len() == 4 && octets[0] == "127" && octets[1..].iter().all(|o| o.parse::<u8>().is_ok())
+}
+
+/// Command that brings the user back to this session. A loopback daemon is
+/// reachable by a bare `dex --reattach <id>`; a remote one needs the same
+/// `connect <url>` the user typed, since the session lives on that daemon.
+fn resume_command(daemon_url: &str, session_id: &str) -> String {
+    if is_loopback(url_host(daemon_url)) {
+        format!("dex --reattach {session_id}")
+    } else {
+        format!("dex connect {daemon_url} --reattach {session_id}")
+    }
+}
+
+/// Show the resume command after the alternate screen is gone so it lands in
+/// the shell's scrollback next to the prompt.
+fn print_resume_hint(daemon_url: &str, session_id: &str) {
+    eprintln!(
+        "\nTo resume this session: {}",
+        resume_command(daemon_url, session_id)
+    );
 }
 
 /// Body grammar of an OSC 10/11 color report: `10;rgb:` / `11;rgb:` plus at
@@ -2594,6 +2623,24 @@ mod tests {
         assert_eq!(
             connection_label("https://agent.example.com/api"),
             "[R] agent.example.com"
+        );
+    }
+
+    #[test]
+    fn resume_command_matches_daemon_locality() {
+        // Loopback: the daemon restarts alongside `dex`, so the id is enough.
+        assert_eq!(
+            resume_command("http://127.0.0.1:4113", "k3m9x2qp7w4n8t5v"),
+            "dex --reattach k3m9x2qp7w4n8t5v"
+        );
+        assert_eq!(
+            resume_command("http://localhost:8420", "sess-1"),
+            "dex --reattach sess-1"
+        );
+        // Remote: the session lives on the daemon, so keep its URL.
+        assert_eq!(
+            resume_command("https://agent.example.com", "sess-1"),
+            "dex connect https://agent.example.com --reattach sess-1"
         );
     }
 

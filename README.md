@@ -33,7 +33,8 @@ to build, test, and submit changes. Please follow the
   direct commands without the agent.
 - **Session persistence** — each conversation is saved as a crash-safe JSONL
   journal. A fresh session starts by default; use `--session` to explicitly
-  continue one.
+  continue one, or `--reattach <id>` to reattach to a daemon session. Quitting
+  the TUI prints the exact resume command for that session.
 - **Skills** — lightweight, discoverable agent skills (directories with a
   `SKILL.md` frontmatter) can be injected into the system prompt or loaded on
   demand via `/skill:<name>`.
