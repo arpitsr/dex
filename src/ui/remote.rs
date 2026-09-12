@@ -1468,6 +1468,7 @@ fn resume_command(
     session_cwd: &str,
     daemon_is_local: bool,
 ) -> String {
+    let session_id = shell_quote(session_id);
     if !daemon_is_local {
         return format!(
             "dex connect {} --reattach {session_id}",
