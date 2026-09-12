@@ -786,15 +786,14 @@ pub(crate) fn run_ratatui_repl_with_remote(
     );
     // The session outlives the TUI (the daemon persisted it), so hand the user
     // the exact command to come back instead of making them hunt `/resume`.
-    // Skipped for a reattach: they already know the command they used.
-    if !is_reattach {
-        print_resume_hint(
-            daemon_url,
-            &remote.session_id,
-            remote.app.session.cwd(),
-            daemon_is_local,
-        );
-    }
+    // Printed on every quit, reattach included: the id and the daemon URL are
+    // what the user needs, and they are not always the ones they typed.
+    print_resume_hint(
+        daemon_url,
+        &remote.session_id,
+        remote.app.session.cwd(),
+        daemon_is_local,
+    );
     res
 }
 
